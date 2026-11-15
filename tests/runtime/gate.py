@@ -22,6 +22,12 @@ Checks (thresholds in THRESHOLDS):
                            brightness pulsing (trimmed mean-luma drift) across still camera stops
   static_blas_rebuilds     static-geometry acceleration structure rebuilds while the camera rotates (telemetry)
   frames_over_50ms         telemetry frameTimeMs > 50 in any measured window (goggle windows included: no freezes)
+  step_timing              per-step GPU times (telemetry passMs): untimed steps, and nested steps longer than their parent
+  skip_occlusion_share     worst scene window's share of draws skipped by occlusionQuery (telemetry skips / proxy draws)
+  skip_other_share         worst scene window's share of draws skipped for any other reason
+  material_share           share of scene draws that used a mod replacement material, in the worst spot
+  textures_demoted         share of scene frames where the texture budget shrank textures (telemetry texturesDemoted)
+  clean_quit               no VK_ERROR_DEVICE_LOST in each spot's remix-dxvk.log (copied into the spot folder)
   pose                     the camera really went where it was told (proxy camera trace vs requested yaw/pitch)
   goggles                  each goggle mode toggled (proxy log) and looks the same with ray tracing on and off
                            (no missing geometry, no different picture)
@@ -45,7 +51,15 @@ THRESHOLDS = {
     "min_scene_luma": 0.03, "min_raster_luma_ratio": 0.75, "min_angled_sharpness": 0.02,
     "pose_error_deg": 3.0, "pan_degrees": 350.0, "goggles_corr": 0.8, "goggles_mean_gap": 0.06,
     "goggles_missing_blocks": 0.02, "still_frames": 15, "pan_coverage": 0.9,
-}
+    # Recorder checks (recorder_checks). Every limit below is a GUESS, not a value from the game or the source. The
+    # comment beside each is what the Nov 14 run (20261114-153401) measured on that check; that run fails other checks.
+    "step_untimed_share": 0.02,     # GUESS. Measured 0 of 4,069 scene frames with an untimed step.
+    "step_child_excess_ms": 0.5,    # GUESS, tolerance for timer rounding. Measured: no child above its parent.
+    "skip_share_occlusion": 0.6,    # GUESS. Measured worst scene window 54.6% skipped by occlusionQuery.
+    "skip_share_other": 0.05,       # GUESS. Every other reason measured at most 0.24% of a window's draws.
+    "min_replaced_share": 0.2,      # GUESS. Measured 81% and 90% with the mod loaded, 0% without it (Nov 14 bug).
+    "max_demoted_share": 0.05,      # GUESS. Measured 0 scene frames with a texture shrunk by the budget.
+    }
 TELEMETRY_FIELDS = ("frame", "frameTimeMs", "gpuTimeMs", "instances", "skinnedInstances", "staticBlasRebuilds",
                     "cameraCut", "textureMemoryMB", "vramUsedMB")
 THUMB_W, THUMB_H = 128, 72
@@ -378,6 +392,119 @@ def load_spots(run: Run) -> list[dict]:
     return spots
 
 
+def recorder_checks(run: Run, pick, good: list[dict], tsrc: str) -> None:
+    """Checks on recorder fields no other check reads: per-step GPU time, skipped draws, the mod material share,
+    texture budget demotion, and a clean quit (Remix's log shows no lost Vulkan device)."""
+    scene = pick(SCENE)
+
+    # Per-step GPU time (passMs: step -> [gpuMs, cpuMs, calls]). A step is untimed when its GPU time is negative,
+    # and a nested step can't take longer than the step it sits in.
+    want, recs = coverage(scene, "telemetry", "telemetry")
+    steps = [r["passMs"] for r in recs if isinstance(r.get("passMs"), dict)]
+    step_limit = (f"untimed <= {THRESHOLDS['step_untimed_share']:.0%}, "
+                  f"nested <= parent + {THRESHOLDS['step_child_excess_ms']:g} ms")
+    if want == 0 or len(steps) < want:
+        run.add("step_timing", NOT_MEASURED, None, step_limit,
+                f"telemetry has {len(steps)} of {want} scene frames with 'passMs'", tsrc)
+    else:
+        untimed = sum(1 for p in steps if any(v[0] < 0 for v in p.values()))
+        excess = []
+        for p in steps:
+            for k in p:
+                parent = k.rsplit("/", 1)[0]
+                if "/" in k and parent in p and p[k][0] >= 0 and p[parent][0] >= 0:
+                    excess.append(p[k][0] - p[parent][0])
+        worst = max(excess, default=0.0)
+        share = untimed / len(steps)
+        ok = share <= THRESHOLDS["step_untimed_share"] and worst <= THRESHOLDS["step_child_excess_ms"]
+        run.add("step_timing", PASS if ok else FAIL, round(share, 6), step_limit,
+                f"{untimed} of {len(steps)} scene frames with an untimed step; worst nested step {worst:+.3f} ms "
+                f"against its parent", tsrc)
+
+    # Skipped draws per reason against the draws the proxy counted over the same frames (column 4 of the frame
+    # trace). Each scene window is one sample, and the worst window decides.
+    samples, missing = [], 0
+    for s, w in scene:
+        tel, prx = s["_data"]["telemetry"], s["_data"]["proxy"]
+        tids, pids = frames_in(w, "telemetry"), frames_in(w, "proxy")
+        if not (pids and all(f in prx for f in pids) and all(isinstance(tel.get(f, {}).get("skips"), dict) for f in tids)):
+            missing += 1
+            continue
+        draws = sum(float(prx[f][4]) for f in pids)
+        skips: dict[str, float] = {}
+        for f in tids:
+            for reason, n in tel[f]["skips"].items():
+                skips[reason] = skips.get(reason, 0) + n
+        if draws > 0:
+            samples.append((draws, skips))
+        else:
+            missing += 1
+    if not samples or missing:
+        detail = (f"{missing} of {len(scene)} scene windows lack telemetry 'skips' or proxy draws" if scene
+                  else "no scene windows were run")
+        for name, limit in (("skip_occlusion_share", THRESHOLDS["skip_share_occlusion"]),
+                            ("skip_other_share", THRESHOLDS["skip_share_other"])):
+            run.add(name, NOT_MEASURED, None, f"<= {limit:.0%} of a window's draws", detail, tsrc)
+    else:
+        occ = max(sk.get("occlusionQuery", 0) / d for d, sk in samples)
+        other = max((n / d for d, sk in samples for r, n in sk.items() if r != "occlusionQuery"), default=0.0)
+        run.add("skip_occlusion_share", PASS if occ <= THRESHOLDS["skip_share_occlusion"] else FAIL, round(occ, 6),
+                f"<= {THRESHOLDS['skip_share_occlusion']:.0%} of a window's draws",
+                f"worst scene window: {occ:.1%} of draws skipped by occlusionQuery", tsrc)
+        run.add("skip_other_share", PASS if other <= THRESHOLDS["skip_share_other"] else FAIL, round(other, 6),
+                f"<= {THRESHOLDS['skip_share_other']:.0%} of a window's draws",
+                f"worst scene window: {other:.1%} of draws skipped for any other reason", tsrc)
+
+    # Mod materials: the share of scene draws that used a replacement material, judged in the worst spot.
+    # A spot with no material draws at all fails: that is what the mod not loading looks like.
+    shares, incomplete = [], 0
+    for s in good:
+        recs = [s["_data"]["telemetry"].get(f, {}) for w in s["windows"] if w["kind"] in SCENE
+                for f in frames_in(w, "telemetry")]
+        if recs and all(isinstance(r.get(k), (int, float)) for r in recs
+                        for k in ("replacedMaterialDraws", "legacyMaterialDraws")):
+            rep = sum(r["replacedMaterialDraws"] for r in recs)
+            leg = sum(r["legacyMaterialDraws"] for r in recs)
+            shares.append((os.path.basename(s["_dir"]), rep / (rep + leg) if rep + leg else 0.0))
+        else:
+            incomplete += 1
+    if not shares or incomplete:
+        run.add("material_share", NOT_MEASURED, None, f">= {THRESHOLDS['min_replaced_share']:.0%} in every spot",
+                f"{incomplete} of {len(good)} spots lack 'replacedMaterialDraws' or 'legacyMaterialDraws' in scene frames",
+                tsrc)
+    else:
+        spot, worst = min(shares, key=lambda x: x[1])
+        run.add("material_share", PASS if worst >= THRESHOLDS["min_replaced_share"] else FAIL, round(worst, 6),
+                f">= {THRESHOLDS['min_replaced_share']:.0%} in every spot",
+                f"lowest spot {spot}: {worst:.1%} of scene draws used a mod material", tsrc)
+
+    # Texture budget: scene frames where the budget shrank textures, as a share of all scene frames.
+    recs = [s["_data"]["telemetry"].get(f, {}) for s, w in scene for f in frames_in(w, "telemetry")]
+    have = sum(1 for r in recs if isinstance(r.get("texturesDemoted"), (int, float)))
+    if recs and have == len(recs):
+        share = sum(1 for r in recs if r["texturesDemoted"] > 0) / len(recs)
+        run.add("textures_demoted", PASS if share <= THRESHOLDS["max_demoted_share"] else FAIL, round(share, 6),
+                f"<= {THRESHOLDS['max_demoted_share']:.0%} of scene frames",
+                f"{share:.1%} of {len(recs)} scene frames had textures shrunk by the budget", tsrc)
+    else:
+        run.add("textures_demoted", NOT_MEASURED, None, f"<= {THRESHOLDS['max_demoted_share']:.0%} of scene frames",
+                f"telemetry has {have} of {len(recs)} scene frames with 'texturesDemoted'", tsrc)
+
+    # A lost Vulkan device ends a run without a clean quit. Each spot's remix-dxvk.log must be present and free of it.
+    logs = [os.path.join(s["_dir"], "remix-dxvk.log") for s in good]
+    have_logs = [p for p in logs if os.path.exists(p)]
+    if not good or len(have_logs) < len(logs):
+        detail = (f"{len(logs) - len(have_logs)} of {len(logs)} spots have no remix-dxvk.log" if good
+                  else "no spot ran far enough to judge")
+        run.add("clean_quit", NOT_MEASURED, None, "no VK_ERROR_DEVICE_LOST in any spot log", detail, "remix-dxvk.log")
+    else:
+        lost = [os.path.basename(os.path.dirname(p)) for p in have_logs
+                if any("VK_ERROR_DEVICE_LOST" in ln for ln in read_lines(p))]
+        run.add("clean_quit", PASS if not lost else FAIL, len(lost), "no VK_ERROR_DEVICE_LOST in any spot log",
+                f"VK_ERROR_DEVICE_LOST in: {', '.join(lost)}" if lost else f"no device loss in {len(have_logs)} spot logs",
+                "remix-dxvk.log")
+
+
 def evaluate(folder: str) -> dict:
     run = Run(folder)
     if not run.manifest.get("spots"):
@@ -453,6 +580,8 @@ def evaluate(folder: str) -> dict:
         worst = max((i / t if t else (1.0 if i else 0.0)) for i, t in tri)
         run.add("inward_fraction", PASS if worst < THRESHOLDS["inward_fraction"] else FAIL, round(worst, 6), "< 0.5%",
                 f"worst frame {worst:.4%} of character triangles inward", tsrc)
+
+    recorder_checks(run, pick, good, tsrc)
 
     # raster fallback: proxy gate CSV frame,sceneDraws,skinnedSceneDraws,handoffs,goggles,rtActive
     want, rows = coverage(pick(SCENE), "proxy", "pgate")

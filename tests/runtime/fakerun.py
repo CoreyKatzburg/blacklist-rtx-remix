@@ -67,6 +67,11 @@ class Builder:
         rec = {"frame": self.tframe, "frameTimeMs": 14.0, "gpuTimeMs": 11.0, "instances": 900, "skinnedInstances": 3,
                "staticBlasRebuilds": 0, "cameraCut": False, "textureMemoryMB": 1800, "vramUsedMB": 6100,
                "skinnedTriangles": 60000, "inwardSkinnedTriangles": 12, "thumbNonFinite": 0}
+        # recorder fields (gate.recorder_checks): healthy values, with one fault per case below
+        rec.update({"replacedMaterialDraws": 354, "legacyMaterialDraws": 25, "texturesDemoted": 0,
+                    "skips": {"occlusionQuery": 300},
+                    "passMs": {"InjectRTX": [10.0, 4.0, 1], "InjectRTX/Ray Reconstruction": [5.0, 0.2, 1],
+                               "InjectRTX/Ray Reconstruction/Prepare DLSS": [0.3, 0.02, 1]}})
         c = self.case
         if c == "nan_frame" and kind == "still" and i == 3: rec["thumbNonFinite"] = 40
         if c == "slow_frame" and kind == "pan" and i == 30: rec["frameTimeMs"] = 61.0
@@ -81,6 +86,17 @@ class Builder:
             img[20:36, 40:56] = np.clip(img[20:36, 40:56] + 10, 0, 255)
         if c == "pulse_still" and wname == "y90_p0":
             img = np.clip(img + 12.0 * math.sin(i * 2.0 * math.pi / 12.0), 0, 255)
+        if c == "untimed_steps" and kind == "still" and i % 5 == 0:
+            rec["passMs"]["InjectRTX/Ray Reconstruction"][0] = -1.0          # the recorder's sentinel: never timed
+        if c == "child_over_parent" and kind == "move" and i == 2:
+            rec["passMs"]["InjectRTX/Ray Reconstruction/Prepare DLSS"][0] = 6.0   # 1.0 ms over its parent's 5.0
+        if c == "child_timer_jitter" and kind == "move" and i == 2:
+            rec["passMs"]["InjectRTX/Ray Reconstruction/Prepare DLSS"][0] = 5.4   # 0.4 ms over: within tolerance
+        if c == "occlusion_heavy": rec["skips"] = {"occlusionQuery": 975}          # 65% of the 1500 proxy draws
+        if c in ("other_skips_6pct", "other_skips_4pct") and kind == "move":
+            rec["skips"]["unsupportedTopology"] = 90 if c == "other_skips_6pct" else 60   # 6% and 4% of 1500 draws
+        if c == "no_mod_materials": rec["replacedMaterialDraws"], rec["legacyMaterialDraws"] = 0, 379
+        if c == "demoted_textures" and kind == "still" and i % 2 == 0: rec["texturesDemoted"] = 1
         if c == "renamed_fields":
             rec["frameMs"] = rec.pop("frameTimeMs")
         rec["lumaThumb"] = base64.b64encode(img.astype(np.uint8).tobytes()).decode()
@@ -198,8 +214,14 @@ class Builder:
         gate.save_text(os.path.join(self.dir, "telemetry.jsonl"), "".join(json.dumps(r) + "\n" for r in self.telemetry))
         gate.save_text(os.path.join(self.dir, "proxy_frames.csv"), "\n".join(self.proxy) + "\n")
         gate.save_text(os.path.join(self.dir, "proxy_gate.csv"), "\n".join(self.pgate) + "\n")
+        if self.case != "no_quit_log":
+            lost = "[error] vkQueueSubmit: VK_ERROR_DEVICE_LOST\n" if self.case == "device_lost" else ""
+            gate.save_text(os.path.join(self.dir, "remix-dxvk.log"), "[info] Remix shutdown\n" + lost)
         gate.save_json(os.path.join(self.dir, "spot.json"), spot)
 
+
+# checks that read telemetry the recorder writes per frame: NOT MEASURED whenever that telemetry is missing
+RECORDER = ("step_timing", "skip_occlusion_share", "skip_other_share", "material_share", "textures_demoted")
 
 # case -> (checks that must FAIL, checks that must be NOT MEASURED); everything else must PASS.
 CASES = {
@@ -226,10 +248,12 @@ CASES = {
     "goggles_missing": (("goggles",), ()),
     "goggles_untoggled": ((), ("goggles",)),
     "no_telemetry": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms", "input_latency_ms",
-                          "skinned_min", "static_blas_rebuilds", "inward_fraction", "nonfinite_thumb_pixels")),
+                          "skinned_min", "static_blas_rebuilds", "inward_fraction", "nonfinite_thumb_pixels",
+                          *RECORDER)),
     # Remix writing only every 15th frame: per-frame checks can't pass; flashes fall back to the screen captures
     "sparse_telemetry": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms", "input_latency_ms",
-                              "skinned_min", "static_blas_rebuilds", "inward_fraction", "nonfinite_thumb_pixels")),
+                              "skinned_min", "static_blas_rebuilds", "inward_fraction", "nonfinite_thumb_pixels",
+                              *RECORDER)),
     "renamed_fields": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms", "input_latency_ms")),
     "no_dumps": ((), ("nan_pixels", "neon_fraction", "brightness_floor", "angled_sharpness", "outline_overlap")),
     "no_proxy_gate": ((), ("raster_fallback_frames",)),
@@ -238,7 +262,18 @@ CASES = {
     "spot_error": (("s1: setup",), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms", "input_latency_ms",
                                     "skinned_min", "static_blas_rebuilds", "inward_fraction", "nonfinite_thumb_pixels",
                                     "raster_fallback_frames", "flashes", "still_flicker", "nan_pixels", "neon_fraction",
-                                    "brightness_floor", "angled_sharpness", "outline_overlap", "pose", "goggles")),
+                                    "brightness_floor", "angled_sharpness", "outline_overlap", "pose", "goggles",
+                                    *RECORDER, "clean_quit")),
+    "untimed_steps": (("step_timing",), ()),          # every 5th still frame: a step with no timing
+    "child_over_parent": (("step_timing",), ()),      # a nested step 1.0 ms longer than its parent
+    "child_timer_jitter": ((), ()),                   # 0.4 ms over its parent: inside the tolerance
+    "occlusion_heavy": (("skip_occlusion_share",), ()),   # 65% of draws skipped by occlusionQuery
+    "other_skips_6pct": (("skip_other_share",), ()),      # 6% of a move window's draws, other reason
+    "other_skips_4pct": ((), ()),                         # 4%: under the 5% limit
+    "no_mod_materials": (("material_share",), ()),        # the mod's materials never drew
+    "demoted_textures": (("textures_demoted",), ()),      # half the still frames shrunk textures
+    "device_lost": (("clean_quit",), ()),                 # Remix's log shows VK_ERROR_DEVICE_LOST
+    "no_quit_log": ((), ("clean_quit",)),                 # no remix-dxvk.log in the spot folder
 }
 
 
