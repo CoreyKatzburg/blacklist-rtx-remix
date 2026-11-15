@@ -228,44 +228,80 @@ class Spot:
         self.yaw = self.pitch = 0.0       # requested, relative to the base
         self.counts_per_deg_x = float(spot.get("mouseCountsPerDegX", 14.0))
         self.counts_per_deg_y = float(spot.get("mouseCountsPerDegY", -14.0))
+        self.calibration: dict = {}
+        self._sent: tuple | None = None   # (rotation read when the last correction was sent, time sent)
 
     def counters(self) -> dict:
         return {"telemetry": self.telemetry.last_frame(), "proxy": self.proxy.last_frame()}
 
-    def _steer_toward(self, target_rel_yaw: float, target_rel_pitch: float, gain: float = 0.65) -> None:
-        cur_yaw, cur_pitch, _ = self.game.rotation(self.controller)
-        err_yaw = gate.wrap((self.base_yaw + target_rel_yaw) - cur_yaw)
-        err_pitch = max(-80.0, min(80.0, self.base_pitch + target_rel_pitch)) - cur_pitch
-        if abs(err_yaw) < 0.08 and abs(err_pitch) < 0.08:
-            return
-        dx = int(round(max(-180.0, min(180.0, err_yaw * self.counts_per_deg_x * gain))))
-        dy = int(round(max(-120.0, min(120.0, err_pitch * self.counts_per_deg_y * gain))))
-        if dx == 0 and abs(err_yaw) >= 0.12:
+    def _rot(self) -> tuple[float, float]:
+        yaw, pitch, _ = self.game.rotation(self.controller)
+        return yaw, pitch
+
+    def rel_pose(self) -> list[float]:
+        """The game's camera direction now, relative to the base (yaw wrapped to -180..180)."""
+        yaw, pitch = self._rot()
+        return [round(gate.wrap(yaw - self.base_yaw), 2), round(pitch - self.base_pitch, 2)]
+
+    def _settled(self, quiet: float = 0.25, timeout: float = 3.0) -> tuple[float, float]:
+        """The rotation once it has not changed for `quiet` seconds (several game frames)."""
+        last, since, end = self._rot(), time.monotonic(), time.monotonic() + timeout
+        while time.monotonic() < end:
+            time.sleep(0.01)
+            now = self._rot()
+            if now != last:
+                last, since = now, time.monotonic()
+            elif time.monotonic() - since >= quiet:
+                break
+        return last
+
+    def _steer_toward(self, target_rel_yaw: float, target_rel_pitch: float, gain: float = 0.8) -> bool:
+        """One correction toward the target, at most once per game frame: the game applies mouse input once per
+        frame, so a correction sent before the previous one shows up in the rotation would be added on top of it
+        (at 22 FPS and one send every 8 ms that stacked about five corrections and swung the camera). Returns True
+        when the camera is on target."""
+        cur = self._rot()
+        err_yaw = gate.wrap((self.base_yaw + target_rel_yaw) - cur[0])
+        err_pitch = max(-80.0, min(80.0, self.base_pitch + target_rel_pitch)) - cur[1]
+        if abs(err_yaw) < 0.15 and abs(err_pitch) < 0.15:
+            self._sent = None
+            return True
+        if self._sent and self._sent[0] == cur and time.monotonic() - self._sent[1] < 0.25:
+            return False   # the last correction is not applied yet
+        dx = int(round(max(-900.0, min(900.0, err_yaw * self.counts_per_deg_x * gain))))
+        dy = int(round(max(-600.0, min(600.0, err_pitch * self.counts_per_deg_y * gain))))
+        if dx == 0 and abs(err_yaw) >= 0.15:
             dx = 1 if err_yaw * self.counts_per_deg_x > 0 else -1
-        if dy == 0 and abs(err_pitch) >= 0.12:
+        if dy == 0 and abs(err_pitch) >= 0.15:
             dy = 1 if err_pitch * self.counts_per_deg_y > 0 else -1
         mouse_move_rel(dx, dy)
+        self._sent = (cur, time.monotonic())
+        return False
 
     def _calibrate_mouse(self) -> None:
-        y0, p0, _ = self.game.rotation(self.controller)
-        mouse_move_rel(140, 0)
-        time.sleep(0.05)
-        y1, _, _ = self.game.rotation(self.controller)
-        dyaw = gate.wrap(y1 - y0)
-        if abs(dyaw) > 0.5:
-            self.counts_per_deg_x = 140.0 / dyaw
-        mouse_move_rel(-140, 80)
-        time.sleep(0.05)
-        _, p1, _ = self.game.rotation(self.controller)
-        dpitch = p1 - p0
-        if abs(dpitch) > 0.5:
-            self.counts_per_deg_y = 80.0 / dpitch
-        mouse_move_rel(0, -80)
-        time.sleep(0.05)
+        """Counts per degree from four settled moves each way per axis. One move read 50 ms later (the old way)
+        could catch the camera still moving and gave a pan of 191 degrees instead of 360."""
+        samples = {"x": [], "y": []}
+        for axis, counts in (("x", 200), ("y", 80)):
+            for sign in (1, -1, 1, -1):
+                before = self._settled()
+                mouse_move_rel(sign * counts if axis == "x" else 0, sign * counts if axis == "y" else 0)
+                after = self._settled()
+                moved = gate.wrap(after[0] - before[0]) if axis == "x" else after[1] - before[1]
+                if abs(moved) > 0.5:
+                    samples[axis].append(sign * counts / moved)
+        self.calibration = {"samplesX": [round(v, 3) for v in samples["x"]],
+                            "samplesY": [round(v, 3) for v in samples["y"]]}
+        for axis in ("x", "y"):
+            vals = samples[axis]
+            if len(vals) < 3 or min(vals) * max(vals) <= 0 or max(map(abs, vals)) / min(map(abs, vals)) > 1.25:
+                raise RuntimeError(f"mouse calibration on {axis} is inconsistent: counts per degree {vals}")
+            setattr(self, f"counts_per_deg_{axis}", float(np.median(vals)))
+        self.calibration.update(countsPerDegX=round(self.counts_per_deg_x, 3), countsPerDegY=round(self.counts_per_deg_y, 3))
 
-    def pose(self, yaw: float, pitch: float) -> None:
+    def pose(self, yaw: float, pitch: float) -> bool:
         self.yaw, self.pitch = yaw, pitch
-        self._steer_toward(yaw, pitch)
+        return self._steer_toward(yaw, pitch)
 
     def hold(self, seconds: float, until=None) -> None:
         end = time.monotonic() + seconds
@@ -289,9 +325,8 @@ class Spot:
             while (t := (time.monotonic() - t0) / seconds) < 1.0:
                 self.pose(y0 + (yaw - y0) * t, p0 + (pitch - p0) * t)
                 time.sleep(0.008)
-            settle_end = time.monotonic() + 0.18
-            while time.monotonic() < settle_end:
-                self.pose(yaw, pitch)
+            settle_end = time.monotonic() + 3.0
+            while not self.pose(yaw, pitch) and time.monotonic() < settle_end:
                 time.sleep(0.008)
         self.window(name, "move", body)
     def capture(self, rel: str, frames: int) -> None:
@@ -316,8 +351,44 @@ class Spot:
         rel = f"frames/{name}.gray"
         self.hold(0.5)
         self.window(name + "_settle", "settle", lambda: self.hold(0.5))
-        self.window(name, "still", lambda: (self.capture(rel, 20), self.dump(name)),
-                    frames=rel, frameSize=[CAP_W, CAP_H], dump=name, **({"outline": outline} if outline else {}))
+        before = self.rel_pose()
+        w = self.window(name, "still", lambda: (self.capture(rel, 20), self.dump(name)),
+                        frames=rel, frameSize=[CAP_W, CAP_H], dump=name, **({"outline": outline} if outline else {}))
+        w["gamePose"] = [before, self.rel_pose()]   # [yaw, pitch] from game memory at the start and end of the stop
+
+    def pan(self, seconds: float) -> float:
+        """One full turn in `seconds`: steady mouse motion at the calibrated rate, plus a correction once per game
+        frame that pulls the turn measured in game memory toward the schedule, so a calibration error cannot
+        shorten the circle. Returns the degrees turned, summed from game memory."""
+        step_hz = 120.0
+        steps = max(1, int(round(seconds * step_hz)))
+        rem, turned = 0.0, 0.0
+        last = self._rot()[0]
+        t0 = time.monotonic()
+        for s_idx in range(steps + int(3.0 * step_hz)):   # up to 3 s more to finish the circle
+            now_yaw = self._rot()[0]
+            fresh = now_yaw != last
+            turned += gate.wrap(now_yaw - last)
+            last = now_yaw
+            target = 360.0 * min(1.0, (s_idx + 1) / steps)
+            if s_idx >= steps and abs(target - turned) < 0.5:
+                break
+            want = (360.0 / steps if s_idx < steps else 0.0) * self.counts_per_deg_x + rem
+            if fresh or s_idx >= steps:
+                want += (target - turned) * self.counts_per_deg_x * (0.3 if s_idx < steps else 0.05)
+            dx = int(round(want))
+            rem = want - dx if s_idx < steps else 0.0
+            mouse_move_rel(dx, 0)
+            self.yaw = target
+            target_t = t0 + (s_idx + 1) / step_hz
+            now = time.monotonic()
+            if target_t > now:
+                time.sleep(target_t - now)
+        self.yaw = 0.0
+        settle_end = time.monotonic() + 1.0
+        while not self._steer_toward(0.0, 0.0) and time.monotonic() < settle_end:
+            time.sleep(0.008)
+        return turned + gate.wrap(self._settled()[0] - last)
 
     def sweep_and_pan(self) -> None:
         pitches = self.spot.get("pitches", [0, -30, 30])
@@ -341,29 +412,11 @@ class Spot:
         rel = "frames/pan.gray"
         proc = start_capture(os.path.join(self.out, rel), fps=60, seconds=seconds + 0.3)
         time.sleep(0.3)   # ffmpeg start-up; the capture then spans the pan, not the still camera after it
-
-        def pan():
-            step_hz = 120.0
-            steps = max(1, int(round(seconds * step_hz)))
-            rem = 0.0
-            t0 = time.monotonic()
-            for s_idx in range(steps):
-                want = 360.0 * self.counts_per_deg_x / steps + rem
-                dx = int(round(want))
-                rem = want - dx
-                mouse_move_rel(dx, 0)
-                self.yaw = 360.0 * (s_idx + 1) / steps
-                target_t = t0 + (s_idx + 1) / step_hz
-                now = time.monotonic()
-                if target_t > now:
-                    time.sleep(target_t - now)
-            self.yaw = 0.0
-            settle_end = time.monotonic() + 0.2
-            while time.monotonic() < settle_end:
-                self._steer_toward(0.0, 0.0)
-                time.sleep(0.008)
+        turned = {}
         try:
-            self.window("pan360", "pan", pan, frames=rel, frameSize=[CAP_W, CAP_H])
+            w = self.window("pan360", "pan", lambda: turned.update(deg=self.pan(seconds)),
+                            frames=rel, frameSize=[CAP_W, CAP_H])
+            w["gameTurned"] = round(turned["deg"], 1)   # degrees, summed from game memory during the pan
         finally:
             try:
                 proc.wait(timeout=10)
@@ -476,6 +529,7 @@ def main() -> int:
     finally:
         if s:
             result["windows"] = s.windows
+            result["mouseCalibration"] = s.calibration
             result.update(s.finish())
         ctypes.windll.winmm.timeEndPeriod(1)
     gate.save_json(os.path.join(a.out, "spot.json"), result)
