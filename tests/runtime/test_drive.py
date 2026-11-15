@@ -29,9 +29,17 @@ class FakeGame:
                 self.queued, self.pending = self.pending, [0, 0]
                 self.history.append((self.turned, self.pitch))
 
+    eat_first = 0.0   # share of the first input on each axis the game drops (seen live right after a load)
+
     def mouse(self, dx: int, dy: int) -> None:
         with self.lock:
-            self.pending[0] += dx; self.pending[1] += dy
+            for i, d in ((0, dx), (1, dy)):
+                if d and self.eat_first:
+                    eaten = getattr(self, "eaten", set())
+                    if i not in eaten:
+                        self.eaten = eaten | {i}
+                        d = int(d * (1.0 - self.eat_first))
+                self.pending[i] += d
 
     def rotation(self, controller: int):
         with self.lock:
@@ -67,6 +75,25 @@ class Steering(unittest.TestCase):
         s._calibrate_mouse()
         self.assertAlmostEqual(s.counts_per_deg_x, 7.0, delta=0.2)
         self.assertAlmostEqual(s.counts_per_deg_y, -9.0, delta=0.3)
+
+    def test_calibration_survives_the_game_eating_part_of_the_first_input(self):
+        # Live Paladin run: the first move read 3.97 counts per degree, the next three 2.43. Without the discarded
+        # warm-up move this raised "inconsistent" and the spot was lost.
+        s = self.run_with(22, 7.0, -9.0, 14.0, -14.0)
+        self.game.eat_first = 0.4
+        s._calibrate_mouse()
+        self.assertAlmostEqual(s.counts_per_deg_x, 7.0, delta=0.2)
+        self.assertAlmostEqual(s.counts_per_deg_y, -9.0, delta=0.3)
+        self.assertGreater(s.calibration["warmupX"], 7.0 * 1.25)
+
+    def test_stop_waits_out_a_stall_before_capturing(self):
+        # Paladin, Nov 15: frames of 0.5 to 1.6 s for several seconds after the full turn.
+        s = self.run_with(22, 7.0, -9.0, 7.0, -9.0)
+        t0 = time.monotonic()
+        s.proxy = mock.Mock(last_frame=lambda: int(max(0.0, time.monotonic() - t0 - 2.0) * 22))   # stalled 2 s
+        waited = s.steady()
+        self.assertGreater(waited, 2.0)
+        self.assertLess(waited, 4.0)
 
     def test_move_lands_on_the_stop_without_swinging_past_it(self):
         s = self.run_with(22, 7.0, -9.0, 7.0, -9.0)

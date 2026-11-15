@@ -141,6 +141,11 @@ if ($running) { throw "$($running.Name) is already running (pid $($running.Id), 
 $otherLock = 'D:\BlacklistOverhaul\experiments\GAME_IN_USE.txt'
 if (Test-Path $otherLock) { throw "Someone else has the game: $(Get-Content $otherLock -Raw)" }
 New-Item -ItemType Directory -Force $runDir | Out-Null
+# Each launch rotates the session logs and keeps only the newest 10 folders: copy any not yet kept out of rotation.
+$evidence = 'D:\BlacklistOverhaul\experiments\playtest-evidence\play-setup-logs'
+Get-ChildItem (Join-Path $Setup 'logs') -Directory -Filter 'before-*' -ErrorAction SilentlyContinue |
+    Where-Object { -not (Test-Path (Join-Path $evidence $_.Name)) } |
+    ForEach-Object { Copy-Item $_.FullName (Join-Path $evidence $_.Name) -Recurse; Write-Step "Kept session logs $($_.Name) in $evidence" }
 @{ spots = @($selected | ForEach-Object name); started = $Stamp } | ConvertTo-Json | Set-Content (Join-Path $runDir 'manifest.json')
 
 try { New-Item -ItemType File -Path $GameLock -Value "verify_runtime.ps1 runtime gate $([DateTime]::UtcNow.ToString('u'))" | Out-Null }
@@ -201,6 +206,8 @@ try {
                 -RedirectStandardOutput (Join-Path $spotDir 'drive.log') -RedirectStandardError (Join-Path $spotDir 'drive.err')
             if (-not $drive.WaitForExit(20 * 60 * 1000)) { $drive.Kill(); Write-Step "$($spot.name): drive.py timed out (20 min)" }
             Write-Step "$($spot.name): $((Get-Content (Join-Path $spotDir 'drive.log') -Tail 1))"
+            Stop-Game   # the next launch starts remix-dxvk.log over; gate.py's clean_quit reads this spot's copy
+            Copy-Item -LiteralPath "$S\remix-dxvk.log" $spotDir -ErrorAction SilentlyContinue
             if ($spot.switchTest -or $spot.lightSwitch) {
                 & $Py (Join-Path $Runtime 'switch_report.py') $spotDir | Out-Null
                 Write-Step "$($spot.name): switch test numbers in $(Join-Path $spotDir 'switch.md')"

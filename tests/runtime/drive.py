@@ -307,19 +307,25 @@ class Spot:
         return False
 
     def _calibrate_mouse(self) -> None:
-        """Counts per degree from four settled moves each way per axis. One move read 50 ms later (the old way)
-        could catch the camera still moving and gave a pan of 191 degrees instead of 360."""
+        """Counts per degree from five settled moves per axis, alternating direction. One move read 50 ms later (the old way)
+        could catch the camera still moving and gave a pan of 191 degrees instead of 360. A first warm-up move per
+        axis is discarded: after a load the game ate part of the first input (Paladin, Nov 15: 3.97 counts per
+        degree, then 2.43 three times)."""
         samples = {"x": [], "y": []}
+        warmup = {}
         for axis, counts in (("x", 200), ("y", 80)):
-            for sign in (1, -1, 1, -1):
+            for i, sign in enumerate((1, -1, 1, -1, 1, -1)):   # even count: the camera ends where it started
                 before = self._settled()
                 mouse_move_rel(sign * counts if axis == "x" else 0, sign * counts if axis == "y" else 0)
                 after = self._settled()
                 moved = gate.wrap(after[0] - before[0]) if axis == "x" else after[1] - before[1]
-                if abs(moved) > 0.5:
+                if i == 0:
+                    warmup[axis] = round(sign * counts / moved, 3) if abs(moved) > 0.5 else None
+                elif abs(moved) > 0.5:
                     samples[axis].append(sign * counts / moved)
         self.calibration = {"samplesX": [round(v, 3) for v in samples["x"]],
-                            "samplesY": [round(v, 3) for v in samples["y"]]}
+                            "samplesY": [round(v, 3) for v in samples["y"]],
+                            "warmupX": warmup["x"], "warmupY": warmup["y"]}
         for axis in ("x", "y"):
             vals = samples[axis]
             if len(vals) < 3 or min(vals) * max(vals) <= 0 or max(map(abs, vals)) / min(map(abs, vals)) > 1.25:
@@ -375,10 +381,24 @@ class Spot:
         for p in found():
             shutil.copy2(p, os.path.join(self.out, "gate", os.path.basename(p)))
 
+    def steady(self, fps: float = 10.0, span: float = 1.0, timeout: float = 15.0) -> float:
+        """Waits until the game has drawn at least fps*span frames in the last `span` seconds; returns the seconds
+        waited. In the Paladin the game stalled 0.5 to 1.6 s per frame for several seconds after the full turn,
+        so the stop after it caught 2 game frames and the flicker checks of the whole run were NOT MEASURED."""
+        t0, seen = time.monotonic(), []
+        while (now := time.monotonic()) - t0 < timeout:
+            seen.append((now, self.proxy.last_frame()))
+            older = [f for t, f in seen if now - t >= span]
+            if older and seen[-1][1] - older[-1] >= fps * span:
+                return round(now - t0, 2)
+            time.sleep(0.1)
+        return round(timeout, 2)
+
     def stop(self, name: str, outline: str | None = None) -> None:
         rel = f"frames/{name}.gray"
         self.hold(0.5)
-        self.window(name + "_settle", "settle", lambda: self.hold(0.5))
+        waited = self.steady()
+        self.window(name + "_settle", "settle", lambda: self.hold(0.5), steadyWait=waited)
         before = self.rel_pose()
         w = self.window(name, "still", lambda: (self.capture(rel, 20), self.dump(name)),
                         frames=rel, frameSize=[CAP_W, CAP_H], dump=name, **({"outline": outline} if outline else {}))
@@ -616,7 +636,8 @@ def main() -> int:
             s.switch_test()
         if not spot.get("switchOnly"):
             s.sweep_and_pan()
-            s.goggles()
+            if int(spot.get("goggleModes", 3)):
+                s.goggles()
         if spot.get("lightSwitch"):
             s.light_switch(spot["lightSwitch"])
     except Exception as e:   # recorded in spot.json; gate.py fails the spot
