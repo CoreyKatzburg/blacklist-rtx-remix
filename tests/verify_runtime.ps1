@@ -10,11 +10,18 @@
 #                                          records a spot: run it right after the game loaded the checkpoint you want
 #                                          (Sam standing at the spawn, untouched). Saves the save files + map, spawn
 #                                          position and camera direction to the checkpoint library.
+#   verify_runtime.ps1 -CaptureCheckpoint <name> -Launch
+#                                          launches the game from the saves in the save folder now (no restore),
+#                                          records where they load (map, spawn, camera) and copies them into the run
+#                                          folder's capture-<name>\. The library is not touched: copy the folder
+#                                          into gate-checkpoints\<name> once its map is the one wanted.
 #   verify_runtime.ps1 -Evaluate <run folder>   re-judge an existing run
+# A spot in spots.json may name another spot's saves with "checkpoint" and move Sam elsewhere with "teleport"
+# ({"location": [x, y, z], "yaw": deg}); drive.py fails the spot when the game does not keep him there.
 # Needs: nobody else using the game (takes play-setup\AGENT_GAME_LOCK.txt), Steam running. Works with the monitors
 # off (screen frames come from gdigrab; the camera is set in memory). Only the goggle keys and the title-screen
 # keys need the game window in front, which this script does itself.
-param([string[]]$Spots = @(), [switch]$DryRun, [string]$CaptureCheckpoint = '', [string]$Evaluate = '', [switch]$SkipInstall)
+param([string[]]$Spots = @(), [switch]$DryRun, [string]$CaptureCheckpoint = '', [switch]$Launch, [string]$Evaluate = '', [switch]$SkipInstall)
 $ErrorActionPreference = 'Stop'
 $Tests = $PSScriptRoot
 $Runtime = Join-Path $Tests 'runtime'
@@ -39,7 +46,7 @@ if ($Evaluate) { exit (Gate $Evaluate) }
 $config = Get-Content (Join-Path $Runtime 'spots.json') -Raw | ConvertFrom-Json
 $hashArgs = @($GameExeHashes | ForEach-Object { '--exe-hash'; $_ })
 
-if ($CaptureCheckpoint) {
+if ($CaptureCheckpoint -and -not $Launch) {
     if (-not ($config.spots | Where-Object name -eq $CaptureCheckpoint)) { throw "No spot '$CaptureCheckpoint' in runtime\spots.json" }
     $game = Get-Process Blacklist_game -ErrorAction Stop | Select-Object -First 1
     $dest = Join-Path $Library $CaptureCheckpoint
@@ -126,11 +133,13 @@ function Set-GoggleBindings($path, $keys) {
 }
 
 $runDir = Join-Path $ResultsRoot $Stamp
-$selected = @($config.spots | Where-Object { -not $Spots.Count -or $Spots -contains $_.name })
-if (-not $selected.Count) { throw "No spots selected (known: $(($config.spots | ForEach-Object name) -join ', '))." }
+$selected = @(if (-not $CaptureCheckpoint) { $config.spots | Where-Object { -not $Spots.Count -or $Spots -contains $_.name } })
+if (-not $selected.Count -and -not $CaptureCheckpoint) { throw "No spots selected (known: $(($config.spots | ForEach-Object name) -join ', '))." }
 # This run closes the game between spots. It must never close a game it did not start (Corey's own session).
-$running = Get-Process Blacklist_game, Blacklist_DX11_game -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($running) { throw "A game is already running (pid $($running.Id), started $($running.StartTime.ToString('HH:mm:ss'))). Close it yourself or wait: this script does not close a game it did not start." }
+$running = Get-Process Blacklist_game, Blacklist_DX11_game, Blacklist_Launcher, NvRemixBridge -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($running) { throw "$($running.Name) is already running (pid $($running.Id), started $($running.StartTime.ToString('HH:mm:ss'))). Close it yourself or wait: this script does not close a game it did not start." }
+$otherLock = 'D:\BlacklistOverhaul\experiments\GAME_IN_USE.txt'
+if (Test-Path $otherLock) { throw "Someone else has the game: $(Get-Content $otherLock -Raw)" }
 New-Item -ItemType Directory -Force $runDir | Out-Null
 @{ spots = @($selected | ForEach-Object name); started = $Stamp } | ConvertTo-Json | Set-Content (Join-Path $runDir 'manifest.json')
 
@@ -156,9 +165,19 @@ try {
         }
         Write-Step 'Play setup installed and hash-checked (proxy, configs, pkg bridge client + runtime, mod links).'
     }
+    if ($CaptureCheckpoint) {
+        $dest = Join-Path $runDir "capture-$CaptureCheckpoint"
+        New-Item -ItemType Directory -Force $dest | Out-Null
+        [IO.File]::WriteAllText("$S\d3d9_proxy.ini", $gateIni)
+        $game = Start-GameAtCheckpoint
+        & $Py (Join-Path $Runtime 'drive.py') capture --pid $game.Id @hashArgs --out (Join-Path $dest 'checkpoint.json')
+        if ($LASTEXITCODE) { throw 'Could not read the camera/map from the game.' }
+        Copy-Item (Join-Path $saveBackup '*.save') $dest
+        Write-Step "Checkpoint recorded in $dest (not in the library)"
+    }
     foreach ($spot in $selected) {
         $spotDir = Join-Path $runDir $spot.name
-        $cp = Join-Path $Library $spot.name
+        $cp = Join-Path $Library $(if ($spot.checkpoint) { $spot.checkpoint } else { $spot.name })
         New-Item -ItemType Directory -Force $spotDir | Out-Null
         if (-not (Test-Path (Join-Path $cp 'checkpoint.json')) -or -not (Get-ChildItem $cp -Filter '*.save' -ErrorAction SilentlyContinue)) {
             @{ name = $spot.name; error = "no checkpoint recorded: load it in game, then run verify_runtime.ps1 -CaptureCheckpoint $($spot.name)"; windows = @() } |
@@ -182,6 +201,10 @@ try {
                 -RedirectStandardOutput (Join-Path $spotDir 'drive.log') -RedirectStandardError (Join-Path $spotDir 'drive.err')
             if (-not $drive.WaitForExit(20 * 60 * 1000)) { $drive.Kill(); Write-Step "$($spot.name): drive.py timed out (20 min)" }
             Write-Step "$($spot.name): $((Get-Content (Join-Path $spotDir 'drive.log') -Tail 1))"
+            if ($spot.switchTest -or $spot.lightSwitch) {
+                & $Py (Join-Path $Runtime 'switch_report.py') $spotDir | Out-Null
+                Write-Step "$($spot.name): switch test numbers in $(Join-Path $spotDir 'switch.md')"
+            }
         } catch {
             Write-Step "$($spot.name): $($_.Exception.Message)"
             if (-not (Test-Path (Join-Path $spotDir 'spot.json'))) {
@@ -203,6 +226,7 @@ try {
     if (Resume-Dx11Mod) { Write-Step 'DX11 lighting mod put back.' }
     Remove-Item -LiteralPath $GameLock -ErrorAction SilentlyContinue
 }
+if ($CaptureCheckpoint) { exit 0 }
 $code = Gate $runDir
 "Result: $(Join-Path $runDir 'result.md')"
 exit $code

@@ -260,6 +260,14 @@ class Game:
     def location(self, actor: int) -> tuple[float, float, float]:
         return self._vec(actor, "Location", "Vector", "<fff")[1]
 
+    def set_location(self, actor: int, xyz) -> None:
+        """Moves an actor by writing Actor.Location and zeroing Actor.Velocity. Whether the game keeps the new place
+        (and streams the area in) is not known from code: callers must read the location back and check it."""
+        address, _ = self._vec(actor, "Location", "Vector", "<fff")
+        self.mem.write(address, struct.pack("<fff", *(float(v) for v in xyz)))
+        velocity, _ = self._vec(actor, "Velocity", "Vector", "<fff")
+        self.mem.write(velocity, struct.pack("<fff", 0.0, 0.0, 0.0))
+
     def map_name(self, controller: int) -> str:
         return self.obj_name(self.outermost(controller))
 

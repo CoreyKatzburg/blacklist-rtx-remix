@@ -152,7 +152,20 @@ def front(hwnd: int) -> bool:
     return user32.GetForegroundWindow() == hwnd
 
 
-SCAN = {"F9": 0x43, "F10": 0x44, "F11": 0x57, "F12": 0x58, "F": 0x21, "G": 0x22, "N": 0x31, "X": 0x2D}
+SCAN = {"F9": 0x43, "F10": 0x44, "F11": 0x57, "F12": 0x58, "F": 0x21, "G": 0x22, "N": 0x31, "X": 0x2D, "SPACE": 0x39}
+
+# Switch test variants (spots.json "switches" overrides): each changes exactly one thing against "base".
+SWITCHES = [
+    {"name": "base"},
+    # Remix keeps the last [RemixConfig] value it was sent, so those variants also name the rtx.conf value to send back.
+    {"name": "fog_off", "ini": [["RemixConfig", "rtx.volumetrics.enable", "False"]],
+     "restore": [["RemixConfig", "rtx.volumetrics.enable", "True"]]},
+    {"name": "flare_balls_off", "ini": [["Lights", "FlareStandIns", "0"]]},
+    {"name": "fill_lights_off", "ini": [["Lights", "Fill", "0"]]},
+    {"name": "game_postfx_off", "ini": [["Proxy", "HidePostFx", "1"]]},
+    {"name": "goggles_on", "goggles": True},
+    {"name": "base_again"},
+]
 
 
 class _MOUSEINPUT(ctypes.Structure):
@@ -233,6 +246,21 @@ class Spot:
 
     def counters(self) -> dict:
         return {"telemetry": self.telemetry.last_frame(), "proxy": self.proxy.last_frame()}
+
+    def teleport(self, tp: dict) -> dict:
+        """Moves Sam from the checkpoint spawn to tp["location"] and makes tp["yaw"] the base direction. The game
+        has to stream the area in and keep Sam there: he must stay within 150 units sideways and not fall more
+        than 300 units, read back after 8 s, or the spot fails."""
+        want = [float(v) for v in tp["location"]]
+        self.game.set_location(self.pawn, want)
+        self.hold(8.0)
+        got = [float(v) for v in self.game.location(self.pawn)]
+        side, drop = float(np.hypot(got[0] - want[0], got[1] - want[1])), want[2] - got[2]
+        info = {"asked": want, "landed": [round(v, 1) for v in got], "sideways": round(side, 1), "drop": round(drop, 1)}
+        if side > 150 or drop > 300:
+            raise RuntimeError(f"teleport did not hold: {info}")
+        self.base_yaw, self.base_pitch = float(tp["yaw"]), float(tp.get("pitch", 0.0))
+        return info
 
     def _rot(self) -> tuple[float, float]:
         yaw, pitch, _ = self.game.rotation(self.controller)
@@ -396,10 +424,6 @@ class Spot:
         stops = [(float(y), float(p)) for p in pitches for y in yaws]
         if stops[0] != (0.0, 0.0):
             raise ValueError("the first pitch must be 0: the first stop is the reference pose (yaw 0, pitch 0)")
-        hwnd = game_window(self.a.pid)
-        if hwnd:
-            front(hwnd)
-            self._calibrate_mouse()
         self.move("to_start", 0.0, 0.0, 0.5)
         self.hold(2.0)
         for i, (y, p) in enumerate(stops):
@@ -425,6 +449,67 @@ class Spot:
         self.stop("y0_p0_after", outline="after")
         if self.spot.get("gunfire", False):
             self.window("gunfire", "combat", lambda: (mouse_fire_burst(6, 0.12), self.hold(0.5)))
+    def light_dump(self, dest: str) -> str | None:
+        """One frame of the proxy's light and flare dump (framedump\\f<frame>_lights.tsv, written when
+        [Proxy] CaptureDraws goes from 0 to 1), copied to `dest`."""
+        folder = os.path.join(self.a.system, "framedump")
+        before = set(os.listdir(folder)) if os.path.isdir(folder) else set()
+        set_ini(self.ini, "Proxy", "CaptureDraws", "1")
+        new = lambda: [n for n in (os.listdir(folder) if os.path.isdir(folder) else []) if n.endswith("_lights.tsv") and n not in before]
+        self.hold(6.0, until=lambda: bool(new()))
+        set_ini(self.ini, "Proxy", "CaptureDraws", "0")
+        time.sleep(0.5)
+        if not new():
+            return None
+        shutil.copy2(os.path.join(folder, new()[0]), dest)
+        return os.path.basename(dest)
+
+    def switch_test(self) -> None:
+        """At the reference pose, the same capture once per variant with exactly one thing changed (an ini edit,
+        or the goggles on). The ini is put back byte for byte after each variant. switch_report.py turns the
+        windows into numbers."""
+        keys = self.spot.get("goggleKeys", {"toggle": "F9", "cycle": "F10"})
+        with open(self.ini, encoding="latin-1", newline="") as f:
+            original = f.read()
+        self.move("to_switch", 0.0, 0.0, 1.0)
+        os.makedirs(os.path.join(self.out, "switch"), exist_ok=True)
+        for v in self.spot.get("switches", SWITCHES):
+            name = v["name"]
+            try:
+                for section, key, value in v.get("ini", []):
+                    set_ini(self.ini, section, key, value)
+                if v.get("goggles"):
+                    hwnd = game_window(self.a.pid)
+                    if hwnd:
+                        front(hwnd)
+                    tap(keys["toggle"])
+                self.hold(3.0)
+                rel = f"frames/switch_{name}.gray"
+                w = self.window(f"switch_{name}", "switch", lambda: (self.capture(rel, 30), self.dump(f"switch_{name}")),
+                                frames=rel, frameSize=[CAP_W, CAP_H], dump=f"switch_{name}", switch=v)
+                w["lights"] = self.light_dump(os.path.join(self.out, "switch", f"{name}_lights.tsv"))
+                w["gamePose"] = [self.rel_pose()]
+            finally:
+                if v.get("goggles"):
+                    tap(keys["toggle"])
+                if v.get("restore"):
+                    for section, key, value in v["restore"]:
+                        set_ini(self.ini, section, key, value)
+                    self.hold(3.0)
+                write_ini(self.ini, original)
+                self.hold(3.0)
+
+    def light_switch(self, flip: dict) -> None:
+        """Faces the reference pose, presses the use key (the spot stands Sam at a light switch) and records the
+        screen for flip["seconds"], so the time the room takes to go dark can be measured."""
+        self.move("to_light_switch", 0.0, 0.0, 1.0)
+        rel, key = "frames/light_switch.gray", flip.get("key", "SPACE")
+        hwnd = game_window(self.a.pid)
+        if hwnd:
+            front(hwnd)
+        self.window("light_switch", "switch", lambda: (tap(key), self.capture(rel, int(30 * flip.get("seconds", 20)))),
+                    frames=rel, frameSize=[CAP_W, CAP_H], switch={"name": "light_switch", "key": key})
+
     def set_rt(self, on: bool) -> None:
         set_ini(self.ini, "Lights", "AutoRaytracing", "1" if on else "0")
         if on:
@@ -521,8 +606,19 @@ def main() -> int:
         gap = float(np.linalg.norm(np.subtract(loc, cp["location"])))
         if gap > 150:
             raise RuntimeError(f"Sam spawned {gap:.0f} units from the recorded checkpoint position")
-        s.sweep_and_pan()
-        s.goggles()
+        if "teleport" in spot:
+            result["teleport"] = s.teleport(spot["teleport"])
+        hwnd = game_window(a.pid)
+        if hwnd:
+            front(hwnd)
+            s._calibrate_mouse()
+        if spot.get("switchTest"):
+            s.switch_test()
+        if not spot.get("switchOnly"):
+            s.sweep_and_pan()
+            s.goggles()
+        if spot.get("lightSwitch"):
+            s.light_switch(spot["lightSwitch"])
     except Exception as e:   # recorded in spot.json; gate.py fails the spot
         result["error"] = f"{type(e).__name__}: {e}"
         print("SPOT ERROR", result["error"])
