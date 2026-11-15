@@ -1,0 +1,68 @@
+{
+  "dxvk_remix_head": "b81a7b566b1eeb9edb4dc2b3c9d3972e0f253ad4",
+  "regions": [
+    {
+      "file": "util/util_bridgecommand.cpp",
+      "from": "DECL_BRIDGE_FUNC(void, syncDataQueue",
+      "to": "DECL_BRIDGE_FUNC(Header, pop_front)",
+      "model": "Send, SendDoubleOverflow, SendOverwrite, Wake1, Wake2, EnterWait, Overwrites, TooBig; constant WriterMayWait",
+      "sha256": "bc8ddf9fef05c58145d73d04d298e453d13bc67cb4df5535524af4eac5877943"
+    },
+    {
+      "file": "util/util_bridgecommand.cpp",
+      "from": "DECL_COMMAND_FUNC(,Command,",
+      "to": "template class Bridge<BridgeId::Module>;",
+      "model": "BeginCmd, EndCmd, EndRetry, PushHeader; constants UidFirst, StageSetters",
+      "sha256": "dad69bc3305a65cf282d0ba71c6b5a3924c653354a829d64830ae0a811a14f80"
+    },
+    {
+      "file": "util/util_bridgecommand.h",
+      "from": null,
+      "to": null,
+      "model": "Need (send_data memUsed), RPull (get_data clears serverResetPosRequired)",
+      "sha256": "ee26a7daebeab7d27c080ecba85a2f7ab23f7874693cc4417c48f40c9d06dab2"
+    },
+    {
+      "file": "util/util_circularqueue.h",
+      "from": null,
+      "to": null,
+      "model": "Inc",
+      "sha256": "7ac58ea74b28ee7c13097fdaa9368770106e258ecafa490ce1aa09422767294a"
+    },
+    {
+      "file": "util/util_circularbuffer.h",
+      "from": null,
+      "to": null,
+      "model": "BlobStart, ItemSlots, ItemEnd",
+      "sha256": "dda3f61ea77f75e033bca76642332d0ce6b2c0ef6e7fe9e6030a0ca4291358ca"
+    },
+    {
+      "file": "util/util_atomiccircularqueue.h",
+      "from": null,
+      "to": null,
+      "model": "stg / pub, MaxStaged, the queue-full branch of EndCmd",
+      "sha256": "3407f03d6078c09d46461ba89356df5b5bd9d4e8d2612ed718dc38eb46890777"
+    },
+    {
+      "file": "util/util_ipcchannel.h",
+      "from": null,
+      "to": null,
+      "model": "Init (serverDataPos = -1, clientDataExpectedPos = -1, semaphore 0 of 1)",
+      "sha256": "3e834ec49cbd0b135845595797dc2272ce43277b632a2e48ed35c8c1981897f8"
+    },
+    {
+      "file": "server/main.cpp",
+      "from": "// Ensure the data position between client and server is in sync after processing the command",
+      "to": "const auto count = DeviceBridge::end_read_data();",
+      "model": "RPublish; constant ReaderPublishes",
+      "sha256": "bb9495ff882642032f15ec52ba04f8903e816fcd78f10a6f3c1cd24ad64694aa"
+    },
+    {
+      "file": "client/d3d9_device_base.cpp",
+      "from": "ClientMessage c(m_ex ? Commands::IDirect3D9Ex_CreateDeviceEx",
+      "to": "const auto header = DeviceBridge::pop_front();",
+      "model": "constant HandshakeFirst",
+      "sha256": "13371ff81e98fab1d7102fa9edac33d4a098a063c8a2ce7788e9ca1cc71221c4"
+    }
+  ]
+}

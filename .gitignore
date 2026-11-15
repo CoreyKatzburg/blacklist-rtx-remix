@@ -1,0 +1,37 @@
+# Large binaries, cloned upstream repos, runtime packages, and test fixtures
+pkg/
+src/
+fixtures/
+*.zip
+*.7z
+*.rar
+
+# Build outputs and compiler artifacts
+*.dll
+*.exe
+*.obj
+*.pdb
+*.lib
+*.exp
+*.ilk
+*.pyc
+__pycache__/
+materials/deps/
+play-setup/glow/mod/
+play-setup/glow/cache/
+tests/lightcal_published.tsv
+
+# Runtime logs, backups, locks, and generated DDS caches
+play-setup/logs/
+play-setup/backups/
+play-setup/resting/
+play-setup/launcher-api-restore.txt
+play-setup/reports/*.log
+AGENT_GAME_LOCK.txt
+play-setup/AGENT_GAME_LOCK.txt
+materials/textures/*.dds
+glow/mod/
+
+# Formal checks: downloaded model checker and per-run outputs
+tests/formal/tools/
+tests/formal/out/
