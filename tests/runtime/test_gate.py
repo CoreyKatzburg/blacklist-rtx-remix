@@ -69,6 +69,16 @@ class MathTest(unittest.TestCase):
         self.assertEqual(gate.find_flashes(pulse), [])                      # ...and slow pulsing is missed by flashes
         self.assertGreater(gate.still_flicker(pulse)[1], gate.THRESHOLDS["still_luma_drift"])
 
+    def test_large_shift_compares_without_shift_not_nan(self):
+        # Phase correlation can report a shift that leaves no area to compare (16 of 36 rows here). That returned NaN,
+        # which every "> limit" test silently reads as "not a flash". Expected value: the unshifted 98th percentile
+        # of 8x8 block means of |a - b| over the 2 px border that the comparison keeps.
+        a = self.rng.uniform(0, 255, (36, 64)).astype(np.float32)
+        b = np.roll(a, (16, 0), axis=(0, 1))
+        d = np.abs(a - b)[2:-2, 2:-2]
+        blocks = d[:32, :56].reshape(4, 8, 7, 8).mean(axis=(1, 3))
+        self.assertAlmostEqual(gate.mc_error(a, b), float(np.percentile(blocks, 98)), places=4)
+
     def test_neon(self):
         img = np.full((10, 10, 3), 0.5, np.float32)
         img[0, 0] = (1.2, 1.1, 1.15)         # white highlight
@@ -111,6 +121,22 @@ class MathTest(unittest.TestCase):
             self.assertIn(1, data)
             self.assertTrue(any("frameTimeMs" in x for x in problems))
             self.assertTrue(any("not JSON" in x for x in problems))
+
+
+class LatencyTableTest(unittest.TestCase):
+    def test_present_row_reads_the_present_duration_not_the_clock(self):
+        # Real rows: the entry clock is ~5.5 million ms, so reading it as a duration gave a 5,616,411 ms median.
+        n = 30
+        proxy = {f: [str(f), f"{5_500_000 + 41.0 * f:.3f}", "45.000", f"{40.0 + f % 3:.3f}", "1400", "8"]
+                 for f in range(1, n + 1)}
+        spot = {"name": "s", "_data": {"telemetry": {}, "proxy": proxy}, "windows": []}
+        window = {"kind": "still", "telemetry": [0, n], "proxy": [0, n]}
+        rows = gate.build_latency_contributors([spot], [(spot, window)])
+        present = [r for r in rows if r["contributor"].startswith("D3D9 Present")]
+        game = [r for r in rows if r["contributor"].startswith("Game Engine CPU")]
+        self.assertEqual(len(present), 1)
+        self.assertAlmostEqual(present[0]["medianMs"], float(np.median([40.0 + f % 3 for f in range(1, n + 1)])), 3)
+        self.assertAlmostEqual(game[0]["medianMs"], float(np.median([45.0 - 40.0 - f % 3 for f in range(1, n + 1)])), 3)
 
 
 class FakeRunTest(unittest.TestCase):

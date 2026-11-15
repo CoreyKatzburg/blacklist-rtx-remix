@@ -154,8 +154,10 @@ def mc_error(a: np.ndarray, b: np.ndarray, block: int = 8, fa=None, fb=None) -> 
     """Motion-compensated difference: shift b onto a, then the 98th percentile of 8x8-block mean |a - b| (0-255).
     A percentile of blocks catches both a whole-frame flash and a local pop."""
     dy, dx = shift(a, b, fa, fb)
-    b = np.roll(b, (dy, dx), axis=(0, 1))
     m = max(abs(dy), abs(dx)) + 2
+    if a.shape[0] <= 2 * m or a.shape[1] <= 2 * m:   # the shift leaves no area to compare: use no shift (not NaN)
+        dy, dx, m = 0, 0, 2
+    b = np.roll(b, (dy, dx), axis=(0, 1))
     d = np.abs(a - b)[m:-m, m:-m]
     h, w = (d.shape[0] // block) * block, (d.shape[1] // block) * block
     if h == 0 or w == 0:
@@ -695,13 +697,16 @@ def build_latency_contributors(spots: list[dict], scene_pairs: list[tuple[dict, 
 
     add_series("GPU Ray-Tracing & Denoising (gpuTimeMs)", gpu, "rtx_telemetry.jsonl")
     add_series("CPU / Bridge Queue Wait Overhead (frameTime - gpuTime)", waits, "rtx_telemetry.jsonl")
+    # d3d9_proxy_frames.csv columns (proxy_diagnostics.cpp FinishTracedFrame): 1 = Present entry clock (ms since
+    # boot, not a duration), 2 = interval since the previous Present, 3 = time spent inside this Present.
+    # The game's own CPU share is approximated as the interval minus this frame's Present.
     _, prows = coverage(scene_pairs, "proxy", "proxy")
     present_ms = []
     other_cpu_ms = []
     for r in prows:
         try:
-            present_ms.append(float(r[1]))
-            other_cpu_ms.append(float(r[3]))
+            present_ms.append(float(r[3]))
+            other_cpu_ms.append(max(0.0, float(r[2]) - float(r[3])))
         except (IndexError, ValueError):
             continue
     add_series("D3D9 Present Bridge Sync (presentMs)", present_ms, "d3d9_proxy_frames.csv")
