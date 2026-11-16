@@ -72,6 +72,10 @@ struct Settings {
     // (lightcal::Qualifies). Off by default: every publish change starts off until a live run shows its numbers.
     // The weapon-class rule's key, WeaponSpotByShape, lives in tuning.
     bool keepTrackedLights = false;
+    // HideLightAt=x,y,z[;x,y,z]: test only, empty by default. Point and spot lights at those positions are not
+    // published (lightcal::Hidden), for off, on, off tests of one light.
+    lightcal::HideList hide;
+    bool hideListBad = false;
     float standInRadius = 2.5f;       // max bulb radius in game units (cm), scaled per flare element size
     float standInIntensity = 20.0f;   // Remix emissive intensity
     // [Proxy] EnableDebuggingTelemetry=1: write lightpub_trace.csv next to the game exe (one line per light change).
@@ -127,6 +131,13 @@ void LoadSettings(const wchar_t* ini) {
     s.standInSkipSamGear = GetPrivateProfileIntW(L"Lights", L"StandInSkipSamGear", 0, ini) != 0;
     s.tuning.weaponSpotByShape = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Lights", L"WeaponSpotByShape", 0, ini)), 0, 2);
     s.keepTrackedLights = GetPrivateProfileIntW(L"Lights", L"KeepTrackedLights", 0, ini) != 0;
+    wchar_t hideText[512];
+    char hideAscii[512];
+    GetPrivateProfileStringW(L"Lights", L"HideLightAt", L"", hideText, 512, ini);
+    int i = 0;
+    for (; i < 511 && hideText[i]; ++i) hideAscii[i] = hideText[i] < 128 ? static_cast<char>(hideText[i]) : '?';
+    hideAscii[i] = 0;
+    s.hideListBad = !lightcal::ParseHideList(hideAscii, &s.hide);
     s.standInRadius = IniFloat(ini, L"StandInRadius", 2.5f);
     s.standInIntensity = IniFloat(ini, L"StandInIntensity", 20.0f);
     s.trace = GetPrivateProfileIntW(L"Proxy", L"EnableDebuggingTelemetry", 0, ini) != 0;
@@ -203,7 +214,7 @@ bool ReadNode(uintptr_t node, NodeData* out) {
 
 // alreadyTracked: published now with KeepTrackedLights=1 (see lightcal::Qualifies).
 bool Wanted(const NodeData& n, bool alreadyTracked = false) {
-    if (!lightcal::Qualifies(n, alreadyTracked)) return false;
+    if (!lightcal::Qualifies(n, alreadyTracked) || lightcal::Hidden(n, g_settings.hide)) return false;
     switch (n.type) {
     case 1: return g_settings.includePoint;
     case 2: return g_settings.includeSpot;
@@ -304,7 +315,7 @@ uint32_t CollectLights(uintptr_t database) {
         !Read(g_lightClass + 0x10, &classIndex) || !heads || classIndex >= headCount) return 0;
     uintptr_t head = 0, node = 0;
     if (!Read(heads + classIndex * 4, &head) || !head || !Read(head, &node)) return 0;
-    uint32_t count = 0;
+    uint32_t count = 0, hidden = 0;
     for (int guard = 0; node && guard < 8192 && count < g_settings.maxLights; ++guard) {
         uintptr_t cls = 0, next = 0;
         if (!Read(node + 0x1C, &cls) || !Read(node + 0x28, &next)) break;
@@ -312,6 +323,7 @@ uint32_t CollectLights(uintptr_t database) {
         s.data = {};
         if (cls == g_lightClass && ReadNode(node, &s.data)) {
             if (g_presentCount < kMaxPresent) g_present[g_presentCount++] = node;
+            hidden += lightcal::Hidden(s.data, g_settings.hide) && lightcal::Qualifies(s.data, KeptTracked(node));
             if (Wanted(s.data, KeptTracked(node))) {
                 s.node = node;
                 ++count;
@@ -319,6 +331,17 @@ uint32_t CollectLights(uintptr_t database) {
         }
         node = next;
     }
+    // HideLightAt: one line whenever the number of lights it holds back changes, so a run shows what the key acted on.
+    static uint32_t loggedHidden = 0;
+    static size_t loggedPositions = 0;
+    static bool loggedBad = false;
+    const size_t positions = g_settings.hide.count;
+    if (g_log && (hidden != loggedHidden || positions != loggedPositions || g_settings.hideListBad != loggedBad))
+        g_log("lightpub: HideLightAt hides %u lights at %u positions%s", hidden, static_cast<unsigned>(positions),
+              g_settings.hideListBad ? " (the ini value is not x,y,z;x,y,z, so nothing is hidden)" : "");
+    loggedHidden = hidden;
+    loggedPositions = positions;
+    loggedBad = g_settings.hideListBad;
     return count;
 }
 

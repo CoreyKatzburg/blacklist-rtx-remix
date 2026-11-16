@@ -55,6 +55,7 @@ struct Node {
 };
 struct Lifecycle {
     bool keep = false;
+    lightcal::HideList hide;   // [Lights] HideLightAt, applied where lightpub.cpp Wanted applies it
     lightcal::Tuning tuning;
     lightcal::LightLifecycleTracker<16> tracker;
     lightcal::DroppedWhilePresent<16> dropped;
@@ -66,6 +67,7 @@ struct Lifecycle {
             const lightcal::TrackedEntry* t = tracker.Find(n.id);
             const bool wasPublished = t && t->handle;
             lightcal::PublishedLight pub;
+            if (lightcal::Hidden(n.data, hide)) continue;
             if (!lightcal::ConvertGameLight(n.data, tuning, &pub, keep && wasPublished)) continue;
             void* handle = nullptr;
             uint32_t made = 0;
@@ -209,6 +211,59 @@ static void KeyCases() {
     }
 }
 
+static lightcal::NodeData At(lightcal::NodeData n, float x, float y, float z) {
+    n.position[0] = x; n.position[1] = y; n.position[2] = z;
+    return n;
+}
+
+// [Lights] HideLightAt (test only): the two green-hall candidates from run 142638, 2A262500 at -8130,2023,115 and
+// 2A262980 at -7525,2023,115 (both point lights, colour 0.043 0.059 0.069, range 375).
+static void HideCases() {
+    using lightcal::HideList;
+    HideList h;
+    CHECK(lightcal::ParseHideList("", &h) && h.count == 0, "hide: empty text should parse to no positions");
+    CHECK(lightcal::ParseHideList("-8130,2023,115", &h) && h.count == 1 && h.pos[0][0] == -8130.0f &&
+              h.pos[0][2] == 115.0f, "hide: one position should parse");
+    CHECK(lightcal::ParseHideList(" -8130, 2023, 115 ; -7525,2023,115", &h) && h.count == 2 && h.pos[1][0] == -7525.0f,
+          "hide: two positions with spaces should parse");
+    CHECK(!lightcal::ParseHideList("-8130,2023", &h) && h.count == 0, "hide: two numbers must be refused, list empty");
+    CHECK(!lightcal::ParseHideList("-8130,2023,115;x", &h) && h.count == 0, "hide: trailing junk must be refused");
+    CHECK(!lightcal::ParseHideList("1,1,1;2,2,2;3,3,3;4,4,4;5,5,5;6,6,6;7,7,7;8,8,8;9,9,9", &h) && h.count == 0,
+          "hide: nine positions (more than kMaxHiddenPositions) must be refused");
+
+    const lightcal::NodeData cyan = Light(1, 0.0689f, 375.0f);
+    lightcal::ParseHideList("-8130,2023,115", &h);
+    CHECK(lightcal::Hidden(At(cyan, -8130, 2023, 115), h), "hide: the listed light should be hidden");
+    CHECK(!lightcal::Hidden(At(cyan, -7525, 2023, 115), h), "hide: its twin 6 m along the hall must stay");
+    CHECK(lightcal::Hidden(At(cyan, -8130 + 9.0f, 2023, 115), h), "hide: 9 cm off should still match");
+    CHECK(!lightcal::Hidden(At(cyan, -8130 + 11.0f, 2023, 115), h), "hide: 11 cm off must not match");
+    CHECK(!lightcal::Hidden(At(cyan, -8130, 2023, 165), h), "hide: 50 cm above must not match (all three axes count)");
+    lightcal::NodeData sun = At(Light(3, 1.0f), -8130, 2023, 115), probe = At(Light(4, 1.0f), -8130, 2023, 115);
+    CHECK(!lightcal::Hidden(sun, h) && !lightcal::Hidden(probe, h), "hide: sun and room fill must never be hidden");
+    CHECK(lightcal::Hidden(At(GuardFlashlight(545.0f), -8130, 2023, 115), h), "hide: a spot light there is hidden too");
+
+    // Off, on, off in one run: base, then hide 2A262500, then the key emptied again.
+    Lifecycle s;
+    const std::vector<Node> hall = {{0x2A262500, At(cyan, -8130, 2023, 115)}, {0x2A262980, At(cyan, -7525, 2023, 115)},
+                                    {0x2A26DEAD, At(Light(1, 0.0f), -8130, 2023, 115)}};   // never qualifies
+    s.Step(hall);
+    void* twin = s.Handle(0x2A262980);
+    CHECK(s.created == 2 && s.Handle(0x2A262500) && twin, "hide: base should publish the two lit lights, got %u", s.created);
+    s.hide = h;
+    s.Step(hall);
+    CHECK(s.destroyed == 1 && !s.Handle(0x2A262500) && s.Handle(0x2A262980) == twin && s.created == 2,
+          "hide on: destroyed %u (want 1), the twin must keep its handle, nothing created (%u)", s.destroyed, s.created);
+    s.hide = HideList{};
+    s.Step(hall);
+    CHECK(s.created == 3 && s.Handle(0x2A262500) && s.Handle(0x2A262980) == twin && !s.Handle(0x2A26DEAD),
+          "hide off again: the hidden light comes back and only it (created %u, want 3)", s.created);
+    // The key can only remove lights: with it on from the first frame, fewer lights exist, never more.
+    Lifecycle on;
+    on.hide = h;
+    for (int f = 0; f < 3; ++f) on.Step(hall);
+    CHECK(on.created == 1 && !on.Handle(0x2A26DEAD), "hide from the start: created %u, want 1", on.created);
+}
+
 int main() {
     // A light the game cuts at once on frame 50: started, then stopped on frame 50 with its full brightness.
     {
@@ -280,6 +335,7 @@ int main() {
         std::filesystem::remove(path);
     }
     KeyCases();
+    HideCases();
     std::printf(g_failures ? "light_trace_test: %d FAILED\n" : "light_trace_test: all passed\n", g_failures);
     return g_failures ? 1 : 0;
 }

@@ -311,6 +311,51 @@ inline bool ConvertGameLight(const NodeData& n, const Tuning& tuning, PublishedL
     return true;
 }
 
+// ---- Test-only: hide chosen lights ([Lights] HideLightAt, empty by default) -----------------------------------------
+// "x,y,z;x,y,z" in game cm. A point or spot light within kHideMatchCm of a listed position is not published, so a
+// test can switch one light off, on, off and see what it adds to the picture. Positions, not node addresses: the
+// nodes hold their place in the level from launch to launch, but their addresses do not (the three con_bright_hall
+// nodes checked in run 084921 appear in none of the six other launches' dumps). The key only removes lights.
+constexpr float kHideMatchCm = 10.0f;
+constexpr size_t kMaxHiddenPositions = 8;
+struct HideList {
+    size_t count = 0;
+    float pos[kMaxHiddenPositions][3] = {};
+};
+
+// Returns false, with an empty list, when the text is not 1 to kMaxHiddenPositions groups of three numbers.
+inline bool ParseHideList(const char* text, HideList* out) {
+    *out = HideList{};
+    if (!text) return true;
+    while (*text == ' ') ++text;
+    if (!*text) return true;
+    HideList list;
+    for (const char* p = text; *p;) {
+        float v[3];
+        int used = 0;
+        if (list.count == kMaxHiddenPositions ||
+            sscanf_s(p, " %f , %f , %f %n", &v[0], &v[1], &v[2], &used) != 3 || used == 0)
+            return false;
+        for (int k = 0; k < 3; ++k) list.pos[list.count][k] = v[k];
+        ++list.count;
+        p += used;
+        if (*p == ';') ++p;
+        else if (*p) return false;
+    }
+    *out = list;
+    return true;
+}
+
+inline bool Hidden(const NodeData& n, const HideList& list) {
+    if (n.type != 1 && n.type != 2) return false;
+    for (size_t i = 0; i < list.count; ++i) {
+        const float dx = n.position[0] - list.pos[i][0], dy = n.position[1] - list.pos[i][1],
+                    dz = n.position[2] - list.pos[i][2];
+        if (dx * dx + dy * dy + dz * dz <= kHideMatchCm * kHideMatchCm) return true;
+    }
+    return false;
+}
+
 // Pure state tracker for game-to-Remix light lifecycle: updates moving/pulsing lights in place via CreateLight
 // with a stable per-node handle hash (never DestroyLight + CreateLight on motion, which resets Remix's temporal
 // light history and causes camera-turn / patrolling-flashlight flicker). DestroyLight runs only when a node
