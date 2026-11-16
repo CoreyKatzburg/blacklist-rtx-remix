@@ -108,6 +108,7 @@ static std::vector<std::string> readLines(const std::string& path) {
 static void testTelemetry(const std::string& dir) {
   RtxFrameTelemetry t;
   t.frame = 123456789012ull;
+  t.qpcMs = 98765432.125;
   t.frameTimeMs = 11.1111;
   t.gpuTimeMs = 9.87654;
   t.instances = 4000000000u;
@@ -134,13 +135,48 @@ static void testTelemetry(const std::string& dir) {
   t.passes.push_back(RtxPassTime { "InjectRTX/Gate Telemetry", -1.0, 0.125, 2 });
   t.newLegacyMaterials = { 0x0123456789ABCDEFull, 0x1ull };
   t.rgbThumb = "BBBB";
-  char line[1024];
+
+  // Normal gate summary (worker E's fake cases). Instance 0: every normal zero, so every triangle is
+  // zero-normal and none can be judged inward. Instance 1: some inward. Instance 2: normals fully flipped
+  // (inward == tris), so it must sort first. Instance 3: static with zero normals, counted apart from skinned.
+  {
+    std::vector<RtxGateInstance> gated(4);
+    gated[0].tris = 300; gated[0].zeroNormal = 300; gated[0].inward = 0;
+    gated[1].tris = 500; gated[1].inward = 12; gated[1].geomHash = 0xB1ull;
+    gated[2].tris = 200; gated[2].inward = 200; gated[2].geomHash = 0xA2ull; gated[2].albedoHash = 0xC0FFEEull;
+    gated[2].cull = 2; gated[2].flip = true; gated[2].enc = true;
+    gated[3].skinned = false; gated[3].tris = 900; gated[3].zeroNormal = 40;
+    RtxFrameTelemetry s;
+    summarizeGateInstances(gated, s);
+    CHECK(s.zeroNormalInstances == 1 && s.zeroNormalStaticInstances == 1, "zero-normal instances counted by kind: %u skinned %u static",
+          s.zeroNormalInstances, s.zeroNormalStaticInstances);
+    CHECK(s.topInwardInstances.size() == 2 && s.topInwardInstances[0].geomHash == 0xA2ull &&
+          s.topInwardInstances[1].geomHash == 0xB1ull, "fully flipped instance first, zero-normal and static instances absent");
+    std::vector<RtxGateInstance> many(12);
+    for (uint32_t i = 0; i < many.size(); ++i) {
+      many[i].tris = 100;
+      many[i].inward = 1 + (i % 3);
+      many[i].geomHash = i;
+    }
+    summarizeGateInstances(many, s);
+    CHECK(s.topInwardInstances.size() == kTopInwardInstances && s.topInwardInstances[0].inward == 3 &&
+          s.topInwardInstances[0].geomHash == 2 && s.topInwardInstances.back().inward == 2,
+          "list capped at 8, most inward first, ties in dispatch order");
+    t.zeroNormalSkinnedTriangles = 300;
+    t.zeroNormalStaticTriangles = 40;
+    summarizeGateInstances(gated, t);
+  }
+  char line[2048];
   const size_t n = formatTelemetryLine(line, sizeof(line), t);
   CHECK(n > 0 && line[n - 1] == '\n', "line ends with a newline");
-  CHECK(std::strstr(line, "\"frame\":123456789012,") != nullptr, "frame printed as integer: %s", line);
+  CHECK(std::strstr(line, "\"frame\":123456789012,\"qpcMs\":98765432.125,") != nullptr, "frame and qpcMs printed: %s", line);
   CHECK(std::strstr(line, "\"cameraCut\":true") != nullptr, "cameraCut printed as JSON bool");
   CHECK(std::strstr(line, "\"instances\":4000000000,") != nullptr, "uint32 printed unsigned");
   CHECK(std::strstr(line, "\"skinnedTriangles\":42000,\"inwardSkinnedTriangles\":7") != nullptr, "skinned triangle fields printed: %s", line);
+  CHECK(std::strstr(line, "\"zeroNormalSkinnedTriangles\":300,\"zeroNormalInstances\":1,\"zeroNormalStaticTriangles\":40,"
+                          "\"zeroNormalStaticInstances\":1,\"topInwardInstances\":[{\"inward\":200,\"tris\":200,"
+                          "\"geomHash\":\"00000000000000A2\",\"albedoHash\":\"0000000000C0FFEE\",\"cull\":2,\"flip\":1,\"blend\":0,"
+                          "\"enc\":1},{\"inward\":12,") != nullptr, "normal gate fields printed: %s", line);
   CHECK(std::strstr(line, "\"lumaThumb\":\"AAAA\"}") != nullptr, "lumaThumb printed when non-empty: %s", line);
   CHECK(std::strstr(line, "\"rayTraced\":true,\"telemetryCpuMs\":0.250,\"replacedMaterialDraws\":800,\"legacyMaterialDraws\":31,"
                           "\"texturesDemoted\":2,\"textureBudgetMB\":3072.0,\"vramFreeMB\":1185.4,\"thumbNonFinite\":5,\"thumbClipped\":9,") != nullptr,
@@ -171,6 +207,7 @@ static void testTelemetry(const std::string& dir) {
     for (uint32_t i = 0; i < kFrames; i++) {
       RtxFrameTelemetry f;
       f.frame = i;
+      f.qpcMs = (i % 10) == 0 ? 0.0 : 5.0e8 + i * 16.667;   // 0 = frame not stamped
       f.frameTimeMs = 10.0 + (i % 7);
       f.gpuTimeMs = 8.0;
       f.instances = 1500 + i % 13;

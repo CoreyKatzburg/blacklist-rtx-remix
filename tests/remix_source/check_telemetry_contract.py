@@ -8,6 +8,7 @@ import sys
 
 REQUIRED = {
     "frame": int,
+    "qpcMs": (int, float),
     "frameTimeMs": (int, float),
     "gpuTimeMs": (int, float),
     "instances": int,
@@ -18,6 +19,11 @@ REQUIRED = {
     "vramUsedMB": (int, float),
     "skinnedTriangles": int,
     "inwardSkinnedTriangles": int,
+    "zeroNormalSkinnedTriangles": int,
+    "zeroNormalInstances": int,
+    "zeroNormalStaticTriangles": int,
+    "zeroNormalStaticInstances": int,
+    "topInwardInstances": list,
     "rayTraced": bool,
     "telemetryCpuMs": (int, float),
     "replacedMaterialDraws": int,
@@ -53,9 +59,49 @@ def check_maps(obj):
     return problems
 
 
+HEX16 = set("0123456789ABCDEF")
+TOP_KEYS = ("inward", "tris", "geomHash", "albedoHash", "cull", "flip", "blend", "enc")
+
+
+def check_normal_gate(obj):
+    """Problems in one record's normal-gate fields (zero-normal counts and topInwardInstances)."""
+    problems = []
+    ints = [k for k in ("skinnedTriangles", "inwardSkinnedTriangles", "zeroNormalSkinnedTriangles", "zeroNormalInstances",
+                        "zeroNormalStaticTriangles", "zeroNormalStaticInstances") if type(obj.get(k)) is int]
+    if len(ints) == 6 and obj["zeroNormalSkinnedTriangles"] > obj["skinnedTriangles"]:
+        problems.append("zeroNormalSkinnedTriangles above skinnedTriangles")
+    if len(ints) == 6 and (obj["zeroNormalInstances"] > obj["zeroNormalSkinnedTriangles"]
+                           or obj["zeroNormalStaticInstances"] > obj["zeroNormalStaticTriangles"]):
+        problems.append("more zero-normal instances than zero-normal triangles")
+    top = obj.get("topInwardInstances")
+    if not isinstance(top, list):
+        return problems
+    if len(top) > 8:
+        problems.append(f"topInwardInstances has {len(top)} entries, at most 8")
+    previous = None
+    for i, e in enumerate(top):
+        if not isinstance(e, dict) or set(e) != set(TOP_KEYS):
+            problems.append(f"topInwardInstances[{i}] keys {sorted(e) if isinstance(e, dict) else e!r}")
+            continue
+        if any(type(e[k]) is not int for k in ("inward", "tris", "cull", "flip", "blend", "enc")) \
+                or any(not (isinstance(e[k], str) and len(e[k]) == 16 and set(e[k]) <= HEX16) for k in ("geomHash", "albedoHash")):
+            problems.append(f"topInwardInstances[{i}] types {e!r}")
+            continue
+        if not 0 < e["inward"] <= e["tris"] or e["flip"] not in (0, 1) or e["blend"] not in (0, 1) or e["enc"] not in (0, 1):
+            problems.append(f"topInwardInstances[{i}] values {e!r}")
+        if previous is not None and e["inward"] > previous:
+            problems.append(f"topInwardInstances[{i}] not sorted by inward, most first")
+        previous = e["inward"]
+    if type(obj.get("inwardSkinnedTriangles")) is int and sum(
+            e["inward"] for e in top if isinstance(e, dict) and type(e.get("inward")) is int) > obj["inwardSkinnedTriangles"]:
+        problems.append("topInwardInstances inward sum above inwardSkinnedTriangles")
+    return problems
+
+
 def check(path):
     errors = []
     previous = None
+    previous_qpc = None
     count = 0
     with open(path, encoding="utf-8") as f:
         for number, line in enumerate(f, 1):
@@ -76,7 +122,18 @@ def check(path):
                 if obj["frame"] < 0 or (previous is not None and obj["frame"] <= previous):
                     errors.append(f"line {number}: frame {obj['frame']} not increasing")
                 previous = obj["frame"]
+            # qpcMs joins this file to d3d9_proxy_frames.csv column 2. 0 means not stamped; every stamp must
+            # be later than the previous stamp, or the join would put two Remix frames in one proxy frame.
+            qpc = obj.get("qpcMs")
+            if isinstance(qpc, (int, float)) and not isinstance(qpc, bool):
+                if qpc < 0:
+                    errors.append(f"line {number}: qpcMs negative")
+                elif qpc > 0:
+                    if previous_qpc is not None and qpc <= previous_qpc:
+                        errors.append(f"line {number}: qpcMs {qpc} not after {previous_qpc}")
+                    previous_qpc = qpc
             errors += [f"line {number}: {p}" for p in check_maps(obj)]
+            errors += [f"line {number}: {p}" for p in check_normal_gate(obj)]
             for key in ("frameTimeMs", "gpuTimeMs", "textureMemoryMB", "vramUsedMB", "telemetryCpuMs", "textureBudgetMB",
                         "vramFreeMB"):
                 if isinstance(obj.get(key), (int, float)) and not isinstance(obj.get(key), bool) and obj[key] < 0:
