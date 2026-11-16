@@ -174,7 +174,8 @@ def front(hwnd: int) -> bool:
 
 
 SCAN = {"F9": 0x43, "F10": 0x44, "F11": 0x57, "F12": 0x58, "F": 0x21, "G": 0x22, "N": 0x31, "X": 0x2D, "SPACE": 0x39,
-        "ESC": 0x01, "ENTER": 0x1C, "ALT": 0x38, "F4": 0x3E, "UP": 0x48, "DOWN": 0x50, "LEFT": 0x4B, "RIGHT": 0x4D}
+        "ESC": 0x01, "ENTER": 0x1C, "ALT": 0x38, "F4": 0x3E, "UP": 0x48, "DOWN": 0x50, "LEFT": 0x4B, "RIGHT": 0x4D,
+        "CTRL": 0x1D, "SHIFT": 0x2A, "Q": 0x10}
 EXTENDED = {"UP", "DOWN", "LEFT", "RIGHT"}   # the arrow block, not the number pad's arrows
 
 # Switch test variants (spots.json "switches" overrides): each changes exactly one thing against "base".
@@ -231,6 +232,19 @@ def quit_step(hwnd: int, key: str) -> None:
             raise RuntimeError(f"PostMessage {key} failed (error {ctypes.get_last_error()})")
     else:
         tap(key)
+
+
+def files_under(folder: str) -> dict[str, int]:
+    """Every file below `folder`, as {path relative to it: write time in ns} (empty when the folder does not exist)."""
+    return {os.path.relpath(p, folder): os.stat(p).st_mtime_ns
+            for r, _, names in os.walk(folder) for p in (os.path.join(r, n) for n in names)}
+
+
+def written_since(folder: str, before: dict[str, int]) -> list[str]:
+    """Files below `folder` written since the files_under() snapshot `before`. Names alone do not tell: the proxy names
+    its dumps by frame number, which repeats between launches (082350 con_bright_hall_samgear: f6059_lights.tsv was
+    rewritten, but an earlier launch had made one with that name, so the sam_gear light dump was missed)."""
+    return sorted(r for r, t in files_under(folder).items() if before.get(r) != t)
 
 
 def wait_exit(pid: int, seconds: float) -> int | None:
@@ -987,6 +1001,12 @@ class Spot:
         # light switch with its light dumps, so each variant launch also measures the fade (frames/light_switch.gray).
         if cfg.get("lightSwitch"):
             self.light_switch(cfg["lightSwitch"])
+        # cfg["switches"] (worker B, Nov 16): switch steps at the same stop once the fade has settled
+        # (switchesAfter more seconds), in the one variant launch that lists them.
+        if cfg.get("switches"):
+            self.hold(float(cfg.get("switchesAfter", 0)))
+            self.spot = {**self.spot, "switches": cfg["switches"]}
+            self.switch_test()
 
     def bench_window(self, name: str, want: int, tag: str, smi_file: str) -> dict:
         """One still window of at least `want` game frames with nvidia-smi sampling into `smi_file`."""
@@ -1019,9 +1039,9 @@ class Spot:
         """One frame of the proxy's light and flare dump (framedump\\f<frame>_lights.tsv, written when
         [Proxy] CaptureDraws goes from 0 to 1), copied to `dest`."""
         folder = os.path.join(self.a.system, "framedump")
-        before = set(os.listdir(folder)) if os.path.isdir(folder) else set()
+        before = files_under(folder)
         set_ini(self.ini, "Proxy", "CaptureDraws", "1")
-        new = lambda: [n for n in (os.listdir(folder) if os.path.isdir(folder) else []) if n.endswith("_lights.tsv") and n not in before]
+        new = lambda: [n for n in written_since(folder, before) if n.endswith("_lights.tsv")]
         self.hold(6.0, until=lambda: bool(new()))
         set_ini(self.ini, "Proxy", "CaptureDraws", "0")
         time.sleep(0.5)
@@ -1037,7 +1057,10 @@ class Spot:
         keys = self.spot.get("goggleKeys", {"toggle": "F9", "cycle": "F10"})
         with open(self.ini, encoding="latin-1", newline="") as f:
             original = f.read()
-        self.move("to_switch", 0.0, 0.0, 1.0)
+        # "switchView" [yaw, pitch] and "switchFrames" (screen frames at 30/s): worker B's con_bright_hall_keys faces the
+        # pulsing lights to the east and needs three of their 52-56 game-frame cycles in each window.
+        self.move("to_switch", *[float(x) for x in self.spot.get("switchView", [0.0, 0.0])], 1.0)
+        frames = int(self.spot.get("switchFrames", 30))
         os.makedirs(os.path.join(self.out, "switch"), exist_ok=True)
         for v in self.spot.get("switches", SWITCHES):
             name = v["name"]
@@ -1053,7 +1076,7 @@ class Spot:
                 self.hold(3.0)
                 proof = self.await_log(v["expectLog"], mark) if v.get("expectLog") else None
                 rel = f"frames/switch_{name}.gray"
-                w = self.window(f"switch_{name}", "switch", lambda: (self.capture(rel, 30), self.dump(f"switch_{name}")),
+                w = self.window(f"switch_{name}", "switch", lambda: (self.capture(rel, frames), self.dump(f"switch_{name}")),
                                 frames=rel, frameSize=[CAP_W, CAP_H], dump=f"switch_{name}", switch=v)
                 w["lights"] = self.light_dump(os.path.join(self.out, "switch", f"{name}_lights.tsv"))
                 if proof:
@@ -1262,6 +1285,75 @@ class Spot:
         n = raw.size // (CAP_W * CAP_H)
         return raw[: n * CAP_W * CAP_H].reshape(n, CAP_H, CAP_W).astype(np.float32).mean(axis=0)
 
+    def usd_capture(self, c: dict) -> dict:
+        """Worker E (Nov 16): which texture each draw binds. Teleports to c["teleport"], takes the y0_p0 stop as
+        <name>_y0_p0 (final.pfm and, when listed in rasterStops, the ray-tracing-off raster), then asks in the same
+        second for the proxy's draw dump ([Proxy] CaptureDraws) and a Remix USD capture (Ctrl+Shift+Q with
+        rtx.captureShowMenuOnHotkey off). Both are copied to <out>\\<name>\\capture\\ and the capture's new files are
+        removed from the game folder. Remix refuses a capture while replacement assets are loaded ("Cannot begin
+        capture when replacement assets are enabled/loaded"), so rtx.enableReplacementAssets is off from after the
+        stop until the export has ended, then set back on."""
+        name = c["name"]
+        rec: dict = {"name": name, "teleport": self.teleport(c["teleport"])}
+        tag = f"{name}_y0_p0"
+        self.move(f"to_{tag}", 0.0, 0.0, 1.0)
+        self.stop(tag)
+        for yaw, pitch in c.get("extraStops", []):   # more stills here (raster too when listed in rasterStops)
+            self.move(f"to_{name}_y{yaw:g}_p{pitch:g}", float(yaw), float(pitch), 1.0)
+            self.stop(f"{name}_y{yaw:g}_p{pitch:g}")
+        if c.get("extraStops"):
+            self.move(f"back_to_{tag}", 0.0, 0.0, 1.0)   # the capture is taken at y0_p0
+        rec["rayTracing"] = self.rt_is_on()
+        dest = os.path.join(self.out, name, "capture")
+        os.makedirs(dest, exist_ok=True)
+        caps, dumps = os.path.join(self.a.system, "rtx-remix", "captures"), os.path.join(self.a.system, "framedump")
+        rlog = os.path.join(self.a.system, "rtx-remix", "logs", "remix-dxvk.log")
+        old_caps, old_dumps = files_under(caps), files_under(dumps)
+        mark = os.path.getsize(rlog)
+
+        def remix_text() -> str:
+            with open(rlog, "rb") as f:
+                f.seek(mark)
+                return f.read().decode("latin-1")
+        new_dumps = lambda: written_since(dumps, old_dumps)
+        set_ini(self.ini, "RemixConfig", "rtx.captureShowMenuOnHotkey", "False")
+        set_ini(self.ini, "RemixConfig", "rtx.enableReplacementAssets", "False")
+        try:
+            self.hold(3.0)   # the proxy passes [RemixConfig] on to Remix at its next re-read
+            hwnd = game_window(self.a.pid)
+            if not hwnd or not front(hwnd):
+                raise RuntimeError("no game window in front for the capture hotkey")
+            rec["askedFrame"], rec["askedAt"] = self.proxy.last_frame(), time.strftime("%H:%M:%S")
+            set_ini(self.ini, "Proxy", "CaptureDraws", "1")
+            tap("CTRL+SHIFT+Q")
+            self.hold(8.0, until=lambda: any(n.endswith("_draws.tsv") for n in new_dumps()))
+            set_ini(self.ini, "Proxy", "CaptureDraws", "0")
+            self.hold(float(c.get("exportSeconds", 300)),
+                      until=lambda: "End USD export" in remix_text() or "Cannot begin" in remix_text())
+            self.hold(3.0)   # texture files may still be closing
+        finally:
+            set_ini(self.ini, "Proxy", "CaptureDraws", "0")
+            set_ini(self.ini, "RemixConfig", "rtx.enableReplacementAssets", "True")   # removing the key would not undo it
+            remove_ini_key(self.ini, "rtx.captureShowMenuOnHotkey")
+            self.hold(3.0)
+        rec["remixLog"] = [l for l in remix_text().splitlines() if "GameCapturer" in l][:30]
+        for n in new_dumps():
+            shutil.copy2(os.path.join(dumps, n), os.path.join(dest, os.path.basename(n)))
+        rec["drawDump"] = [os.path.basename(n) for n in new_dumps()]
+        added = written_since(caps, old_caps)
+        for rel in added:
+            os.makedirs(os.path.dirname(os.path.join(dest, rel)), exist_ok=True)
+            shutil.copy2(os.path.join(caps, rel), os.path.join(dest, rel))
+            os.remove(os.path.join(caps, rel))
+        rec["captureFiles"] = len(added)
+        rec["captureMB"] = round(sum(os.path.getsize(os.path.join(dest, r)) for r in added) / 2**20, 1)
+        rec["usd"] = [r for r in added if r.lower().endswith((".usd", ".usda", ".usdc"))]
+        problems = ([] if any(n.endswith("_draws.tsv") for n in rec["drawDump"]) else ["no new draw dump"]) + \
+                   ([] if rec["usd"] else ["no new USD capture file"])
+        if problems:
+            rec["error"] = "; ".join(problems)
+        return rec
+
     def quit_test(self, cfg: dict) -> dict:
         """Worker C's quit test (Nov 16): does the game's own quit, or Alt+F4, end in VK_ERROR_DEVICE_LOST?
         cfg: {"goggles": bool, "keys": [[step, seconds after], ...], "holdSeconds": s, "exitSeconds": s}, where a step
@@ -1286,7 +1378,11 @@ class Spot:
         out["askedAt"] = time.strftime("%Y-%m-%d %H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
         code = None
         for i, (key, after) in enumerate(cfg["keys"]):
-            front(hwnd)
+            # 20261116-082350 quit_menu: the confirmed quit hid the game window but the process lived 16 s more, and
+            # the next ENTER went to whatever window was in front. No key goes anywhere but the game.
+            if not front(hwnd):
+                out["steps"].append({"key": key, "skipped": "the game window could not be brought to the front"})
+                break
             quit_step(hwnd, key)
             step = {"key": key, "at": time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"}
             code = wait_exit(self.a.pid, float(after))
@@ -1387,6 +1483,22 @@ def main() -> int:
                 result["rayTracingAtStart"] = s.rt_is_on()
             result["quit"] = s.quit_test(spot["quit"])
             print("QUIT", json.dumps(result["quit"]), flush=True)
+        elif spot.get("captures"):   # worker E's capture launch: several targets after one checkpoint load
+            if not a.no_remix:
+                result["rayTracingAtStart"] = s.rt_is_on()
+            if not hwnd or not front(hwnd):
+                raise RuntimeError("no game window to bring to the front for the captures")
+            s._calibrate_mouse()
+            result["captures"] = []
+            for c in spot["captures"]:   # a failed target is recorded and the next one still runs
+                try:
+                    result["captures"].append(s.usd_capture(c))
+                except Exception as e:   # noqa: BLE001
+                    result["captures"].append({"name": c["name"], "error": f"{type(e).__name__}: {e}"})
+                print("CAPTURE", json.dumps(result["captures"][-1])[:2000], flush=True)
+            bad = [f"{c['name']}: {c['error']}" for c in result["captures"] if c.get("error")]
+            if bad:
+                result["error"] = "; ".join(bad)
         elif spot.get("bench"):
             if not hwnd:
                 raise RuntimeError("no game window to bring to the front for the benchmark")

@@ -449,6 +449,98 @@ class Reference(unittest.TestCase):
         finally:
             n.kill(); n.wait()
 
+    def test_usd_capture_keeps_only_its_own_files_and_puts_the_settings_back(self):
+        # Worker E's capture: the draw dump and the Remix capture asked together, copied out, the new capture files
+        # removed from the game folder (older ones stay), replacement assets back on, and a capture that Remix
+        # refused is an error, not a quiet success.
+        import os, shutil, tempfile, types
+
+        def run(writes_usd):
+            tmp = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, tmp, True)
+            system, out = os.path.join(tmp, "SYSTEM"), os.path.join(tmp, "out")
+            caps, dumps = os.path.join(system, "rtx-remix", "captures"), os.path.join(system, "framedump")
+            logs = os.path.join(system, "rtx-remix", "logs")
+            for d in (os.path.join(caps, "textures"), dumps, logs, out):
+                os.makedirs(d)
+            for p in (os.path.join(caps, "textures", "old.dds"), os.path.join(dumps, "f9_draws.tsv")):
+                open(p, "w").close()   # f9: an earlier launch reached frame 9 too, so the name is taken
+                os.utime(p, ns=(10**18, 10**18))
+            with open(os.path.join(logs, "remix-dxvk.log"), "w") as f:
+                f.write("[GameCapturer][aaaa] End USD export\n")   # an earlier capture's line must not count
+            ini = os.path.join(system, "d3d9_proxy.ini")
+            with open(ini, "w", newline="") as f:
+                f.write("[Proxy]\r\nCaptureDraws=0\r\n[RemixConfig]\r\nrtx.x = 1\r\n")
+
+            def press(key):
+                self.assertEqual(key, "CTRL+SHIFT+Q")
+                with open(ini) as f:
+                    text = f.read()
+                self.assertIn("rtx.enableReplacementAssets = False", text)   # else Remix refuses the capture
+                self.assertIn("CaptureDraws=1", text)                       # asked in the same second
+                with open(os.path.join(dumps, "f9_draws.tsv"), "w") as f:
+                    f.write("this launch")
+                with open(os.path.join(logs, "remix-dxvk.log"), "a") as f:
+                    if writes_usd:
+                        os.makedirs(os.path.join(caps, "meshes"))
+                        open(os.path.join(caps, "capture_1.usda"), "w").close()
+                        open(os.path.join(caps, "meshes", "m.usd"), "w").close()
+                        f.write("[GameCapturer][bbbb] New capture\n[GameCapturer][bbbb] End USD export\n")
+                    else:
+                        f.write("[GameCapturer] Cannot begin capture when replacement assets are enabled/loaded.\n")
+            s = drive.Spot.__new__(drive.Spot)
+            s.a = types.SimpleNamespace(system=system, pid=1)
+            s.ini, s.out = ini, out
+            s.proxy = types.SimpleNamespace(last_frame=lambda: 9)
+            s.teleport, s.move, s.stop = (lambda tp: {"sideways": 0}), (lambda *a: None), (lambda name: None)
+            s.rt_is_on, s.hold = (lambda: {"rayTracedLastFrames": [True]}), (lambda seconds, until=None: None)
+            with mock.patch.object(drive, "tap", press), mock.patch.object(drive, "game_window", lambda pid: 5), \
+                    mock.patch.object(drive, "front", lambda h: True):
+                rec = s.usd_capture({"name": "con_boiler", "teleport": {}})
+            with open(ini) as f:
+                text = f.read()
+            return rec, caps, os.path.join(out, "con_boiler", "capture"), text
+
+        rec, caps, dest, ini_text = run(True)
+        self.assertNotIn("error", rec)
+        self.assertEqual(rec["drawDump"], ["f9_draws.tsv"])
+        self.assertEqual(rec["usd"], ["capture_1.usda", os.path.join("meshes", "m.usd")])
+        self.assertTrue(os.path.exists(os.path.join(dest, "meshes", "m.usd")))
+        self.assertEqual(set(drive.files_under(caps)), {os.path.join("textures", "old.dds")})
+        self.assertIn("rtx.enableReplacementAssets = True", ini_text)
+        self.assertIn("CaptureDraws=0", ini_text)
+        self.assertNotIn("captureShowMenuOnHotkey", ini_text)
+        rec, *_ = run(False)
+        self.assertEqual(rec["error"], "no new USD capture file")
+        self.assertIn("Cannot begin capture", rec["remixLog"][0])
+
+    def test_light_dump_takes_a_rewritten_file_whose_name_an_earlier_launch_used(self):
+        # 082350 con_bright_hall_samgear: the sam_gear step's f6059_lights.tsv was written, but a launch at 07:25 had
+        # made a file with that name, and a check by name missed it (no light dump for the step).
+        import os, shutil, tempfile, types
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        dumps = os.path.join(tmp, "framedump")
+        os.makedirs(dumps)
+        old = os.path.join(dumps, "f6059_lights.tsv")
+        open(old, "w").close()
+        os.utime(old, ns=(10**18, 10**18))
+        ini = os.path.join(tmp, "d3d9_proxy.ini")
+        with open(ini, "w", newline="") as f:
+            f.write("[Proxy]\r\nCaptureDraws=0\r\n")
+        s = drive.Spot.__new__(drive.Spot)
+        s.a, s.ini = types.SimpleNamespace(system=tmp), ini
+
+        def hold(seconds, until=None):
+            with open(old, "w") as f:
+                f.write("this launch")
+        s.hold = hold
+        with mock.patch.object(drive.time, "sleep"):
+            got = s.light_dump(os.path.join(tmp, "sam_gear_lights.tsv"))
+        self.assertEqual(got, "sam_gear_lights.tsv")
+        with open(os.path.join(tmp, "sam_gear_lights.tsv")) as f:
+            self.assertEqual(f.read(), "this launch")
+
     def test_screen_probe_tells_a_lost_game_picture_from_a_dead_display(self):
         # Nov 16: the black no-Remix runs could be the display (off after 30 min idle) or the game picture lost after
         # Present. The marker window's colour in the same grab separates them.
