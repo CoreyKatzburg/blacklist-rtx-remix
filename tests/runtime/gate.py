@@ -7,6 +7,9 @@ incomplete never passes. Frame numbers restart at every game launch, so each spo
 
 Checks (thresholds in THRESHOLDS):
   nan_pixels               non-finite pixels in Remix's final image dumps (<tag>_final.pfm), all sweep stops
+  scene_brightness         two-sided original-game brightness + near-white check vs <tag>_raster.pfm (central 84%
+                           ROI, clipped to [0, 1], on-pose <= 1 deg): per-stop [0.50x, 1.85x], spot median
+                           [0.60x, 1.50x], near-white delta <= +0.10, floor >= 0.03; NOT MEASURED without raster
   neon_fraction            worst dump's share of clipped, strongly coloured pixels: max channel >= 1.0 and
                            (max - min) / max >= 0.5 (white highlights are allowed, neon colours are not)
   skinned_min              fewest active character meshes in any frame (telemetry skinnedInstances)
@@ -79,7 +82,9 @@ THRESHOLDS = {
     "input_lag_margin_ms": 5.0,
     # Speed FAIL (fps_regression): a spot whose median FPS is more than this below the same spot in the previous run.
     "max_fps_drop": 0.10,  # Corey, Nov 15
-    "min_scene_luma": 0.03, "min_raster_luma_ratio": 0.75, "min_angled_sharpness": 0.02,
+    "min_scene_luma": 0.03, "min_raster_luma_ratio": 0.50, "max_raster_luma_ratio": 1.85,
+    "min_spot_median_ratio": 0.60, "max_spot_median_ratio": 1.50, "max_near_white_delta": 0.10,
+    "min_angled_sharpness": 0.02,
     "pose_error_deg": 3.0, "pan_degrees": 350.0, "goggles_corr": 0.8, "goggles_mean_gap": 0.06,
     "goggles_missing_blocks": 0.02, "still_frames": 15, "pan_coverage": 0.9,
     # Recorder checks (recorder_checks). Every limit below is a GUESS, not a value from the game or the source. The
@@ -1232,9 +1237,9 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
                 + ("; " + "; ".join(flicker_bad[:5]) if flicker_bad else ""),
                 ", ".join(sorted(flicker_sources)))
 
-    # image dumps at the stops: NaN, neon, brightness floor, angled sharpness, outline
+    # image dumps at the stops: NaN, neon, two-sided scene_brightness vs raster, angled sharpness, outline
     nan_total, worst_neon, n_final, missing_final, overlaps, outline_missing = 0, 0.0, 0, [], [], []
-    worst_luma, worst_raster_ratio, worst_angled_sharp = float("inf"), float("inf"), float("inf")
+    worst_angled_sharp = float("inf")
     n_angled = 0
     for s, w in pick(("still",)):
         tag = w.get("dump")
@@ -1244,16 +1249,8 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
         if os.path.exists(final):
             img = read_pfm(final)
             nan, neon = neon_stats(img)
-            mean_l, p10_l, sharp = luma_and_sharpness(img)
+            _, _, sharp = luma_and_sharpness(img)
             nan_total += nan; worst_neon = max(worst_neon, neon); n_final += 1
-            worst_luma = min(worst_luma, mean_l)
-            raster = spot_path(s, os.path.join("gate", f"{tag}_raster.pfm"))
-            if raster and os.path.exists(raster):
-                rm, rp10, _ = luma_and_sharpness(read_pfm(raster))
-                if rm > 1e-4:
-                    worst_raster_ratio = min(worst_raster_ratio, mean_l / rm)
-                if rp10 > 1e-4:
-                    worst_raster_ratio = min(worst_raster_ratio, p10_l / rp10)
             if abs(float(w.get("pitch", 0.0))) > 1e-3:
                 worst_angled_sharp = min(worst_angled_sharp, sharp)
                 n_angled += 1
@@ -1268,25 +1265,54 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
             if ov is None:
                 outline_missing.append(f"{s['name']}/{tag}: Sam not in the near field ({count} outline px)"); continue
             overlaps.append((f"{s['name']} {w['outline']}", ov))
-    if missing_final or n_final == 0:
-        detail = f"{len(missing_final)} of {len(missing_final) + n_final} stops have no final image dump"
+    b_thresh = (f"luma >= {THRESHOLDS['min_scene_luma']:g}, stop [{THRESHOLDS['min_raster_luma_ratio']:.2f}x, "
+                f"{THRESHOLDS['max_raster_luma_ratio']:.2f}x], median [{THRESHOLDS['min_spot_median_ratio']:.2f}x, "
+                f"{THRESHOLDS['max_spot_median_ratio']:.2f}x], near-white <= +{THRESHOLDS['max_near_white_delta']:.2f}")
+    b_src = "Remix <tag>_final.pfm + reference <tag>_raster.pfm"
+    if missing_final or n_final == 0 or not good:
+        detail = (f"{len(missing_final)} of {len(missing_final) + n_final} stops have no final image dump"
+                  if (missing_final or n_final == 0) else "no spot ran far enough to judge")
         run.add("nan_pixels", NOT_MEASURED, nan_total, "0", detail, "Remix <tag>_final.pfm")
         run.add("neon_fraction", NOT_MEASURED, round(worst_neon, 6), "< 0.1%", detail, "Remix <tag>_final.pfm")
-        run.add("brightness_floor", NOT_MEASURED, None, f"luma >= {THRESHOLDS['min_scene_luma']:g}", detail, "Remix <tag>_final.pfm")
+        run.add("scene_brightness", NOT_MEASURED, None, b_thresh, detail, b_src)
         run.add("angled_sharpness", NOT_MEASURED, None, f">= {THRESHOLDS['min_angled_sharpness']:g}", detail, "Remix <tag>_final.pfm")
     else:
         run.add("nan_pixels", PASS if nan_total <= THRESHOLDS["nan_pixels"] else FAIL, nan_total, "0",
                 f"{nan_total} non-finite pixels in {n_final} dumps", "Remix <tag>_final.pfm")
         run.add("neon_fraction", PASS if worst_neon < THRESHOLDS["neon_fraction"] else FAIL, round(worst_neon, 6), "< 0.1%",
                 f"worst dump {worst_neon:.4%} clipped neon pixels", "Remix <tag>_final.pfm")
-        b_ok = worst_luma >= THRESHOLDS["min_scene_luma"] and (
-            not math.isfinite(worst_raster_ratio) or worst_raster_ratio >= THRESHOLDS["min_raster_luma_ratio"]
+
+        sys.modules.setdefault("gate", sys.modules[__name__])
+        b_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "analysis", "brightness"))
+        if b_dir not in sys.path:
+            sys.path.insert(0, b_dir)
+        import pfm_brightness  # noqa: E402
+
+        b_th = {k: THRESHOLDS[k] for k in (
+            "min_scene_luma", "min_raster_luma_ratio", "max_raster_luma_ratio",
+            "min_spot_median_ratio", "max_spot_median_ratio", "max_near_white_delta",
+        )}
+        b_sum = pfm_brightness.summarize_gate_run(
+            folder, reference_dirs=[reference] if reference else None, max_pose_error_deg=1.0, thresholds=b_th
         )
-        b_detail = f"darkest stop mean luma {worst_luma:.4f}" + (
-            f", raster match {worst_raster_ratio:.2f}x" if math.isfinite(worst_raster_ratio) else ""
-        )
-        run.add("brightness_floor", PASS if b_ok else FAIL, round(worst_luma, 5),
-                f"luma >= {THRESHOLDS['min_scene_luma']:g} (>= 0.75x raster)", b_detail, "Remix <tag>_final.pfm")
+        b_spots = [b_sum["spots"][s["name"]] for s in good if s["name"] in b_sum.get("spots", {})]
+        if len(b_spots) < len(good) or any(sp["status"] == pfm_brightness.NOT_MEASURED for sp in b_spots):
+            reasons = [f"{s['name']}: {', '.join(b_sum['spots'][s['name']]['reasons'] or ['not measured'])}"
+                       if s["name"] in b_sum.get("spots", {}) else f"{s['name']}: no brightness data"
+                       for s in good if s["name"] not in b_sum.get("spots", {})
+                       or b_sum["spots"][s["name"]]["status"] == pfm_brightness.NOT_MEASURED]
+            run.add("scene_brightness", NOT_MEASURED, None, b_thresh, "; ".join(reasons[:6]), b_src)
+        else:
+            meds = [sp["raster_gamma_ratio_median"] for sp in b_spots if sp["raster_gamma_ratio_median"] is not None]
+            nw_max = max((sp["near_white_delta_max"] for sp in b_spots if sp["near_white_delta_max"] is not None),
+                         default=0.0)
+            failed_sp = [f"{s['name']} ({'; '.join(b_sum['spots'][s['name']]['reasons'])})"
+                         for s in good if b_sum["spots"][s["name"]]["status"] == pfm_brightness.FAIL]
+            val = round(float(meds[0]) if len(meds) == 1 else max(meds), 3) if meds else None
+            b_detail = ("; ".join(failed_sp[:4]) if failed_sp
+                        else f"median {min(meds):.2f}x..{max(meds):.2f}x raster, max near-white delta {nw_max:+.3f}")
+            run.add("scene_brightness", FAIL if failed_sp else PASS, val, b_thresh, b_detail, b_src)
+
         if n_angled == 0:
             run.add("angled_sharpness", NOT_MEASURED, None, f">= {THRESHOLDS['min_angled_sharpness']:g}",
                     "no pitched camera stops measured", "Remix <tag>_final.pfm")

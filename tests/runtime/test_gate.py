@@ -147,6 +147,22 @@ class MathTest(unittest.TestCase):
         self.assertAlmostEqual(res["game"], 14.0)
         self.assertAlmostEqual(res["after"], 8.0)
 
+    def test_brightness_hdr_clip_and_black_raster_guard(self):
+        b_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "analysis", "brightness"))
+        if b_dir not in sys.path:
+            sys.path.insert(0, b_dir)
+        import pfm_brightness  # noqa: E402
+
+        f3 = np.full((36, 64, 3), 3.0, np.float32)
+        r1 = np.full((36, 64, 3), 1.0, np.float32)
+        cmp_hdr = pfm_brightness.compare_final_to_raster(f3, r1)
+        self.assertAlmostEqual(cmp_hdr["gamma_mean_ratio"], 1.0, places=5)
+
+        r0 = np.zeros((36, 64, 3), np.float32)
+        cmp_blk = pfm_brightness.compare_final_to_raster(f3, r0)
+        self.assertTrue(cmp_blk["black_raster"])
+        self.assertIsNone(cmp_blk["gamma_mean_ratio"])
+
 
 class LatencyTableTest(unittest.TestCase):
     def test_present_row_reads_the_present_duration_not_the_clock(self):

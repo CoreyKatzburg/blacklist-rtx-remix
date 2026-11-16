@@ -48,6 +48,10 @@ foreach ($name in 'verify_config.py', 'verify_lights_and_materials.py') {
         Write-Host "   $($results[-1].Note)" -ForegroundColor Yellow
     }
 }
+foreach ($rel in 'analysis\brightness\pfm_brightness.py', 'analysis\brightness\align_sessions.py') {
+    $p = Join-Path $testsDir $rel
+    if (Test-Path $p) { Step (Split-Path $rel -Leaf) { Native $py @($p, '--self-test') } }
+}
 foreach ($file in Get-ChildItem $testsDir -Filter 'verify_materials_*.py' | Sort-Object Name) {
     Step $file.Name { Native $py @($file.FullName) }
 }

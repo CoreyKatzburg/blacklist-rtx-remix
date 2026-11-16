@@ -187,11 +187,20 @@ class Builder:
             color[5:8, 5:30] = (1.0, 1.0, 0.98)             # white clipped highlight: allowed
         if c == "too_dark":
             color *= 0.02
+        if c == "too_dark_vs_raster":
+            color = np.clip(0.14 + pattern[..., None], 0.05, 0.95).repeat(3, axis=2).astype(np.float32)
+        if c == "too_bright_vs_raster":
+            color = np.clip(0.88 + pattern[..., None], 0.05, 0.95).repeat(3, axis=2).astype(np.float32)
+        if c == "too_white_vs_raster":
+            color = np.full((h, w, 3), 0.20, np.float32)       # mean ~0.43 (~1.07x), 30% ROI slab at 0.96 -> nearWhite +0.28
+            color[6:15, :] = 0.96
         if c == "nan_pixel" and tag == "y45_p0":
             color[10, 10] = np.nan
         if c == "neon" and tag == "y180_p30":
             color[20:25, 0:10] = (1.6, 0.1, 1.4)             # 50 px of 2304 = 2% neon magenta
         gate.write_pfm(os.path.join(self.dir, "gate", f"{tag}_final.pfm"), color)
+        if c == "good":
+            gate.write_pfm(os.path.join(self.dir, "gate", f"{tag}_raster.pfm"), color)
         if outline:
             depth = np.full((144, 256), 2000.0, np.float32)
             depth[30:110, 100:150] = 250.0                    # Sam, full-res game depth
@@ -307,7 +316,7 @@ RECORDER = ("step_timing", "skip_occlusion_share", "skip_other_share", "material
 # case -> (checks that must FAIL, checks that must be NOT MEASURED); everything else must PASS.
 CASES = {
     "good": ((), ()),
-    "nan_pixel": (("nan_pixels",), ()),
+    "nan_pixel": (("nan_pixels", "scene_brightness"), ()),
     "nan_frame": (("nonfinite_thumb_pixels",), ()),
     "neon": (("neon_fraction",), ()),
     "no_skinned": (("skinned_min",), ()),
@@ -337,8 +346,11 @@ CASES = {
     "no_mouse_lag": ((), ("input_latency_ms",)),        # missing mouse_lag in spot.json: NOT MEASURED, fails the gate
     "fps_regression": (("fps_regression",), ()),        # 15% below the previous run
     "fps_drop_9pct": ((), ()),                          # 9% below the previous run: passes
-    "no_reference": ((), ("input_latency_ms", "lamps_without_flare")),  # no --reference: NOT MEASURED, fails gate
-    "too_dark": (("brightness_floor",), ()),
+    "no_reference": ((), ("input_latency_ms", "lamps_without_flare", "scene_brightness")),
+    "too_dark": (("scene_brightness",), ()),
+    "too_dark_vs_raster": (("scene_brightness",), ()),
+    "too_bright_vs_raster": (("scene_brightness",), ()),
+    "too_white_vs_raster": (("scene_brightness",), ()),
     "blurry_angles": (("angled_sharpness",), ()),
     "pose_off": (("pose",), ()),
     "pan_short": (("pose",), ()),
@@ -357,14 +369,14 @@ CASES = {
                               "skinned_min", "static_blas_rebuilds", "inward_fraction", "nonfinite_thumb_pixels",
                               "goggles_toggle_rebuilds", "goggles_dark_frame", *RECORDER)),
     "renamed_fields": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms")),
-    "no_dumps": ((), ("nan_pixels", "neon_fraction", "brightness_floor", "angled_sharpness", "outline_overlap")),
+    "no_dumps": ((), ("nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness", "outline_overlap")),
     "no_proxy_gate": ((), ("raster_fallback_frames",)),
     "no_thumbs": ((), ()),                       # still measurable from the screen captures (pan at full rate)
     "half_rate_capture": ((), ("flashes",)),     # screen capture saw half the game frames of the pan
     "spot_error": (("s1: setup",), ("frames_over_50ms", "present_stalls", "min_median_fps", "latency_overhead_ms",
                                     "input_latency_ms", "skinned_min", "static_blas_rebuilds", "inward_fraction",
                                     "nonfinite_thumb_pixels", "raster_fallback_frames", "flashes", "still_flicker",
-                                    "nan_pixels", "neon_fraction", "brightness_floor", "angled_sharpness",
+                                    "nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
                                     "outline_overlap", "pose", "goggles", "goggles_toggle_rebuilds",
                                     "goggles_dark_frame", "flare_standins_off", "flare_unplaced_balls",
                                     "flare_moving_balls", "lamps_without_flare", "lights_dimmed_linger",
