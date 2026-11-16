@@ -21,13 +21,21 @@
 #   verify_runtime.ps1 -Evaluate <run folder>   re-judge an existing run
 #   -Previous <run folder> / -Reference <run folder>   what gate.py compares against (default: newest earlier run with
 #                                          the same spots, and newest reference-* no-Remix run)
+#   verify_runtime.ps1 -NoRemix -Spots a,b the original game as reference, in experiments\remix-gate\reference-<stamp>:
+#                                          the proxy stays (camera log, frame timing) but chains Windows' own d3d9
+#                                          (ChainDll) with every rewrite off, so Remix and its bridge never load. Same
+#                                          spots, stops, mouse lag and cutscene recording; each still stop saves
+#                                          gate\<tag>_raster.pfm (the screen, display-encoded 0..1) for worker F2's
+#                                          brightness limits. How Remix was turned off is in reference.json.
+# In Remix runs drive.py also saves <tag>_raster.pfm with ray tracing switched off for the stops in "rasterStops"
+# (default y0_p0), which gate.py compares with Remix's picture.
 # A spot in spots.json may name another spot's saves with "checkpoint" and move Sam elsewhere with "teleport"
 # ({"location": [x, y, z], "yaw": deg}); drive.py fails the spot when the game does not keep him there.
 # Needs: nobody else using the game (takes play-setup\AGENT_GAME_LOCK.txt), Steam running. Works with the monitors
 # off (screen frames come from gdigrab; the camera is set in memory). Only the goggle keys and the title-screen
 # keys need the game window in front, which this script does itself.
 param([string[]]$Spots = @(), [switch]$DryRun, [string]$CaptureCheckpoint = '', [switch]$Launch, [string]$Evaluate = '', [switch]$SkipInstall, [string]$SaveFrom = '',
-      [string]$Previous = '', [string]$Reference = '')
+      [string]$Previous = '', [string]$Reference = '', [switch]$NoRemix)
 $ErrorActionPreference = 'Stop'
 $Tests = $PSScriptRoot
 $Runtime = Join-Path $Tests 'runtime'
@@ -50,8 +58,10 @@ function Gate($folder) {
     $name = Split-Path $folder -Leaf
     $stamp = $name -replace '^reference-', ''
     $spotsHere = (Get-RunSpots $folder) -join ','
+    # a reference run is compared only with earlier reference runs, a Remix run only with earlier Remix runs
+    $kind = if ($name -like 'reference-*') { '^reference-\d{8}-\d{6}$' } else { '^\d{8}-\d{6}$' }
     $prev = if ($Previous) { $Previous } else {
-        Get-ChildItem $ResultsRoot -Directory | Where-Object { $_.Name -match '^\d{8}-\d{6}$' -and $_.Name -lt $stamp -and
+        Get-ChildItem $ResultsRoot -Directory | Where-Object { $_.Name -match $kind -and ($_.Name -replace '^reference-', '') -lt $stamp -and
             (Test-Path (Join-Path $_.FullName 'result.json')) -and ((Get-RunSpots $_.FullName) -join ',') -eq $spotsHere } |
             Sort-Object Name | Select-Object -Last 1 -ExpandProperty FullName }
     $ref = if ($Reference) { $Reference } elseif ($name -like 'reference-*') { $null } else {
@@ -123,8 +133,29 @@ function Stop-Game {
     $script:PlayProcess = $null
 }
 
-# Steam -> launcher -> game; then Space, Space, Enter (title, "press any key", "resume at checkpoint") until the
-# proxy log says ray tracing switched on in this process, i.e. a level is rendering. Never Esc (quits from menus).
+# A level is rendering in game process $id: with Remix, the proxy logged that ray tracing switched on in it; without
+# Remix (no such line), the proxy's frame log has a real camera, which the menus never publish (Benghazi, Nov 15:
+# 2527 menu frames without one). The frame log is new for each launch (the Play script moves the old one away).
+function Test-LevelLive($id) {
+    if (-not $NoRemix) {
+        return [bool](Select-String -LiteralPath "$S\d3d9_proxy.log" -Pattern "\[pid $id\] lightpub: AutoRaytracing -> on" -Quiet -ErrorAction SilentlyContinue)
+    }
+    foreach ($line in @(Get-Content -LiteralPath "$S\d3d9_proxy_frames.csv" -Tail 40 -ErrorAction SilentlyContinue)) {
+        $fields = $line -split ','
+        if ($fields.Count -lt 7) { continue }
+        foreach ($pub in $fields[6] -split '\|') {   # the same rule as cinematic.py camera_row
+            $p = $pub -split ':'
+            if ($p.Count -ge 9 -and $p[2] -eq '0') {
+                if (@($p[3..5] | Where-Object { [math]::Abs(($_ -as [double])) -gt 1e-3 }).Count) { return $true }
+                break
+            }
+        }
+    }
+    $false
+}
+
+# Steam -> launcher -> game; then Space, Space, Enter (title, "press any key", "resume at checkpoint") until
+# Test-LevelLive says a level is rendering. Never Esc (quits from menus).
 function Start-GameAtCheckpoint {
     $log = "$S\d3d9_proxy.log"
     # Windows PowerShell started from PowerShell 7 inherits 7's PSModulePath and then has no Get-FileHash, so the Play
@@ -149,9 +180,13 @@ function Start-GameAtCheckpoint {
         Start-Sleep 2
     }
     Start-Sleep 12; $k = 0
-    while (-not (Select-String -LiteralPath $log -Pattern "\[pid $($game.Id)\] lightpub: AutoRaytracing -> on" -Quiet -ErrorAction SilentlyContinue)) {
+    while (-not (Test-LevelLive $game.Id)) {
         if ($t.Elapsed.TotalSeconds -gt 480) { throw 'The game did not reach the level within 8 minutes.' }
         if ($game.HasExited) { throw 'The game exited while loading.' }
+        if ($NoRemix -and ((Select-String -LiteralPath $log -Pattern "\[pid $($game.Id)\] chained RTX Remix DLL" -Quiet -ErrorAction SilentlyContinue) -or
+                (Get-Process NvRemixBridge -ErrorAction SilentlyContinue))) {
+            throw 'No-Remix run, but the game loaded Remix (proxy log or NvRemixBridge running).'
+        }
         $game.Refresh()
         [void][GateInput]::Front($game.MainWindowHandle)
         [GateInput]::Tap($(if ($k % 3 -eq 2) { 0x1C } else { 0x39 })); Start-Sleep -Milliseconds 1600; ++$k
@@ -173,7 +208,28 @@ function Set-GoggleBindings($path, $keys) {
     [IO.File]::WriteAllText($path, $text)
 }
 
-$runDir = Join-Path $ResultsRoot $Stamp
+$runDir = Join-Path $ResultsRoot $(if ($NoRemix) { "reference-$Stamp" } else { $Stamp })
+if ($NoRemix -and $CaptureCheckpoint) { throw '-NoRemix records the reference at existing spots; capture checkpoints with Remix.' }
+# -NoRemix: how Remix is turned off. Only this run's copy of the proxy ini changes (put back afterwards like every
+# run's ini); the installed files stay as they are. ChainDll makes the proxy hand every call to Windows' 32-bit d3d9,
+# so d3d9_remix.dll and the bridge never load; the rest switches off everything the proxy changes in the game's
+# drawing for Remix (pass filter, skips, hand-off, texkill alpha, format guard, query shortcut, texture budget cap).
+# Kept: the camera log and frame timing (EnableDebuggingTelemetry, PublishCamera) the measurements need.
+$NoRemixProxyKeys = [ordered]@{
+    ChainDll = 'C:\Windows\SysWOW64\d3d9.dll'; PassFilter = 0; ForwardScene = 0; SkipShadowMapDraws = 0; SkipGameLighting = 0
+    SkipGamePost = 0; GogglesGameView = 0; HandoffBeforePost = 0; HandoffBeforeEffects = 0; AlphaTestFromTexkill = 0
+    ModernFilter = 0; FormatGuard = 0; QueryMode = 0; TextureStreamBudgetMB = 0
+}
+function Get-NoRemixIni($text) {
+    if ($text -match '(?m)^\[Lights\]') { throw 'The setup proxy ini already has a [Lights] section; -NoRemix would need to merge it.' }
+    foreach ($key in $NoRemixProxyKeys.Keys) {
+        if ($text -match "(?m)^$key[ \t]*=") { throw "The setup proxy ini already sets $key; -NoRemix would need to merge it." }
+    }
+    $keys = ($NoRemixProxyKeys.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "`r`n"
+    $out = [Regex]::Replace($text, '(?m)^\[Proxy\][ \t]*\r?\n', "[Proxy]`r`n; verify_runtime.ps1 -NoRemix (reference run)`r`n$keys`r`n", 1)
+    if ($out -eq $text) { throw 'No [Proxy] section in the setup proxy ini.' }
+    $out.TrimEnd() + "`r`n[Lights]`r`nEnable=0`r`n"
+}
 $selected = @(if (-not $CaptureCheckpoint) { $config.spots | Where-Object { -not $Spots.Count -or $Spots -contains $_.name } })
 if (-not $selected.Count -and -not $CaptureCheckpoint) { throw "No spots selected (known: $(($config.spots | ForEach-Object name) -join ', '))." }
 # This run closes the game between spots. It must never close a game it did not start (Corey's own session).
@@ -187,7 +243,7 @@ $evidence = 'D:\BlacklistOverhaul\experiments\playtest-evidence\play-setup-logs'
 Get-ChildItem (Join-Path $Setup 'logs') -Directory -Filter 'before-*' -ErrorAction SilentlyContinue |
     Where-Object { -not (Test-Path (Join-Path $evidence $_.Name)) } |
     ForEach-Object { Copy-Item $_.FullName (Join-Path $evidence $_.Name) -Recurse; Write-Step "Kept session logs $($_.Name) in $evidence" }
-@{ spots = @($selected | ForEach-Object name); started = $Stamp } | ConvertTo-Json | Set-Content (Join-Path $runDir 'manifest.json')
+@{ spots = @($selected | ForEach-Object name); started = $Stamp; noRemix = [bool]$NoRemix } | ConvertTo-Json | Set-Content (Join-Path $runDir 'manifest.json')
 
 try { New-Item -ItemType File -Path $GameLock -Value "verify_runtime.ps1 runtime gate $([DateTime]::UtcNow.ToString('u'))" | Out-Null }
 catch { throw "Someone else has the game: $(Get-Content $GameLock -Raw)" }
@@ -201,6 +257,14 @@ try {
     $setupIniBackup = [IO.File]::ReadAllText($setupIniPath)
     $iniBackup = if (Test-Path -LiteralPath "$S\d3d9_proxy.ini") { [IO.File]::ReadAllText("$S\d3d9_proxy.ini") } else { $setupIniBackup }
     $gateIni = [Regex]::Replace($setupIniBackup, '(?m)^EnableDebuggingTelemetry[ \t]*=[ \t]*0', 'EnableDebuggingTelemetry=1')
+    if ($NoRemix) {
+        $gateIni = Get-NoRemixIni $gateIni
+        @{ how = 'proxy kept, chained to Windows d3d9 with every rewrite off; written to play-setup\d3d9_proxy.ini and the game folder copy for this run only'
+           proxyKeys = $NoRemixProxyKeys; lights = @{ Enable = 0 }; ini = $gateIni
+           check = 'drive.py fails a spot unless the proxy log says this game process chained \Windows\SysWOW64\d3d9.dll (spot.json renderer); the load wait throws if Remix or NvRemixBridge loads'
+           restore = 'both ini copies are written back from the backups taken at the start; see restored below' } |
+            ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDir 'reference.json')
+    }
     [IO.File]::WriteAllText($setupIniPath, $gateIni)
     if (-not $SkipInstall) {
         $left = @(Get-PlayMismatches)
@@ -248,7 +312,8 @@ try {
             $cine = if ($spot.cinematic) {
                 Start-Process $Py -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $spotDir 'cinematic.log') `
                     -RedirectStandardError (Join-Path $spotDir 'cinematic.err') -ArgumentList (@((Join-Path $Runtime 'cinematic.py'),
-                    '--log', "$S\d3d9_proxy.log", '--frames', "$S\d3d9_proxy_frames.csv", '--out', (Join-Path $spotDir 'cinematic')) |
+                    '--log', "$S\d3d9_proxy.log", '--frames', "$S\d3d9_proxy_frames.csv", '--out', (Join-Path $spotDir 'cinematic')) +
+                    @(if ($NoRemix) { '--signal', 'camera' }) |
                     ForEach-Object { '"' + $_ + '"' }) }
             $game = Start-GameAtCheckpoint
             if ($cine) {
@@ -258,7 +323,7 @@ try {
             $spot | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $spotDir 'spot_config.json')
             $driveArgs = @((Join-Path $Runtime 'drive.py'), 'spot', '--pid', $game.Id) + $hashArgs + @(
                 '--spot', (Join-Path $spotDir 'spot_config.json'), '--checkpoint', (Join-Path $cp 'checkpoint.json'),
-                '--system', $S, '--root', $Root, '--out', $spotDir)
+                '--system', $S, '--root', $Root, '--out', $spotDir) + @(if ($NoRemix) { '--no-remix' })
             $drive = Start-Process $Py -ArgumentList ($driveArgs | ForEach-Object { '"' + $_ + '"' }) -NoNewWindow -PassThru `
                 -RedirectStandardOutput (Join-Path $spotDir 'drive.log') -RedirectStandardError (Join-Path $spotDir 'drive.err')
             if (-not $drive.WaitForExit(20 * 60 * 1000)) { $drive.Kill(); Write-Step "$($spot.name): drive.py timed out (20 min)" }
@@ -289,6 +354,15 @@ try {
     $restored = Restore-LauncherApi
     if ($restored) { Write-Step "Launcher setting put back: $restored" }
     if (Resume-Dx11Mod) { Write-Step 'DX11 lighting mod put back.' }
+    if ($NoRemix -and (Test-Path (Join-Path $runDir 'reference.json'))) { try {
+        $note = Get-Content (Join-Path $runDir 'reference.json') -Raw | ConvertFrom-Json
+        $note | Add-Member restored ([ordered]@{
+            setupIniAsBefore = ([IO.File]::ReadAllText($setupIniPath) -eq $setupIniBackup)
+            gameIniAsBefore  = ([IO.File]::ReadAllText("$S\d3d9_proxy.ini") -eq $(if ($SkipInstall) { $iniBackup } else { $setupIniBackup }))
+            playMismatches   = @(Get-PlayMismatches); launcherApi = (Get-StartupApi) }) -Force
+        $note | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDir 'reference.json')
+        Write-Step "Remix settings put back: $(($note.restored | ConvertTo-Json -Compress))"
+    } catch { Write-Step "Could not record the restore check: $($_.Exception.Message)" } }
     Remove-Item -LiteralPath $GameLock -ErrorAction SilentlyContinue
 }
 if ($CaptureCheckpoint) { exit 0 }

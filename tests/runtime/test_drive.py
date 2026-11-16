@@ -156,5 +156,49 @@ class MouseLag(unittest.TestCase):
             self.assertEqual(drive.proxy_camera_dirs(p, 950.0), [(1000.5, (0.0, 1.0, 0.0))])
 
 
+class Reference(unittest.TestCase):
+    """The no-Remix reference pictures: same units as Remix's final.pfm, and never recorded through the wrong renderer."""
+    def test_grabs_are_averaged_in_display_units_and_a_flash_shows(self):
+        import numpy as np
+        w, h = 4, 2
+        grey = np.full((h, w, 3), 128, np.uint8)
+        flash = np.full((h, w, 3), 255, np.uint8)
+        raw = b"".join(f.tobytes() for f in [grey, grey, flash, grey])
+        img, lumas = drive.average_grabs(raw, w, h, 4)
+        # mid grey must stay 128/255 = 0.502 like final.pfm; turned linear it would be 0.216 (a fake 2.3x error)
+        self.assertAlmostEqual(float(img[0, 0, 0]), (128 * 3 + 255) / 4 / 255, places=5)
+        self.assertEqual(img.shape, (h, w, 3))
+        self.assertEqual((min(lumas), max(lumas)), (0.502, 1.0))
+        with self.assertRaisesRegex(RuntimeError, "3 of 4 frames"):
+            drive.average_grabs(raw[: 3 * w * h * 3], w, h, 4)
+
+    def test_renderer_must_match_the_run(self):
+        log = ("2026-11-15 21:42:24.180 [pid 25472] chained RTX Remix DLL: D:\\Steam\\x\\SYSTEM\\d3d9_remix.dll\r\n"
+               "2026-11-15 21:50:00.000 [pid 999] chained INI DLL: C:\\Windows\\SysWOW64\\d3d9.dll\r\n")
+        self.assertEqual(drive.check_renderer(drive.chained_dll(log, 25472), no_remix=False), "remix")
+        self.assertEqual(drive.check_renderer(drive.chained_dll(log, 999), no_remix=True), "system")
+        with self.assertRaisesRegex(RuntimeError, "needs Windows d3d9"):   # a "reference" drawn by Remix
+            drive.check_renderer(drive.chained_dll(log, 25472), no_remix=True)
+        with self.assertRaisesRegex(RuntimeError, "needs Remix"):          # a Remix run that fell back to Windows
+            drive.check_renderer(drive.chained_dll(log, 999), no_remix=False)
+        with self.assertRaisesRegex(RuntimeError, "no 'chained"):          # another process's line does not count
+            drive.check_renderer(drive.chained_dll(log, 1234), no_remix=True)
+
+    def test_rt_off_picture_needs_ten_frames_not_ray_traced(self):
+        import json, os, tempfile, types
+        def spot_with(flags):
+            p = os.path.join(tmp, "t.jsonl")
+            with open(p, "w") as fh:
+                fh.write("\n".join(json.dumps({"frame": 100 + i, "rayTraced": f}) for i, f in enumerate(flags)) + "\n")
+            return types.SimpleNamespace(telemetry=types.SimpleNamespace(path=p))
+        with tempfile.TemporaryDirectory() as tmp:
+            ok = drive.Spot.rt_is_off(spot_with([True] * 5 + [False] * 12), 100)
+            self.assertEqual(ok["rayTracedLastFrames"], [False] * 10)
+            with self.assertRaisesRegex(RuntimeError, "was not off"):   # Remix ignored the switch
+                drive.Spot.rt_is_off(spot_with([True] * 5 + [False] * 11 + [True]), 100)
+            with self.assertRaisesRegex(RuntimeError, "last 6 frames"):   # too few frames since the switch
+                drive.Spot.rt_is_off(spot_with([False] * 20), 113)
+
+
 if __name__ == "__main__":
     unittest.main()

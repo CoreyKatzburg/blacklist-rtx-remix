@@ -32,6 +32,7 @@ import gate  # noqa: E402  (file helpers)
 
 FFMPEG = r"d:\ffmpeg\bin\ffmpeg.exe"
 CAP_W, CAP_H = 320, 180
+RASTER_GRABS = 10   # full-size grabs averaged per reference picture (snow, dust and dither average out; worker F2)
 
 
 # --- append-only files the game writes ----------------------------------------------------------------------
@@ -222,6 +223,72 @@ def start_capture(path: str, frames: int = 0, fps: int = 30, seconds: float = 0.
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def client_rect(hwnd: int) -> tuple[int, int, int, int]:
+    """(left, top, width, height) on the screen of the window's client area: the game picture without title bar or
+    borders."""
+    import ctypes.wintypes as wt
+    r, pt = wt.RECT(), wt.POINT(0, 0)
+    user32.GetClientRect(ctypes.c_void_p(hwnd), ctypes.byref(r))
+    user32.ClientToScreen(ctypes.c_void_p(hwnd), ctypes.byref(pt))
+    return pt.x, pt.y, r.right - r.left, r.bottom - r.top
+
+
+def average_grabs(raw: bytes, w: int, h: int, n: int) -> tuple[np.ndarray, list[float]]:
+    """The mean of n RGB24 screen grabs as display-encoded floats in 0..1 (u8 / 255, NOT turned linear: Remix's
+    <tag>_final.pfm is gamma-encoded with ModernFilter=1, so both pictures must be compared in the same units; worker
+    F2, Nov 15), and each grab's mean Rec.709 luma in the same units, so a flash during the grabs shows up."""
+    size = w * h * 3
+    if len(raw) < n * size:
+        raise RuntimeError(f"screen grab returned {len(raw) // size} of {n} frames of {w}x{h}")
+    frames = np.frombuffer(raw, np.uint8, n * size).reshape(n, h, w, 3)
+    acc = np.zeros((h, w, 3), np.float32)   # exact: at most 10 * 255 per pixel
+    lumas = []
+    for f in frames:
+        acc += f
+        lumas.append(round(float((f.astype(np.float32) @ np.float32([0.2126, 0.7152, 0.0722])).mean()) / 255.0, 4))
+    return acc / np.float32(n * 255.0), lumas
+
+
+def recent_telemetry(path: str | None, after_frame: int, tail_bytes: int = 2 << 20) -> list[dict]:
+    """Remix telemetry records (one JSON line per frame, ~26 KB each) newer than after_frame, from the file's end."""
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, "rb") as f:
+        start = max(0, os.path.getsize(path) - tail_bytes)
+        f.seek(start)
+        lines = f.read().splitlines()[1 if start else 0:]   # a read from the middle starts inside a line
+    out = []
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if int(rec.get("frame", -1)) > after_frame:
+            out.append(rec)
+    return out
+
+
+def chained_dll(log_text: str, pid: int) -> tuple[str, str] | None:
+    """(source, path) of the d3d9 the proxy handed the game's drawing to in process `pid`, from the proxy log line
+    'chained <source> DLL: <path>'; None when that process logged none."""
+    found = re.findall(rf"\[pid {pid}\] chained (.+?) DLL: ([^\r\n]+)", log_text)
+    return (found[-1][0], found[-1][1].strip()) if found else None
+
+
+def check_renderer(chained: tuple[str, str] | None, no_remix: bool) -> str:
+    """'remix' or 'system' for the chained DLL; raises when it is not the one this run is meant to measure, so a
+    no-Remix reference can never be recorded through Remix (or a Remix run through the plain driver)."""
+    if not chained:
+        raise RuntimeError("the proxy log has no 'chained ... DLL' line for this game process")
+    path = chained[1].replace("/", "\\").lower()
+    kind = "system" if path.endswith(("\\syswow64\\d3d9.dll", "\\system32\\d3d9.dll")) else \
+        "remix" if path.endswith("\\d3d9_remix.dll") else "unknown"
+    if kind != ("system" if no_remix else "remix"):
+        raise RuntimeError(f"the game drew through {chained[1]} ({chained[0]}); this run needs "
+                           f"{'Windows d3d9 (no Remix)' if no_remix else 'Remix'}")
+    return kind
+
+
 def proxy_camera_dirs(path: str, since_ms: float) -> list[tuple[float, tuple]]:
     """(ms, camera forward vector) of the game frames the proxy logged at or after since_ms. The ms column is
     QueryPerformanceCounter time, the same clock as time.perf_counter."""
@@ -291,6 +358,7 @@ class Spot:
         self.calibration: dict = {}
         self._sent: tuple | None = None   # (rotation read when the last correction was sent, time sent)
         self.home: list[float] | None = None   # where Sam stands for this spot (spawn, or where the teleport left him)
+        self.no_remix = bool(getattr(a, "no_remix", False))   # reference run: the game draws through Windows d3d9
 
     def sam_moved(self, where: str) -> float | None:
         """Sideways distance Sam has moved from `home`; raises past 150 units. Green hallway, Nov 15: enemies
@@ -456,16 +524,82 @@ class Spot:
             time.sleep(0.1)
         return round(timeout, 2)
 
+    def raster(self, tag: str, method: str, **extra) -> dict:
+        """The reference picture <tag>_raster.pfm in gate\\ (gate.py and worker F2's scorer read it beside
+        <tag>_final.pfm): the mean of RASTER_GRABS full-size grabs of the game window's client area, display-encoded
+        0..1, unmasked, plus <tag>_raster.json saying where the camera was and how the picture was made."""
+        hwnd = game_window(self.a.pid)
+        if not hwnd:
+            raise RuntimeError("no game window to grab")
+        x, y, w, h = client_rect(hwnd)
+        rot, loc = self.game.rotation(self.controller), self.game.location(self.pawn)
+        t0 = time.monotonic()
+        out = subprocess.run([FFMPEG, "-v", "error", "-f", "gdigrab", "-framerate", "25", "-draw_mouse", "0",
+                              "-offset_x", str(x), "-offset_y", str(y), "-video_size", f"{w}x{h}", "-i", "desktop",
+                              "-frames:v", str(RASTER_GRABS), "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
+                             capture_output=True, timeout=60)
+        seconds = time.monotonic() - t0
+        img, lumas = average_grabs(out.stdout, w, h, RASTER_GRABS)
+        gate.write_pfm(os.path.join(self.out, "gate", f"{tag}_raster.pfm"), img)
+        info = {"tag": tag, "method": method, "grabs": RASTER_GRABS, "grabSeconds": round(seconds, 2),
+                "clientRect": [x, y, w, h], "encoding": "display-encoded u8/255 (not linear), RGB, unmasked",
+                "yawPitch": [round(float(rot[0]), 2), round(float(rot[1]), 2)], "relPose": self.rel_pose(),
+                "location": [round(float(v), 1) for v in loc], "lumaPerGrab": lumas,
+                "luma": [min(lumas), round(float(np.mean(lumas)), 4), max(lumas)], **extra}
+        gate.save_json(os.path.join(self.out, "gate", f"{tag}_raster.json"), info)
+        return info
+
+    def _try_raster(self, tag: str, method: str, before_raster=None) -> dict:
+        """{"raster": path} or {"rasterError": why}: a failed reference picture is recorded in the window and the spot
+        goes on (gate.py then has no raster picture for that stop) instead of losing the stops after it."""
+        try:
+            extra = before_raster() if before_raster else {}
+            self.raster(tag, method, **extra)
+            return {"raster": f"gate/{tag}_raster.pfm"}
+        except Exception as e:   # noqa: BLE001 - recorded, not fatal
+            print("RASTER ERROR", tag, f"{type(e).__name__}: {e}")
+            return {"rasterError": f"{type(e).__name__}: {e}"}
+
+    def rt_is_off(self, since_frame: int) -> dict:
+        """Raises unless Remix's telemetry has at least 10 frames after since_frame and the last 10 are not ray traced."""
+        recs = recent_telemetry(self.telemetry.path, since_frame)
+        traced = [bool(r.get("rayTraced")) for r in recs[-10:]]
+        if len(traced) < 10 or any(traced):
+            raise RuntimeError(f"ray tracing was not off: rayTraced of the last {len(traced)} frames {traced}")
+        return {"rayTracedLastFrames": traced}
+
+    def raster_rt_off(self, tag: str) -> None:
+        """Method A reference picture inside a Remix run: ray tracing off (the proxy then gives the game back its own
+        lighting and post effects), checked off in Remix's telemetry, grabbed, then switched back on."""
+        got: dict = {}
+
+        def body():
+            before = self.telemetry.last_frame()
+            self.set_rt(False)
+            got.update(self._try_raster(tag, "rt_off", lambda: self.rt_is_off(before)))
+        try:
+            self.window(tag + "_raster", "raster", body).update(got)
+        finally:
+            self.set_rt(True)
+
     def stop(self, name: str, outline: str | None = None) -> None:
         rel = f"frames/{name}.gray"
         self.hold(0.5)
         waited = self.steady()
         self.window(name + "_settle", "settle", lambda: self.hold(0.5), steadyWait=waited)
         before = self.rel_pose()
-        w = self.window(name, "still", lambda: (self.capture(rel, 20), self.dump(name)),
-                        frames=rel, frameSize=[CAP_W, CAP_H], dump=name, **({"outline": outline} if outline else {}))
+        got: dict = {}
+        if self.no_remix:   # no Remix dumps to ask for; the reference picture is the screen itself
+            grab = lambda: got.update(self._try_raster(name, "no_remix"))
+        else:
+            grab, got = (lambda: self.dump(name)), {"dump": name}
+        w = self.window(name, "still", lambda: (self.capture(rel, 20), grab()),
+                        frames=rel, frameSize=[CAP_W, CAP_H], **({"outline": outline} if outline else {}))
+        w.update(got)
         w["gamePose"] = [before, self.rel_pose()]   # [yaw, pitch] from game memory at the start and end of the stop
         w["samMoved"] = self.sam_moved(name)
+        if not self.no_remix and name in self.spot.get("rasterStops", ["y0_p0"]):
+            self.raster_rt_off(name)
 
     def pan(self, seconds: float) -> float:
         """One full turn in `seconds`: steady mouse motion at the calibrated rate, plus a correction once per game
@@ -730,6 +864,8 @@ def main() -> int:
     ap.add_argument("--exe-hash", action="append", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--spot"); ap.add_argument("--checkpoint"); ap.add_argument("--system"); ap.add_argument("--root")
+    ap.add_argument("--no-remix", action="store_true", help="reference run: the proxy chains Windows' d3d9; each still "
+                    "stop saves <tag>_raster.pfm instead of asking Remix for dumps; no switch test or goggle check")
     a = ap.parse_args()
     if a.mode == "capture":
         game, proc = blmem.attach(a.pid, a.exe_hash)
@@ -749,6 +885,9 @@ def main() -> int:
     ctypes.windll.winmm.timeBeginPeriod(1)
     try:
         s = Spot(a, spot, cp)
+        with open(os.path.join(a.system, "d3d9_proxy.log"), encoding="latin-1") as f:
+            chained = chained_dll(f.read(), a.pid)
+        result["renderer"] = {"chained": list(chained) if chained else None, "kind": check_renderer(chained, a.no_remix)}
         where = s.game.map_name(s.controller)
         if where != cp["map"]:
             raise RuntimeError(f"loaded map {where!r}, checkpoint was recorded in {cp['map']!r}")
@@ -770,11 +909,11 @@ def main() -> int:
                 back = time.monotonic() + 3.0   # the trials alternate direction; put the camera back on the stop exactly
                 while not s.pose(s.yaw, s.pitch) and time.monotonic() < back:
                     time.sleep(0.008)
-        if spot.get("switchTest"):
+        if spot.get("switchTest") and not a.no_remix:   # the switches are Remix settings
             s.switch_test()
         if not spot.get("switchOnly"):
             s.sweep_and_pan()
-            if int(spot.get("goggleModes", 3)):
+            if int(spot.get("goggleModes", 3)) and not a.no_remix:   # the goggle check compares ray tracing on/off
                 s.goggles()
         if spot.get("lightSwitch"):
             s.light_switch(spot["lightSwitch"])
