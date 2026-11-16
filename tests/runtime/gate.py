@@ -16,11 +16,11 @@ Checks (thresholds in THRESHOLDS):
   remix_dropped_character_frames  frames outside goggles (proxy_gate goggles==0 on frame +/-3 and rayTraced!=false)
                            where Remix has 0 skinned instances while proxy sent skinnedSceneDraws > 0 on +/-3 (must be 0)
   frame_join_clock         for telemetry frames with qpcMs > 0, qpcMs must lie in (entry+presentMs of row k-1,
-                           entry+presentMs of row k] for matching proxy frame k (NOT MEASURED does not fail gate yet)
-  zero_normal_skinned_triangles   per-spot median/max of telemetry zeroNormalSkinnedTriangles (GUESS max 0)
-  zero_normal_instances           per-spot median/max of telemetry zeroNormalInstances (GUESS max 0)
-  zero_normal_static_triangles    per-spot median/max of telemetry zeroNormalStaticTriangles (GUESS max 0)
-  zero_normal_static_instances    per-spot median/max of telemetry zeroNormalStaticInstances (GUESS max 0)
+                           entry+presentMs of row k] for matching proxy frame k
+  zero_normal_skinned_triangles   per-spot median/max of telemetry zeroNormalSkinnedTriangles (max 0, measured in every Nov 16 run)
+  zero_normal_instances           per-spot median/max of telemetry zeroNormalInstances (max 0, measured in every Nov 16 run)
+  zero_normal_static_triangles    per-spot median/max of telemetry zeroNormalStaticTriangles (max 0, measured in every Nov 16 run)
+  zero_normal_static_instances    per-spot median/max of telemetry zeroNormalStaticInstances (max 0, measured in every Nov 16 run)
   outline_overlap          Sam's near-field depth outline, the game's own depth (= Remix off) against Remix's depth
                            of the same frame, before and after the close-camera sweep: share of the game's outline
                            pixels that have a Remix outline pixel within 2 px
@@ -37,9 +37,15 @@ Checks (thresholds in THRESHOLDS):
   min_median_fps           median FPS over the scene windows: WARN below 90 (Corey's target: a goal, not a limit)
   fps_regression           each spot's median FPS against the same spot in --previous: FAIL when more than 10% slower;
                            WARN when no previous run is given
-  input_latency_ms         each spot's median mouse-to-screen time (spot.json mouse_lag.samples_ms, >= 20 turns) against
-                           the same spot in --reference (the no-Remix run): FAIL when more than the GUESS margin above it;
-                           NOT MEASURED when missing or without --reference
+  input_latency_ms         each spot's median game share of the mouse lag (spot.json mouse_lag.trials gameMs, >= 20
+                           turns: mouse turn to the first proxy frame with the turned camera) against the same spot in
+                           --reference (the no-Remix run): FAIL when more than the GUESS margin above it; NOT MEASURED when
+                           missing or without --reference. It leaves out everything after the game hands the frame on, so
+                           for Remix it is a lower bound.
+  input_latency_screen_ms  the screen share (samples_ms, from a desktop grab): always NOT MEASURED, numbers in the detail,
+                           until the grab is shown to work in Remix runs (coordinator, Nov 16)
+  frame_interval_vs_reference  report only, never FAIL: per spot, median FPS and frames over 50 ms from the proxy frame
+                           interval (proxy_frames.csv index 2) in scene windows, this run next to --reference
   step_timing              per-step GPU times (telemetry passMs): untimed steps, and nested steps longer than their parent
   skip_occlusion_share     worst scene window's share of draws skipped by occlusionQuery (telemetry skips / proxy draws)
   skip_other_share         worst scene window's share of draws skipped for any other reason
@@ -48,8 +54,10 @@ Checks (thresholds in THRESHOLDS):
   clean_quit               no VK_ERROR_DEVICE_LOST in remix-dxvk.log and no non-zero exit code in drive.log's QUIT
                            record (either fails); then bridge32.log has "Sending Terminate command to server" (else
                            NOT MEASURED), and no proxy Present > 1000 ms in the last 10 s
-  present_stalls           d3d9_proxy_frames.csv col 3 (time inside Present) > 50 ms in any measured window, excluding
-                           loading-screen frames via is_proxy_loading
+  present_stalls           d3d9_proxy_frames.csv 4th column (row index 3 after the frame number: time inside Present)
+                           > 50 ms in any measured window, excluding loading-screen frames via is_proxy_loading
+  frame_gap_over_50ms      d3d9_proxy_frames.csv 3rd column (row index 2: ms since the previous Present entry, the gap
+                           the player sees) > 50 ms in any measured window, excluding loading frames (worker C, Nov 16)
   goggles_toggle_rebuilds  on the first rayTraced=true frame after rayTraced=false in any goggles window, telemetry
                            staticBlasBuilds <= 40 (GUESS)
   goggles_dark_frame       on that same first rayTraced=true frame, mean luma / mean luma 10 ray-traced frames later
@@ -65,6 +73,12 @@ Checks (thresholds in THRESHOLDS):
   lights_recreated         stray line "recreated R": <= 2 per line when keep tracked 1 (GUESS); report only with 0.
                            Proxies before fbe011f lack the field: NOT MEASURED
   lamps_without_flare      spot max of lamps without flare XM <= --reference spot max + 10 (GUESS)
+  lights_orbs_unmatched    symptom checks, ledger rows 1 and 2 (worker B's glow_blobs.py, pictures only): per still and
+  lights_puffs             switch stop, the Remix still against the --reference (no Remix) still at the same pose.
+  lights_glows_lost        Orbs: bright blobs the original does not show. Puffs: large bright areas the original leaves
+                           dark (also surfaces Remix lights; a puff needs a look before it is called a floating light).
+                           Glows lost: lamp glows the original shows that Remix lost (what must stay). Limit 0 each per
+                           stop. Poses apart: that stop is listed, not compared. No no-Remix reference: NOT MEASURED
   lights_dimmed_linger     report only (WARN above 600 frames, never FAIL): stray line max longest dim TM. It measures
                            the game: guard rifle flashlights dim on their own (2060 frames at con_bright_hall)
   light_switchoff_lag      report only (WARN above 1.0 s, never FAIL): longest downward brightness run before stopped
@@ -78,10 +92,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import json
 import math
 import os
 import re
+import subprocess
 import sys
 
 import numpy as np
@@ -98,7 +114,7 @@ THRESHOLDS = {
     "min_median_fps": 90.0,  # Corey's target, Nov 15: WARN below it, not a fail. Median FPS over the SCENE windows (goggles excluded).
     "max_wait_overhead_ms": 5.0,
     # Input lag (input_latency_ms) is judged per spot against the no-Remix reference run, not a fixed limit. The margin
-    # is a GUESS until reference numbers exist (Corey, Nov 15: the original game has almost no noticeable lag).
+    # is a GUESS: reference game share is 12.7 to 27.5 ms and Remix 93.7 to 101.5 ms, so no healthy pair sets it yet.
     "input_lag_margin_ms": 5.0,
     # Speed FAIL (fps_regression): a spot whose median FPS is more than this below the same spot in the previous run.
     "max_fps_drop": 0.10,  # Corey, Nov 15
@@ -107,36 +123,44 @@ THRESHOLDS = {
     "min_angled_sharpness": 0.02,
     "pose_error_deg": 3.0, "pan_degrees": 350.0, "goggles_corr": 0.8, "goggles_mean_gap": 0.06,
     "goggles_missing_blocks": 0.02, "still_frames": 15, "pan_coverage": 0.9,
-    # Recorder checks (recorder_checks). Every limit below is a GUESS, not a value from the game or the source. The
-    # comment beside each is what the Nov 14 run (20261114-153401) measured on that check; that run fails other checks.
-    "step_untimed_share": 0.02,     # GUESS. Measured 0 of 4,069 scene frames with an untimed step.
-    "step_child_excess_ms": 0.5,    # GUESS, tolerance for timer rounding. Measured: no child above its parent.
-    "skip_share_occlusion": 0.6,    # GUESS. Measured worst scene window 54.6% skipped by occlusionQuery.
-    "skip_share_other": 0.05,       # GUESS. Every other reason measured at most 0.24% of a window's draws.
-    "min_replaced_share": 0.2,      # GUESS. Measured 81% and 90% with the mod loaded, 0% without it (Nov 14 bug).
-    "max_demoted_share": 0.05,      # GUESS. Measured 0 scene frames with a texture shrunk by the budget.
-    "goggles_toggle_max_builds": 40,   # GUESS. First rayTraced=true after rayTraced=false in a goggles window.
-    "goggles_dark_min_ratio": 0.4,     # GUESS. Mean luma ratio vs 10 ray-traced frames later on toggle-off.
-    "present_stalls_max": 0,           # d3d9_proxy_frames.csv col 3 > 50 ms in measured windows (excl. loads).
+    # Recorder checks (recorder_checks). MEASURED = set from live runs: the healthy Remix gate runs 20261115-140515 and
+    # -142638 and 20261116-063147 to -123628 (11 runs with scene windows, about 31,000 scene frames). GUESS = no live
+    # number decides it yet; the comment says what was measured.
+    "step_untimed_share": 0.0,      # MEASURED: 0 untimed steps in every run (was a GUESS of 2%).
+    "step_child_excess_ms": 0.5,    # GUESS, timer rounding tolerance. Measured +0.000 ms worst in every run.
+    "skip_share_occlusion": 0.6,    # MEASURED: worst window 18.3% to 58.0% (paladin_1, 140515) in healthy runs.
+    "skip_share_other": 0.05,       # GUESS. Measured at most 0.42% (140515); nothing says what share is harmful.
+    "min_replaced_share": 0.6,      # MEASURED: lowest spot 73.6% (paladin_1) to 88.6% with the mod, 0% without it.
+    "max_demoted_share": 0.0,       # MEASURED: 0 frames with a texture shrunk by the budget in every run.
+    "goggles_toggle_max_builds": 40,   # GUESS. No healthy goggles-off since the proxy fix (RT stays on: NOT MEASURED).
+    "goggles_dark_min_ratio": 0.4,     # GUESS. Same: no healthy goggles-off since the proxy fix.
+    "present_stalls_max": 0,           # proxy row index 3 (time inside Present) > 50 ms in measured windows (excl. loads).
+    "frame_gap_max": 0,                # proxy row index 2 (Present-to-Present gap) > 50 ms, same rule as frames_over_50ms.
     "quit_present_max_ms": 1000.0,     # No proxy Present > 1000 ms in the last 10 s before Terminate.
     "flare_unplaced_max_noskip": 15,   # Measured live (worker B): 15 at both spots with SU=0, 0 with SU=1.
     "lamps_without_flare_margin": 10,  # GUESS. Max jump over --reference spot max XM.
     "lights_dimmed_max_frames": 600,   # Report only: WARN above this. Game guard flashlights reach 2060.
     "light_switchoff_max_s": 1.0,      # Report only: WARN above this. Game guard flashlights reach 18.6 s.
     "lights_recreated_max_kept": 2,    # GUESS (worker B). Re-creates per stray line with keep tracked 1.
-    "zero_normal_skinned_tris_max": 0,     # GUESS until first live run with new build.
-    "zero_normal_instances_max": 0,        # GUESS until first live run with new build.
-    "zero_normal_static_tris_max": 0,      # GUESS until first live run with new build.
-    "zero_normal_static_instances_max": 0, # GUESS until first live run with new build.
-    "compile_stall_min_frames": 300,       # GUESS. Consecutive rayTraced=false frames with 25-40 ms CPU wait.
-    "compile_stall_wait_min_ms": 25.0,     # GUESS.
-    "compile_stall_wait_max_ms": 40.0,     # GUESS.
-    "compile_wait_stuck_s": 20.0,          # GUESS. Seconds in compile wait with no rayTraced=true frame.
-    "compile_wait_min_ms": 28.0,           # GUESS. Fallback when remixShaderCompiles is absent.
-    "compile_wait_max_ms": 40.0,           # GUESS. Fallback when remixShaderCompiles is absent.
-    "min_scene_rt_share": 0.99,            # GUESS. Non-goggles scene RT share (con_custodial measured 100.0%).
+    "zero_normal_skinned_tris_max": 0,     # MEASURED: max 0 in every Nov 16 run with the field (063147 to 123628).
+    "zero_normal_instances_max": 0,        # MEASURED: same.
+    "zero_normal_static_tris_max": 0,      # MEASURED: same.
+    "zero_normal_static_instances_max": 0, # MEASURED: same.
+    # Compile hang: 063147 con_bright_hall (stuck) waited frameTimeMs - gpuTimeMs median 29.5 ms, p99 31.7 ms on its
+    # non-loading frames; healthy runs have longest such run 0 to 4 frames and 0.0 s of compile wait.
+    "compile_stall_min_frames": 300,       # MEASURED range: healthy max 4 frames, stuck 14,314; 300 is a choice in between.
+    "compile_stall_wait_min_ms": 25.0,     # MEASURED band around the stuck 29.5 ms median; the edges are GUESSES.
+    "compile_stall_wait_max_ms": 40.0,     # Same.
+    "compile_wait_stuck_s": 20.0,          # MEASURED range: healthy 0.0 s, stuck 300.2 s; 20 s is a choice in between.
+    "compile_wait_min_ms": 28.0,           # Worker C's signature around the stuck 29.5 ms median; edges are GUESSES.
+    "compile_wait_max_ms": 40.0,           # Same.
+    "min_scene_rt_share": 0.99,            # MEASURED: 100.0% in every healthy run, 0% stuck; 99% is a choice.
     }
-SOFT_NM = frozenset({"frame_join_clock"})  # NOT MEASURED does not fail the gate for these checks yet
+# Checks whose NOT MEASURED does not fail the gate (a field not yet in a build that ran live). Empty since Remix
+# 0c13881 (staged in 81c0328) ran live on Nov 16 with qpcMs and instancedSharedSlotDraws (run 20261116-100605).
+# input_latency_screen_ms is always NOT MEASURED until the desktop grab works in Remix runs (coordinator, Nov 16);
+# input_latency_ms (the game share) is the judged lag check.
+SOFT_NM: frozenset[str] = frozenset({"input_latency_screen_ms"})
 TELEMETRY_FIELDS = ("frame", "frameTimeMs", "gpuTimeMs", "instances", "skinnedInstances", "staticBlasRebuilds",
                     "cameraCut", "textureMemoryMB", "vramUsedMB")
 THUMB_W, THUMB_H = 128, 72
@@ -739,19 +763,30 @@ def _find_proxy_log(spot: dict) -> str | None:
     return find_session_log(spot["_dir"], "proxy") or find_session_log(spot["_dir"], "d3d9_proxy")
 
 
-def _parse_lightpub_log(path: str) -> list[tuple[tuple[int, int, int], int, int, int, int, int, int]]:
-    """Return [( (E, SU, SM), frame, XM, S, UM, MM, TM ), ...] from proxy.log."""
+def _lp_settings(ln: str) -> str:
+    """The settings of a lightpub settings line (the text in its parentheses), to tell whether a reload changed them."""
+    return ln[ln.index("(", ln.index("lightpub:")):].strip()
+
+
+def _parse_lightpub_log(path: str) -> list[tuple[tuple[int, int, int], int, int, int, int, int, int, bool]]:
+    """Return [( (E, SU, SM), frame, XM, S, UM, MM, TM, reloaded ), ...] from proxy.log. reloaded: a settings line
+    between the previous stray line (or the first settings line) and this one changed the settings, so this line's
+    counts span two settings and are not held to the limit of the new one."""
     cfg: tuple[int, int, int] | None = None
+    cur = start = None
     rows = []
     for ln in read_lines(path):
         m = _LP_CFG_RE.search(ln)
         if m:
             cfg = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            cur = _lp_settings(ln)
+            start = cur if start is None else start
             continue
         m = _LP_STRAY_RE.search(ln)
         if m and cfg is not None:
             rows.append((cfg, int(m.group(1)), int(m.group(2)), int(m.group(3)),
-                         int(m.group(4)), int(m.group(5)), int(m.group(6))))
+                         int(m.group(4)), int(m.group(5)), int(m.group(6)), cur != start))
+            start = cur
     return rows
 
 
@@ -773,17 +808,22 @@ T1_THRESH = f"report only, WARN above {THRESHOLDS['light_switchoff_max_s']:g} s"
 def _parse_lightpub_extras(path: str) -> list[dict]:
     """Per stray line: frame plus the optional settings and stray fields of newer proxies (None when absent).
     Settings come from the last settings line before the stray line ("enabled (", "settings reloaded (", "settings
-    reloaded after a missed notice (" all match _LP_CFG_RE)."""
+    reloaded after a missed notice (" all match _LP_CFG_RE). reloaded: as in _parse_lightpub_log."""
     cfg: dict | None = None
+    cur = start = None
     rows = []
     for ln in read_lines(path):
         if _LP_CFG_RE.search(ln):
             cfg = {k: (int(m.group(1)) if (m := rx.search(ln)) else None) for k, rx in _LP_OPT_CFG.items()}
+            cur = _lp_settings(ln)
+            start = cur if start is None else start
             continue
         m = _LP_STRAY_RE.search(ln)
         if m and cfg is not None:
             tail = ln[m.end():]
-            row = dict(cfg, frame=int(m.group(1)), dimmed_max=int(_LP_DIMMED_RE.search(ln).group(1)))
+            row = dict(cfg, frame=int(m.group(1)), dimmed_max=int(_LP_DIMMED_RE.search(ln).group(1)),
+                       reloaded=cur != start)
+            start = cur
             row.update({k: (int(mm.group(1)) if (mm := rx.search(tail)) else None) for k, rx in _LP_OPT_STRAY.items()})
             rows.append(row)
     return rows
@@ -791,7 +831,8 @@ def _parse_lightpub_extras(path: str) -> list[dict]:
 
 def _lightpub_field_checks(run: Run, extras: dict[str, list[dict]], log_src: str) -> None:
     """S6 flare_sam_gear_balls, lights_weapon_flips and lights_recreated. A stray line or its settings line without
-    the field (an older proxy) makes the check NOT MEASURED."""
+    the field (an older proxy) makes the check NOT MEASURED. A stray line whose 600-frame window contains a reload
+    that changed the settings counts under two settings, so it is reported, not held to the new setting's limit."""
     rows = [(n, r) for n, rs in extras.items() for r in rs]
     specs = (
         ("flare_sam_gear_balls", "skip_sam_gear", "sam_gear_max", "0 when skip sam gear 1, no limit with 0",
@@ -815,13 +856,14 @@ def _lightpub_field_checks(run: Run, extras: dict[str, list[dict]], log_src: str
             continue
         bad, limited, report = [], [], []
         for n, r in rows:
-            lim = limit_of(r[key], r[field])
+            lim = None if r["reloaded"] else limit_of(r[key], r[field])
             (limited if lim is not None else report).append(r[field])
             if lim is not None and r[field] > lim:
                 bad.append(f"{n} frame {r['frame']} {field}={r[field]} ({key} {r[key]})")
         worst = max(r[field] for _, r in rows)
         detail = (f"limited lines: {len(limited)} (max {max(limited, default=0)}); "
-                  f"report-only lines: {len(report)} (max {max(report, default=0)}, total {sum(report)})")
+                  f"report-only lines: {len(report)} (max {max(report, default=0)}, total {sum(report)}; "
+                  f"{sum(1 for _, r in rows if r['reloaded'])} spanning a settings change)")
         if bad:
             detail = f"{len(bad)} violation(s), first {bad[0]}; " + detail
         run.add(check, FAIL if bad else PASS, worst, thresh, detail, log_src)
@@ -839,6 +881,98 @@ def stop_all_ray_traced(spot: dict, w: dict) -> tuple[bool, str | None]:
     if any(not tel[f]["rayTraced"] for f in tids):
         return False, "not all frames ray traced"
     return True, None
+
+
+def _time_to_first_rt_text(ltel: dict[int, dict]) -> str:
+    """'timeToFirstRayTracedS=<x>s preRtCompiles=<n>' for one launch's telemetry: the sum of frameTimeMs from its
+    first line to the first rayTraced=true line, and the highest remixShaderCompiles before it ('-' without it)."""
+    t_ms, first_rt_s, pre = 0.0, None, None
+    for fr in sorted(ltel):
+        r = ltel[fr]
+        cval = r.get("remixShaderCompiles")
+        if isinstance(cval, (int, float)):
+            pre = max(pre or 0, int(cval))
+        if r.get("rayTraced") is True:
+            first_rt_s = t_ms / 1000.0
+            break
+        if isinstance(r.get("frameTimeMs"), (int, float)):
+            t_ms += float(r["frameTimeMs"])
+    tt = f"{first_rt_s:.1f}s" if first_rt_s is not None else "never RT"
+    return f"timeToFirstRayTracedS={tt} preRtCompiles={pre if pre is not None else '-'}"
+
+
+def _launch_compile_state(ltel: dict[int, dict], loading) -> tuple[str, float]:
+    """One launch's telemetry -> ('missing' | 'rt' | 'never' | 'wait', seconds in the shader compile wait).
+    'rt': some frame ray traced. 'never': remixShaderCompiles present on every frame and always 0. 'wait': never ray
+    traced; the wait sums frameTimeMs over frames with remixShaderCompiles > 0, or without that field over frames
+    with compile_wait_min_ms <= frameTimeMs - gpuTimeMs <= compile_wait_max_ms that loading(frame) does not excuse."""
+    frames = sorted(ltel)
+    if not frames or not all(isinstance(ltel[f].get("rayTraced"), bool)
+                             and isinstance(ltel[f].get("frameTimeMs"), (int, float))
+                             and isinstance(ltel[f].get("gpuTimeMs"), (int, float)) for f in frames):
+        return "missing", 0.0
+    if any(ltel[f]["rayTraced"] is True for f in frames):
+        return "rt", 0.0
+    comp = [ltel[f].get("remixShaderCompiles") for f in frames]
+    has_comp = all(isinstance(c, (int, float)) for c in comp)
+    if has_comp and max(comp) == 0:
+        return "never", 0.0
+    lo, hi = THRESHOLDS["compile_wait_min_ms"], THRESHOLDS["compile_wait_max_ms"]
+    wait_s = 0.0
+    for f, c in zip(frames, comp):
+        ft, gt = float(ltel[f]["frameTimeMs"]), float(ltel[f]["gpuTimeMs"])
+        if (c > 0) if has_comp else (lo <= ft - gt <= hi and not loading(f)):
+            wait_s += ft / 1000.0
+    return "wait", wait_s
+
+
+_CAPTURE_ALL_RE = re.compile(r"\brtx\.captureAllInstances\s*=\s*(\w+)")
+INSTANCED_THRESH = "0 on ray-traced scene frames with rtx.captureAllInstances on; report only with it off"
+
+
+def capture_all_instances(log_path: str | None) -> bool | None:
+    """rtx.captureAllInstances as Remix logged it at startup (it logs every non-default option as 'rtx.x = v'); no
+    line means the default, False. None when there is no remix-dxvk.log."""
+    if not log_path or not os.path.exists(log_path):
+        return None
+    on = False
+    for ln in read_lines(log_path):
+        m = _CAPTURE_ALL_RE.search(ln)
+        if m:
+            on = m.group(1).lower() in ("true", "1")
+    return on
+
+
+def instanced_capture_check(run: Run, sources: list[tuple[str, bool | None, list[tuple[int, object]]]],
+                            tsrc: str) -> None:
+    """instanced_shared_slot_draws (worker E2, dxvk-remix cb7d3b6): telemetry instancedSharedSlotDraws counts
+    hardware-instanced draws whose copies shared capture slots (only one copy ray traced). sources: (name,
+    rtx.captureAllInstances, [(frame, value)] on the ray-traced scene frames). With the option on the count must be 0
+    on every such frame; with it off it is reported, not judged. Note Remix still shares slots with the option on for
+    strips, fans and draws over kMaxInstancedCaptureVertices, so a FAIL names frames to look at, not only a bug."""
+    if not sources:
+        run.add("instanced_shared_slot_draws", NOT_MEASURED, None, INSTANCED_THRESH, "no spot ran far enough", tsrc)
+        return
+    no_log = [n for n, on, _ in sources if on is None]
+    no_rt = [n for n, _, vals in sources if not vals]
+    no_field = [n for n, _, vals in sources if vals and any(type(v) is not int for _, v in vals)]
+    if no_log or no_rt or no_field:
+        why = ([f"no remix-dxvk.log to read rtx.captureAllInstances: {', '.join(no_log)}"] if no_log else []) + (
+            [f"no ray-traced scene frame to count on: {', '.join(no_rt)}"] if no_rt else []) + (
+            [f"instancedSharedSlotDraws missing (a build before dxvk-remix cb7d3b6): {', '.join(no_field)}"]
+            if no_field else [])
+        run.add("instanced_shared_slot_draws", NOT_MEASURED, None, INSTANCED_THRESH, "; ".join(why), tsrc)
+        return
+    parts, bad = [], 0
+    for n, on, vals in sources:
+        worst = max(vals, key=lambda fv: fv[1])
+        nz = sum(1 for _, v in vals if v > 0)
+        if on:
+            bad += nz
+        parts.append(f"{n} captureAllInstances {'on' if on else 'off (report only)'}: {nz} of {len(vals)} ray-traced "
+                     f"scene frames with shared-slot draws, {sum(v for _, v in vals)} draws, max {worst[1]} at frame "
+                     f"{worst[0]}")
+    run.add("instanced_shared_slot_draws", FAIL if bad else PASS, bad, INSTANCED_THRESH, "; ".join(parts), tsrc)
 
 
 def ray_tracing_checks(run: Run, good: list[dict], tsrc: str) -> None:
@@ -889,24 +1023,7 @@ def ray_tracing_checks(run: Run, good: list[dict], tsrc: str) -> None:
         # never report 0 when only spot telemetry exists ("not measured").
         launch_path = spot_path(s, s.get("telemetryLaunch")) or os.path.join(s["_dir"], "telemetry_launch.jsonl")
         if os.path.exists(launch_path):
-            ltel, _ = read_telemetry(launch_path)
-            t_ms = 0.0
-            first_rt_s = None
-            pre_compiles: int | None = None
-            for fr in sorted(ltel):
-                r = ltel[fr]
-                cval = r.get("remixShaderCompiles")
-                if first_rt_s is None and isinstance(cval, (int, float)):
-                    pre_compiles = max(pre_compiles or 0, int(cval))
-                if r.get("rayTraced") is True:
-                    first_rt_s = t_ms / 1000.0
-                    break
-                ft = r.get("frameTimeMs")
-                if isinstance(ft, (int, float)):
-                    t_ms += float(ft)
-            pc_str = str(pre_compiles) if pre_compiles is not None else "-"
-            tt_str = f"{first_rt_s:.1f}s" if first_rt_s is not None else "never RT"
-            launch_times.append(f"{s['name']} timeToFirstRayTracedS={tt_str} preRtCompiles={pc_str}")
+            launch_times.append(f"{s['name']} {_time_to_first_rt_text(read_telemetry(launch_path)[0])}")
         else:
             launch_times.append(f"{s['name']} timeToFirstRayTracedS=not measured preRtCompiles=-")
 
@@ -963,39 +1080,21 @@ def ray_tracing_checks(run: Run, good: list[dict], tsrc: str) -> None:
 
     # 3. compile_wait_stuck & never_ray_traced
     stuck_lim_s = THRESHOLDS["compile_wait_stuck_s"]
-    cw_lo, cw_hi = THRESHOLDS["compile_wait_min_ms"], THRESHOLDS["compile_wait_max_ms"]
     cw_thresh = f"< {stuck_lim_s:g} s in compile wait without rayTraced=true (GUESS)"
     stuck_spots, never_rt_spots, missing_cw = [], [], []
     worst_wait_s = 0.0
     for s in good:
         launch_path = spot_path(s, s.get("telemetryLaunch")) or os.path.join(s["_dir"], "telemetry_launch.jsonl")
         ltel = read_telemetry(launch_path)[0] if os.path.exists(launch_path) else s["_data"]["telemetry"]
-        frames = sorted(ltel)
-        valid = [fr for fr in frames if isinstance(ltel[fr].get("rayTraced"), bool)
-                 and isinstance(ltel[fr].get("frameTimeMs"), (int, float))
-                 and isinstance(ltel[fr].get("gpuTimeMs"), (int, float))]
-        if not frames or len(valid) < len(frames):
+        state, wait_s = _launch_compile_state(ltel, lambda fr, s=s: is_proxy_loading(s, fr))
+        if state == "missing":
             missing_cw.append(s["name"])
             continue
-        has_rt = any(ltel[fr]["rayTraced"] is True for fr in frames)
-        if has_rt:
+        if state == "rt":
             continue
-        comp_vals = [int(ltel[fr]["remixShaderCompiles"]) for fr in frames
-                     if isinstance(ltel[fr].get("remixShaderCompiles"), (int, float))]
-        has_comp_field = len(comp_vals) == len(frames)
-        if has_comp_field and max(comp_vals, default=0) == 0:
+        if state == "never":
             never_rt_spots.append(f"{s['name']} (0 compiles)")
             continue
-        wait_s = 0.0
-        for fr in frames:
-            r = ltel[fr]
-            ft, gt = float(r["frameTimeMs"]), float(r["gpuTimeMs"])
-            if has_comp_field:
-                if int(r["remixShaderCompiles"]) > 0:
-                    wait_s += ft / 1000.0
-            else:
-                if cw_lo <= (ft - gt) <= cw_hi and not is_proxy_loading(s, fr):
-                    wait_s += ft / 1000.0
         worst_wait_s = max(worst_wait_s, wait_s)
         if wait_s >= stuck_lim_s:
             stuck_spots.append(f"{s['name']} ({wait_s:.1f}s)")
@@ -1044,7 +1143,8 @@ def lightpub_checks(run: Run, good: list[dict], reference: dict[str, dict] | Non
     else:
         all_rows = [(name, *row) for name, rows in parsed.items() for row in rows]
         # S1: flare_standins_off
-        off_rows = [(n, fr, S) for n, (E, _, _), fr, _, S, _, _, _ in all_rows if E == 0]
+        # A line whose window spans a settings change (reloaded) is not held to the new settings' limits.
+        off_rows = [(n, fr, S) for n, (E, _, _), fr, _, S, _, _, _, rl in all_rows if E == 0 and not rl]
         bad_s1 = [r for r in off_rows if r[2] > 0]
         worst_s1 = max((r[2] for r in off_rows), default=0)
         run.add("flare_standins_off", PASS if not bad_s1 else FAIL, worst_s1, "0 when flare stand-ins 0",
@@ -1052,15 +1152,15 @@ def lightpub_checks(run: Run, good: list[dict], reference: dict[str, dict] | Non
 
         # S2: flare_unplaced_balls
         noskip_lim = THRESHOLDS["flare_unplaced_max_noskip"]
-        bad_s2 = [(n, fr, SU, UM) for n, (_, SU, _), fr, _, _, UM, _, _ in all_rows
-                  if UM > (0 if SU == 1 else noskip_lim)]
+        bad_s2 = [(n, fr, SU, UM) for n, (_, SU, _), fr, _, _, UM, _, _, rl in all_rows
+                  if not rl and UM > (0 if SU == 1 else noskip_lim)]
         worst_um = max(r[5] for r in all_rows)
         run.add("flare_unplaced_balls", PASS if not bad_s2 else FAIL, worst_um,
                 f"0 when SU=1, <= {noskip_lim} when SU=0 (measured live)",
                 f"worst max-unplaced UM={worst_um} ({len(bad_s2)} violation(s))", log_src)
 
         # S3: flare_moving_balls
-        sm1_rows = [(n, fr, MM) for n, (_, _, SM), fr, _, _, _, MM, _ in all_rows if SM == 1]
+        sm1_rows = [(n, fr, MM) for n, (_, _, SM), fr, _, _, _, MM, _, rl in all_rows if SM == 1 and not rl]
         bad_s3 = [r for r in sm1_rows if r[2] > 0]
         worst_mm = max((r[2] for r in sm1_rows), default=0)
         run.add("flare_moving_balls", PASS if not bad_s3 else FAIL, worst_mm, "0 when SM=1",
@@ -1193,26 +1293,29 @@ def spot_fps(spot: dict) -> float | None:
     return 1000.0 / max(float(np.median(vals)), 1e-3)
 
 
+def _lag_stats(raw) -> dict | None:
+    vals = [float(x) for x in raw if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)]
+    if len(vals) < 20:
+        return None
+    return {"median": float(np.median(vals)), "spread": float(np.percentile(vals, 75) - np.percentile(vals, 25)),
+            "n": len(vals)}
+
+
 def spot_mouse_lag(spot: dict) -> dict | None:
-    """Mouse-to-screen lag stats from spot.json['mouse_lag']: median, IQR spread, and game/after shares;
-    None unless samples_ms has at least 20 finite numbers."""
+    """Game share of the mouse lag from spot.json['mouse_lag'].trials[].gameMs (mouse turn to the first proxy frame
+    with the turned camera): median, IQR spread and count; None unless at least 20 trials have a finite gameMs."""
     ml = spot.get("mouse_lag")
-    if not isinstance(ml, dict):
+    trials = ml.get("trials") if isinstance(ml, dict) else None
+    if not isinstance(trials, list):
         return None
-    raw = ml.get("samples_ms")
-    if not isinstance(raw, list):
-        return None
-    samples = [float(x) for x in raw if isinstance(x, (int, float)) and math.isfinite(x)]
-    if len(samples) < 20:
-        return None
-    game = ml.get("game_share_ms")
-    after = ml.get("after_game_ms")
-    return {
-        "median": float(np.median(samples)),
-        "spread": float(np.percentile(samples, 75) - np.percentile(samples, 25)),
-        "game": float(game) if isinstance(game, (int, float)) and math.isfinite(game) else None,
-        "after": float(after) if isinstance(after, (int, float)) and math.isfinite(after) else None,
-    }
+    return _lag_stats([t.get("gameMs") for t in trials if isinstance(t, dict)])
+
+
+def spot_screen_lag(spot: dict) -> dict | None:
+    """Mouse turn to a changed desktop grab (spot.json mouse_lag.samples_ms); None unless >= 20 finite samples."""
+    ml = spot.get("mouse_lag")
+    raw = ml.get("samples_ms") if isinstance(ml, dict) else None
+    return _lag_stats(raw) if isinstance(raw, list) else None
 
 
 def fps_regression_check(run: Run, good: list[dict], previous: dict[str, dict] | None) -> None:
@@ -1244,17 +1347,25 @@ def fps_regression_check(run: Run, good: list[dict], previous: dict[str, dict] |
 def _fmt_lag(s: dict | None) -> str:
     if s is None:
         return "not measured"
-    parts = [f"spread {s['spread']:.1f}"]
-    if s["game"] is not None and s["after"] is not None:
-        parts.append(f"game {s['game']:.1f}+after {s['after']:.1f}")
-    return f"{s['median']:.1f} ms ({', '.join(parts)})"
+    return f"{s['median']:.1f} ms (spread {s['spread']:.1f}, {s['n']} turns)"
 
 
 def input_lag_check(run: Run, good: list[dict], reference: dict[str, dict] | None) -> None:
-    """Each spot's median mouse-to-screen time (spot.json mouse_lag.samples_ms, >= 20 turns) against the same spot in
-    the no-Remix reference run (--reference), within input_lag_margin_ms (a GUESS). Without --reference or when any
-    spot lacks mouse_lag, the check is NOT MEASURED: there is no fixed limit."""
-    src = "spot.json mouse_lag (20 mouse turns): this run and the reference run (--reference)"
+    """input_latency_ms: each spot's median game share of the mouse lag (spot_mouse_lag, >= 20 turns) against the same
+    spot in the no-Remix reference run (--reference), within input_lag_margin_ms (a GUESS). It is the mouse turn to the
+    first game frame with the turned camera and leaves out everything after the game hands the frame on, so for Remix
+    it is a lower bound. Without --reference or when any spot lacks it: NOT MEASURED, there is no fixed limit.
+    input_latency_screen_ms: the screen share (samples_ms) is always NOT MEASURED until the desktop grab is shown to
+    work in Remix runs; its numbers go in the detail. It is in SOFT_NM, so it does not fail the gate."""
+    sources = "spot.json mouse_lag.samples_ms (desktop grab): this run and --reference"
+    screen = "; ".join(f"{s['name']} {_fmt_lag(spot_screen_lag(s))}" + (
+        f" vs {_fmt_lag(spot_screen_lag(reference[s['name']]))}" if reference and s["name"] in reference else "")
+        for s in good)
+    run.add("input_latency_screen_ms", NOT_MEASURED, None, "not judged until the screen grab works",
+            f"screen share not trusted yet (grab repeats pictures in Remix runs); numbers: {screen or 'no spot'}",
+            sources)
+    src = "spot.json mouse_lag.trials gameMs (mouse turn to the first game frame with the turned camera; leaves out " \
+          "everything after the game hands the frame on, a lower bound for Remix): this run and --reference"
     margin = THRESHOLDS["input_lag_margin_ms"]
     threshold = f"<= reference + {margin:g} ms per spot (GUESS margin)"
     ours = {s["name"]: spot_mouse_lag(s) for s in good}
@@ -1278,6 +1389,160 @@ def input_lag_check(run: Run, good: list[dict], reference: dict[str, dict] | Non
     detail = f"worst spot {worst:+.2f} ms over reference; " + "; ".join(
         f"{n} {_fmt_lag(a)} vs {_fmt_lag(b)}" for _, n, a, b in diffs)
     run.add("input_latency_ms", PASS if worst <= margin else FAIL, round(worst, 2), threshold, detail, src)
+
+
+def proxy_over_50ms(run: Run, name: str, col: int, what: str, limit_key: str, pairs, no_remix: bool) -> None:
+    """Count proxy rows in the windows `pairs` whose row index `col` is above 50 ms, loading frames excluded
+    (is_proxy_loading). Index 3 is the time inside Present (present_stalls), index 2 the gap since the previous Present
+    entry (frame_gap_over_50ms). NOT MEASURED when any frame in the windows lacks that column."""
+    src = "d3d9_proxy_frames.csv"
+    if not pairs:
+        run.add(name, NOT_MEASURED, None, "0", "no windows of this kind were run", src)
+        return
+    want, rows = coverage(pairs, "proxy", "proxy")
+    have = sum(1 for r in rows if len(r) > col)
+    if want == 0 or have < want:
+        run.add(name, NOT_MEASURED, None, "0", f"proxy trace has {have} of {want} frames with column {col}", src)
+        return
+    over, excluded, worst_ms, worst_f = 0, 0, -1.0, 0
+    for s, w in pairs:
+        prx = s["_data"]["proxy"]
+        for pf in frames_in(w, "proxy"):
+            try:
+                ms = float(prx[pf][col])
+            except (IndexError, ValueError):
+                continue
+            if ms > 50.0 and is_proxy_loading(s, pf, no_remix=no_remix):
+                excluded += 1
+                continue
+            if ms > worst_ms:
+                worst_ms, worst_f = ms, pf
+            if ms > 50.0:
+                over += 1
+    detail = f"{over} of {want} frames with {what} > 50 ms (worst {worst_ms:.1f} ms at frame {worst_f})" + (
+        f" ({excluded} loading-screen frames excluded)" if excluded else "")
+    run.add(name, PASS if over <= THRESHOLDS[limit_key] else FAIL, over, "0", detail, src)
+
+
+def spot_proxy_interval(spot: dict, no_remix: bool) -> tuple[float, int, int] | None:
+    """(median FPS, frames over 50 ms, frames) from proxy row index 2 (Present-to-Present gap) over one spot's scene
+    windows, loading frames excluded; None when any frame lacks the column."""
+    vals = []
+    for s, w in scene_pairs(spot):
+        prx = s["_data"]["proxy"]
+        for pf in frames_in(w, "proxy"):
+            try:
+                ms = float(prx[pf][2])
+            except KeyError:
+                continue
+            except (IndexError, ValueError):
+                return None
+            if not is_proxy_loading(s, pf, no_remix=no_remix):
+                vals.append(ms)
+    if not vals:
+        return None
+    return 1000.0 / max(float(np.median(vals)), 1e-3), sum(1 for v in vals if v > 50.0), len(vals)
+
+
+def frame_interval_check(run: Run, good: list[dict], reference: dict[str, dict] | None, no_remix: bool) -> None:
+    """frame_interval_vs_reference: report only, never FAIL (coordinator, Nov 16: a ray-traced picture will not match
+    the original's 150-200 FPS; the FPS rules are min_median_fps and fps_regression). Prints each spot's median FPS
+    and frames over 50 ms from the proxy frame gap, this run next to the reference. WARN when anything is missing."""
+    src = "d3d9_proxy_frames.csv index 2 (Present-to-Present gap), scene windows: this run and --reference (no Remix)"
+    parts, missing = [], []
+    for s in good:
+        now = spot_proxy_interval(s, no_remix)
+        ref = spot_proxy_interval(reference[s["name"]], True) if reference and s["name"] in reference else None
+        fmt = lambda v: "not measured" if v is None else f"{v[0]:.1f} FPS, {v[1]} of {v[2]} frames over 50 ms"
+        parts.append(f"{s['name']} {fmt(now)} vs original {fmt(ref)}")
+        if now is None or ref is None:
+            missing.append(s["name"])
+    if reference is None:
+        parts.insert(0, "no reference run given (--reference)")
+    run.add("frame_interval_vs_reference", WARN if missing or reference is None or not good else PASS, None,
+            "report only", "; ".join(parts) or "no spot measured", src)
+
+
+GLOW_BLOBS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "analysis", "glow_blobs.py")
+
+
+def glow_blobs_stop(remix_spot: str, orig_spot: str, still: str, orig_still: str) -> tuple[int, str]:
+    """Run worker B's glow_blobs.py on one stop: (exit code, output). It reads only the two stills and the proxy camera
+    (pose check), never light, flare or ball lists. 0 PASS, 1 FAIL, 2 NOT MEASURED (poses apart)."""
+    try:
+        p = subprocess.run([sys.executable, "-I", GLOW_BLOBS, "--remix-spot", remix_spot, "--orig-spot", orig_spot,
+                            "--still", still, "--orig-still", orig_still], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return -1, f"glow_blobs.py did not run: {e}"
+    return p.returncode, (p.stdout + p.stderr).strip()
+
+
+_GLOW_COUNTS = {  # check -> the glow_blobs.py line that carries its count (worker B, f56bbcc); limit 0 each
+    "lights_orbs_unmatched": re.compile(r"glow_blobs: unmatched (\d+) of (\d+) blobs"),
+    "lights_puffs": re.compile(r"glow_blobs: puffs (\d+)()"),
+    "lights_glows_lost": re.compile(r"glow_blobs: lost (\d+) of (\d+) original glows"),
+}
+
+
+def glow_checks(run: Run, good: list[dict], reference: dict[str, dict] | None, ref_no_remix: bool) -> None:
+    """Symptom checks for ledger rows 1 and 2 from worker B's glow_blobs.py (pictures only): per still and switch
+    stop, the Remix still against the original game's still at the same pose. Three counts, each with limit 0 per stop:
+    lights_orbs_unmatched (bright blobs the original does not show), lights_puffs (large bright areas the original
+    leaves dark; also counts surfaces Remix lights that the original leaves dark, so a puff needs a look before it is
+    called a floating light) and lights_glows_lost (the reverse: a lamp glow the original shows that Remix lost).
+    Switch stops are compared with the original's y0_p0; the pose check decides whether that is the same pose.
+    Each check: FAIL when any compared stop is over 0; otherwise NOT MEASURED when a spot has no no-Remix reference,
+    glow_blobs.py broke on a stop, or no stop could be compared; PASS otherwise. Stops whose poses are too far apart
+    (exit 2) are listed and not compared."""
+    src = "glow_blobs.py: the stop's Remix still against the same spot's still in --reference (no Remix)"
+    threshold = "0 per stop"
+    if reference is None or not ref_no_remix:
+        why = "no reference run given (--reference)" if reference is None else "the reference run is not a no-Remix run"
+        for name in _GLOW_COUNTS:
+            run.add(name, NOT_MEASURED, None, threshold, why, src)
+        return
+    jobs, missing = [], []
+    for s in good:
+        ref = reference.get(s["name"])
+        if ref is None:
+            missing.append(s["name"])
+            continue
+        ref_stills = {w["name"] for w in ref["windows"] if w.get("frames")}
+        for w in s["windows"]:
+            if not w.get("frames") or w["kind"] not in ("still", "switch"):
+                continue
+            orig = w["name"] if w["name"] in ref_stills else ("y0_p0" if w["kind"] == "switch" else None)
+            if orig in ref_stills:
+                jobs.append((s["name"], s["_dir"], ref["_dir"], w["name"], orig))
+    with concurrent.futures.ThreadPoolExecutor(4) as pool:
+        outs = list(pool.map(lambda j: glow_blobs_stop(j[1], j[2], j[3], j[4]), jobs))
+    counts = {name: [] for name in _GLOW_COUNTS}    # name -> [(label, n, of)] per compared stop
+    apart, errors = [], []
+    for (spot, _, _, stop, orig), (code, out) in zip(jobs, outs):
+        first = (out.splitlines()[0] if out else f"exit {code}").replace("glow_blobs: ", "")
+        found = {name: rx.search(out) for name, rx in _GLOW_COUNTS.items()}
+        if code == 2 and "NOT MEASURED" in out:
+            apart.append(f"{spot} {stop}: {first}")       # poses too far apart: a known gap, listed
+        elif code in (0, 1) and all(found.values()):
+            label = f"{spot} {stop}" + (f" (vs original {orig})" if orig != stop else "")
+            for name, m in found.items():
+                counts[name].append((label, int(m[1]), m[2]))
+        else:
+            errors.append(f"{spot} {stop}: exit {code}, {first}")   # the script broke: not measured
+    tail = ((f"; poses apart, not compared: {'; '.join(apart)}" if apart else "")
+            + (f"; glow_blobs.py errors: {'; '.join(errors)}" if errors else "")
+            + (f"; no reference for {', '.join(missing)}" if missing else ""))
+    for name, rows in counts.items():
+        bad = [(lab, n, of) for lab, n, of in rows if n > 0]
+        detail = (f"{len(bad)} of {len(rows)} compared stops over 0"
+                  + (": " + "; ".join(f"{lab} {n}" + (f" of {of}" if of else "") for lab, n, of in bad) if bad else "")
+                  + tail)
+        if bad:
+            run.add(name, FAIL, sum(n for _, n, _ in bad), threshold, detail, src)
+        elif missing or errors or not rows:
+            run.add(name, NOT_MEASURED, None, threshold, detail, src)
+        else:
+            run.add(name, PASS, 0, threshold, detail, src)
 
 
 def evaluate(folder: str, previous: str | None = None, reference: str | None = None) -> dict:
@@ -1326,35 +1591,10 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
             run.add("frames_over_50ms", PASS if over_nonload <= THRESHOLDS["frames_over_50ms"] else FAIL,
                     over_nonload, "0", detail, tsrc)
 
-    # present_stalls: d3d9_proxy_frames.csv column 3 (Present duration ms) > 50 ms in measured windows, excl. loads.
-    if not measured_pairs:
-        run.add("present_stalls", NOT_MEASURED, None, "0", "no windows of this kind were run", "d3d9_proxy_frames.csv")
-    else:
-        want_p, prows_p = coverage(measured_pairs, "proxy", "proxy")
-        have_p = sum(1 for r in prows_p if len(r) >= 4)
-        if want_p == 0 or have_p < want_p:
-            run.add("present_stalls", NOT_MEASURED, None, "0",
-                    f"proxy trace has {have_p} of {want_p} frames with Present ms", "d3d9_proxy_frames.csv")
-        else:
-            stalls, excluded_p, worst_ms, worst_f = 0, 0, -1.0, 0
-            for s, w in measured_pairs:
-                prx = s["_data"]["proxy"]
-                for pf in frames_in(w, "proxy"):
-                    try:
-                        pms = float(prx[pf][3])
-                    except (IndexError, ValueError):
-                        continue
-                    if pms > 50.0 and is_proxy_loading(s, pf, no_remix=no_remix):
-                        excluded_p += 1
-                        continue
-                    if pms > worst_ms:
-                        worst_ms, worst_f = pms, pf
-                    if pms > 50.0:
-                        stalls += 1
-            detail = f"{stalls} of {want_p} frames with Present > 50 ms (worst {worst_ms:.1f} ms at frame {worst_f})" + (
-                f" ({excluded_p} loading-screen frames excluded)" if excluded_p else "")
-            run.add("present_stalls", PASS if stalls <= THRESHOLDS["present_stalls_max"] else FAIL,
-                    stalls, "0", detail, "d3d9_proxy_frames.csv")
+    # present_stalls: proxy row index 3 (time inside Present); frame_gap_over_50ms: index 2 (gap since the previous
+    # Present entry). Both > 50 ms in measured windows, loading frames excluded.
+    proxy_over_50ms(run, "present_stalls", 3, "Present", "present_stalls_max", measured_pairs, no_remix)
+    proxy_over_50ms(run, "frame_gap_over_50ms", 2, "a Present-to-Present gap", "frame_gap_max", measured_pairs, no_remix)
     # skinned_min & remix_dropped_character_frames: join telemetry skinnedInstances with proxy_gate skinnedSceneDraws
     scene_pairs_list = pick(SCENE)
     if not scene_pairs_list:
@@ -1450,6 +1690,10 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
                 f"<= {THRESHOLDS['max_wait_overhead_ms']:g} ms",
                 f"median CPU/bridge wait {med_wait:.2f} ms (p99 {p99_wait:.2f} ms)", tsrc)
     input_lag_check(run, good, ref_spots)
+    frame_interval_check(run, good, ref_spots, no_remix)
+    ref_manifest = os.path.join(reference, "manifest.json") if reference else None
+    ref_no_remix = bool(ref_manifest and os.path.exists(ref_manifest) and load_json(ref_manifest).get("noRemix"))
+    glow_checks(run, good, ref_spots, ref_no_remix)
     latency_contributors = build_latency_contributors(good, pick(SCENE))
 
     # inward-facing character triangles: two extra telemetry fields, judged per frame
@@ -1467,7 +1711,7 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
     # frame_join_clock: qpcMs cross-check against proxy_frames.csv (entry + presentMs of k-1, k]
     if not measured_pairs:
         run.add("frame_join_clock", NOT_MEASURED, None, "0 frames outside proxy window",
-                "no windows of this kind were run (NOT MEASURED does not fail the gate for this check yet)",
+                "no windows of this kind were run",
                 "rtx_telemetry.jsonl qpcMs + d3d9_proxy_frames.csv")
     else:
         qpc_checked, qpc_bad, first_bad = 0, 0, None
@@ -1491,7 +1735,7 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
                         first_bad = (s["name"], tf, float(qpc), lo, hi)
         if qpc_checked == 0:
             run.add("frame_join_clock", NOT_MEASURED, None, "0 frames outside proxy window",
-                    "qpcMs absent or 0 on every frame (old build/run); NOT MEASURED does not fail the gate for this check yet",
+                    "qpcMs absent or 0 on every frame (a build before dxvk-remix 7f8c727)",
                     "rtx_telemetry.jsonl qpcMs + d3d9_proxy_frames.csv")
         else:
             bdetail = f"{qpc_bad} of {qpc_checked} qpcMs frames outside (prev_end, cur_end]" + (
@@ -1501,7 +1745,7 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
             run.add("frame_join_clock", PASS if qpc_bad == 0 else FAIL, qpc_bad, "0 frames outside proxy window",
                     bdetail, "rtx_telemetry.jsonl qpcMs + d3d9_proxy_frames.csv")
 
-    # Zero-normal counts per spot (median and max, GUESS limits until first live run)
+    # Zero-normal counts per spot (median and max; limit 0 measured in every Nov 16 run)
     for cname, field, lim_key in (
         ("zero_normal_skinned_triangles", "zeroNormalSkinnedTriangles", "zero_normal_skinned_tris_max"),
         ("zero_normal_instances", "zeroNormalInstances", "zero_normal_instances_max"),
@@ -1509,7 +1753,7 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
         ("zero_normal_static_instances", "zeroNormalStaticInstances", "zero_normal_static_instances_max"),
     ):
         lim = THRESHOLDS[lim_key]
-        thresh_zn = f"<= {lim} max per spot (GUESS)"
+        thresh_zn = f"<= {lim} max per spot"
         if not good:
             run.add(cname, NOT_MEASURED, None, thresh_zn, "no spot ran far enough to judge", tsrc)
             continue
@@ -1531,6 +1775,12 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
 
     recorder_checks(run, pick, good, tsrc)
     ray_tracing_checks(run, good, tsrc)
+    instanced_capture_check(run, [
+        (s["name"], capture_all_instances(_first_file(s["_dir"], ("remix-dxvk.log",))),
+         [(tf, s["_data"]["telemetry"].get(tf, {}).get("instancedSharedSlotDraws"))
+          for _, w in scene_pairs(s) for tf in frames_in(w, "telemetry")
+          if s["_data"]["telemetry"].get(tf, {}).get("rayTraced") is not False])
+        for s in good], tsrc)
     lightpub_checks(run, good, ref_spots)
 
     # goggles_toggle_rebuilds & goggles_dark_frame: first rayTraced=true frame after rayTraced=false in goggles windows.
@@ -1803,7 +2053,10 @@ def evaluate_session(folder: str) -> dict:
     """Score the logs of a free-play session (a play-setup logs folder: rtx_telemetry.jsonl, d3d9_proxy_gate.csv and
     rtx-remix_logs_remix-dxvk.log) with the gate rules that need no scripted camera: goggles_toggle_rebuilds and
     goggles_dark_frame on every goggles-off (proxy goggles column 1 -> 0), remix_dropped_character_frames on every
-    frame, clean_quit on device loss. Telemetry is streamed (sessions reach 1.6 GB). Writes nothing to the folder."""
+    frame, frames_over_50ms (only loading screens excused; result["slowFrames"] lists every frame over 50 ms),
+    remix_ray_tracing (scene share outside loading and goggles, time to first ray-traced frame from launch start),
+    compile_wait_stuck and never_ray_traced on the whole launch, instanced_shared_slot_draws on ray-traced scene frames,
+    clean_quit on device loss. Telemetry is streamed (sessions reach 1.6 GB). Writes nothing to the folder."""
     run = Run.__new__(Run)
     run.dir, run.manifest, run.metrics = folder, {}, []
     tel_path = _first_file(folder, ("rtx_telemetry.jsonl", "telemetry.jsonl"))
@@ -1814,11 +2067,19 @@ def evaluate_session(folder: str) -> dict:
                      ("goggles_dark_frame", f">= {dark_lim:g} (GUESS)"),
                      ("remix_dropped_character_frames", "0"))
     if not tel_path or not pg_path:
-        for name, thr in goggle_checks:
+        for name, thr in goggle_checks + (("frames_over_50ms", "0"), ("remix_ray_tracing", "scene RT"),
+                                          ("compile_wait_stuck", "no compile-wait hang"),
+                                          ("never_ray_traced", "rayTraced=true when remixShaderCompiles==0"),
+                                          ("instanced_shared_slot_draws", INSTANCED_THRESH)):
             run.add(name, NOT_MEASURED, None, thr, "session has no telemetry or no proxy gate CSV", tsrc)
+        slow = []
     else:
         pg = read_csv_frames(pg_path, 6)
+        pf_path = _first_file(folder, ("d3d9_proxy_frames.csv", "proxy_frames.csv"))
+        spot = {"_data": {"pgate": pg, "proxy": read_csv_frames(pf_path, 7) if pf_path else {}}}
+        keep = ("rayTraced", "frameTimeMs", "gpuTimeMs", "remixShaderCompiles", "instancedSharedSlotDraws")
         tel: dict[int, tuple] = {}   # frame -> (rayTraced, staticBlasBuilds, skinnedInstances, instances, luma)
+        ltel: dict[int, dict] = {}   # frame -> the fields the launch and frame-time rules read
         with open(tel_path, "rb") as f:
             for ln in f:
                 try:
@@ -1830,6 +2091,7 @@ def evaluate_session(folder: str) -> dict:
                 if isinstance(o.get("frame"), int):
                     tel[o["frame"]] = (o.get("rayTraced"), o.get("staticBlasBuilds"), o.get("skinnedInstances"),
                                        o.get("instances"), luma)
+                    ltel[o["frame"]] = {k: o[k] for k in keep if k in o}
 
         def goggles(fr: int) -> bool | None:
             row = pg.get(fr)
@@ -1890,6 +2152,53 @@ def evaluate_session(folder: str) -> dict:
                     f"proxy drew characters +/-3 frames outside goggles"
                     + (f"; frames {', '.join(map(str, dropped[:10]))}" if dropped else ""), tsrc)
 
+        # frames_over_50ms: the gate rule (only loading screens excused, by the proxy row with the same frame number;
+        # goggles frames count, as goggles windows do in a gate run). result["slowFrames"] lists every frame > 50 ms.
+        loading = lambda fr: is_proxy_loading(spot, fr)     # noqa: E731
+        timed = [(fr, float(r["frameTimeMs"])) for fr, r in sorted(ltel.items())
+                 if isinstance(r.get("frameTimeMs"), (int, float))]
+        slow = [(fr, ms, "loading" if loading(fr) else None) for fr, ms in timed if ms > 50.0]
+        counted = [x for x in slow if x[2] is None]
+        if not timed:
+            run.add("frames_over_50ms", NOT_MEASURED, None, "0", "telemetry has no frameTimeMs", tsrc)
+        else:
+            worst10 = sorted(counted, key=lambda x: -x[1])[:10]
+            run.add("frames_over_50ms", PASS if len(counted) <= THRESHOLDS["frames_over_50ms"] else FAIL, len(counted),
+                    "0", f"{len(counted)} of {len(timed)} frames over 50 ms ({len(slow) - len(counted)} loading-screen "
+                    f"frames excused); ten worst: " + ", ".join(f"{fr} {ms:.1f} ms" for fr, ms, _ in worst10), tsrc)
+
+        # remix_ray_tracing: ray-traced share of scene frames (not loading, not goggles +/-3), time to first RT frame.
+        scene = [fr for fr in sorted(ltel) if isinstance(ltel[fr].get("rayTraced"), bool) and not loading(fr)
+                 and not any(goggles(f) for f in range(fr - 3, fr + 4))]
+        min_rt = THRESHOLDS["min_scene_rt_share"]
+        rt_thresh = f"scene RT >= {min_rt:.0%} (GUESS)"
+        if not scene:
+            run.add("remix_ray_tracing", NOT_MEASURED, None, rt_thresh, "no scene frame with rayTraced", tsrc)
+        else:
+            share = sum(1 for fr in scene if ltel[fr]["rayTraced"]) / len(scene)
+            run.add("remix_ray_tracing", PASS if share >= min_rt else FAIL, round(share, 4), rt_thresh,
+                    f"scene RT {share:.2%} of {len(scene)} frames outside loading and goggles; from launch start "
+                    f"{_time_to_first_rt_text(ltel)}", tsrc)
+
+        # compile_wait_stuck & never_ray_traced: the gate rule on the whole launch.
+        state, wait_s = _launch_compile_state(ltel, loading)
+        cw_thresh = f"< {THRESHOLDS['compile_wait_stuck_s']:g} s in compile wait without rayTraced=true (GUESS)"
+        nr_thresh = "rayTraced=true when remixShaderCompiles==0"
+        if state == "missing":
+            for name, thr in (("compile_wait_stuck", cw_thresh), ("never_ray_traced", nr_thresh)):
+                run.add(name, NOT_MEASURED, None, thr, "telemetry lacks rayTraced/frameTimeMs/gpuTimeMs", tsrc)
+        else:
+            stuck = state == "wait" and wait_s >= THRESHOLDS["compile_wait_stuck_s"]
+            run.add("compile_wait_stuck", FAIL if stuck else PASS, round(wait_s, 1), cw_thresh,
+                    "ray traced" if state == "rt" else f"never ray traced, {wait_s:.1f} s in the compile wait", tsrc)
+            run.add("never_ray_traced", FAIL if state == "never" else PASS, int(state == "never"), nr_thresh,
+                    "never ray traced with 0 compiles" if state == "never" else "no 0-compile non-RT launch", tsrc)
+
+        # instanced_shared_slot_draws on the ray-traced scene frames
+        log_on = capture_all_instances(_first_file(folder, ("rtx-remix_logs_remix-dxvk.log", "remix-dxvk.log")))
+        instanced_capture_check(run, [("session", log_on, [(fr, ltel[fr].get("instancedSharedSlotDraws"))
+                                                           for fr in scene if ltel[fr]["rayTraced"]])], tsrc)
+
     dxvk = _first_file(folder, ("rtx-remix_logs_remix-dxvk.log", "remix-dxvk.log"))
     if not dxvk:
         run.add("clean_quit", NOT_MEASURED, None, "no VK_ERROR_DEVICE_LOST", "no remix-dxvk.log in the session",
@@ -1899,8 +2208,10 @@ def evaluate_session(folder: str) -> dict:
         run.add("clean_quit", FAIL if lost else PASS, len(lost), "no VK_ERROR_DEVICE_LOST",
                 f"VK_ERROR_DEVICE_LOST on line(s) {', '.join(map(str, lost[:5]))}" if lost else "no device loss",
                 os.path.basename(dxvk))
-    status = PASS if all(x["status"] in (PASS, WARN) for x in run.metrics) else FAIL
-    return {"status": status, "session": os.path.abspath(folder), "thresholds": THRESHOLDS, "checks": run.metrics}
+    status = PASS if all(x["status"] in (PASS, WARN) or (x["status"] == NOT_MEASURED and x["check"] in SOFT_NM)
+                         for x in run.metrics) else FAIL
+    return {"status": status, "session": os.path.abspath(folder), "thresholds": THRESHOLDS, "checks": run.metrics,
+            "slowFrames": [[fr, round(ms, 1), why] for fr, ms, why in slow]}
 
 
 def pose_check(run: Run, spots: list[dict]) -> None:

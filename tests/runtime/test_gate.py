@@ -143,15 +143,17 @@ class MathTest(unittest.TestCase):
                                                        "G:0:0:3769.8:3085.6:225.2:0.14:0.08:-0.98:0.0"]))
 
     def test_spot_mouse_lag(self):
+        # input_latency_ms reads the game share (trials gameMs), not the screen samples: give the two different values.
         self.assertIsNone(gate.spot_mouse_lag({}))
-        self.assertIsNone(gate.spot_mouse_lag({"mouse_lag": {"samples_ms": [20.0] * 19}}))
-        res = gate.spot_mouse_lag({"mouse_lag": {"samples_ms": [20.0] * 10 + [24.0] * 10,
-                                                 "game_share_ms": 14.0, "after_game_ms": 8.0}})
-        self.assertIsNotNone(res)
-        self.assertAlmostEqual(res["median"], 22.0)
-        self.assertAlmostEqual(res["spread"], 4.0)
-        self.assertAlmostEqual(res["game"], 14.0)
-        self.assertAlmostEqual(res["after"], 8.0)
+        trials = [{"screenMs": None, "gameMs": 90.0 + (i % 2) * 8.0} for i in range(20)]
+        self.assertIsNone(gate.spot_mouse_lag({"mouse_lag": {"samples_ms": [20.0] * 20, "trials": trials[:19]}}))
+        res = gate.spot_mouse_lag({"mouse_lag": {"samples_ms": [20.0] * 20, "game_share_ms": 1.0,
+                                                 "trials": trials + [{"screenMs": 30.0, "gameMs": None}]}})
+        self.assertAlmostEqual(res["median"], 94.0)
+        self.assertAlmostEqual(res["spread"], 8.0)
+        self.assertEqual(res["n"], 20)
+        self.assertAlmostEqual(gate.spot_screen_lag({"mouse_lag": {"samples_ms": [20.0] * 10 + [24.0] * 10}})["median"],
+                               22.0)
 
     def test_brightness_hdr_clip_and_black_raster_guard(self):
         b_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "analysis", "brightness"))
@@ -292,6 +294,51 @@ class FakeRunTest(unittest.TestCase):
                 self.assertEqual(by_name["remix_ray_tracing"]["status"], want_rt, (spot_name, by_name["remix_ray_tracing"]))
                 self.assertEqual(by_name["remix_compile_stall"]["status"], want_cs, (spot_name, by_name["remix_compile_stall"]))
 
+    def test_frame_gap_on_06_dlss_perf_1(self):
+        """Worker C's case: the DLSS performance launch of the settings sweep has Present-to-Present gaps over 50 ms in
+        its measured windows while no Present call and no Remix frame time is over 50 ms. frame_gap_over_50ms must
+        FAIL on it (3 gaps: 5410, 5435, 6397; C's fourth, 5689, is the frame before look_y135 starts) and present_stalls
+        must PASS. The same rows with those gaps set to 33 ms must PASS."""
+        base = r"D:\BlacklistOverhaul\experiments\remix-gate\20261116-113127-settings"
+        if not os.path.isdir(os.path.join(base, "06_dlss_perf_1")):
+            self.skipTest("settings sweep not on this machine")
+        run = gate.Run(base)
+        run.manifest = {"spots": ["06_dlss_perf_1"]}
+        good = gate.load_spots(run)
+        pairs = [(s, w) for s in good for w in s["windows"] if w["kind"] in gate.MEASURED]
+        gate.proxy_over_50ms(run, "frame_gap_over_50ms", 2, "a Present-to-Present gap", "frame_gap_max", pairs, False)
+        gate.proxy_over_50ms(run, "present_stalls", 3, "Present", "present_stalls_max", pairs, False)
+        by = {m["check"]: m for m in run.metrics}
+        self.assertEqual((by["frame_gap_over_50ms"]["status"], by["frame_gap_over_50ms"]["value"]), (gate.FAIL, 3))
+        self.assertIn("worst 61.5 ms at frame 5410", by["frame_gap_over_50ms"]["detail"])
+        self.assertEqual(by["present_stalls"]["status"], gate.PASS, by["present_stalls"])
+        prx = good[0]["_data"]["proxy"]
+        for pf in (5410, 5435, 6397):
+            prx[pf][2] = "33"
+        run.metrics.clear()
+        gate.proxy_over_50ms(run, "frame_gap_over_50ms", 2, "a Present-to-Present gap", "frame_gap_max", pairs, False)
+        self.assertEqual(run.metrics[0]["status"], gate.PASS, run.metrics[0])
+
+    def test_glow_blobs_counts_on_real_stops(self):
+        """Ledger rows 1 and 2: worker B's glow_blobs.py (f56bbcc) through the gate's own call and parsing, against the
+        original game at con_bright_hall (reference 000454). 142638 y0_p0, stand-in balls on: 12 orbs and 2 puffs, no
+        lost glow. 142638's balls-off switch step: 0/0/0. 063147 y0_p0 (never ray traced, dark): 6 of 21 original
+        glows lost, the reverse direction. y135_p0: poses 20 cm apart, not compared (exit 2)."""
+        g = r"D:\BlacklistOverhaul\experiments\remix-gate"
+        og = os.path.join(g, "reference-20261116-000454", "con_bright_hall")
+        rx = os.path.join(g, "20261115-142638", "con_bright_hall")
+        dark = os.path.join(g, "20261116-063147", "con_bright_hall")
+        if not all(os.path.isdir(d) for d in (og, rx, dark)):
+            self.skipTest("runs 142638, 063147 or reference 000454 not on this machine")
+
+        def counts(remix, still, orig):
+            code, out = gate.glow_blobs_stop(remix, og, still, orig)
+            return code, tuple(int(rx_.search(out)[1]) if rx_.search(out) else None for rx_ in gate._GLOW_COUNTS.values())
+
+        self.assertEqual(counts(rx, "y0_p0", "y0_p0"), (1, (12, 2, 0)))
+        self.assertEqual(counts(rx, "switch_flare_balls_off", "y0_p0"), (0, (0, 0, 0)))
+        self.assertEqual(counts(dark, "y0_p0", "y0_p0"), (1, (13, 5, 6)))
+        self.assertEqual(gate.glow_blobs_stop(rx, og, "y135_p0", "y135_p0")[0], 2)
     def test_session_mode_fake_sessions(self):
         with tempfile.TemporaryDirectory() as td:
             for case in fakerun.SESSION_CASES:
@@ -304,10 +351,22 @@ class FakeRunTest(unittest.TestCase):
         d = r"D:\BlacklistOverhaul\experiments\playtest-evidence\play-setup-logs\before-20261115-135449"
         if not os.path.exists(os.path.join(d, "rtx_telemetry.jsonl")):
             self.skipTest("session logs not on this machine")
-        by = {c["check"]: c for c in gate.evaluate_session(d)["checks"]}
+        result = gate.evaluate_session(d)
+        by = {c["check"]: c for c in result["checks"]}
         g = by["goggles_toggle_rebuilds"]
         self.assertEqual(g["status"], gate.FAIL, g)
         self.assertIn("94 at 41475", g["detail"])
+        # Around that goggles-off: 64.7 ms at 41472 (inside goggles, not loading) counts, 49.1 ms at 41477 is under 50.
+        slow = {fr: (ms, why) for fr, ms, why in result["slowFrames"]}
+        self.assertEqual(slow.get(41472), (64.7, None))
+        self.assertNotIn(41477, slow)
+        self.assertEqual(by["frames_over_50ms"]["status"], gate.FAIL)
+        # compile_wait.py's reference: first ray-traced frame 27.1 s after launch start.
+        self.assertIn("timeToFirstRayTracedS=27.1s", by["remix_ray_tracing"]["detail"])
+        self.assertEqual(by["remix_ray_tracing"]["status"], gate.PASS, by["remix_ray_tracing"])
+        self.assertEqual(by["compile_wait_stuck"]["status"], gate.PASS)
+        self.assertEqual(by["never_ray_traced"]["status"], gate.PASS)
+        self.assertEqual(by["instanced_shared_slot_draws"]["status"], gate.NOT_MEASURED)   # build before cb7d3b6
 
 
 class DriveHelpersTest(unittest.TestCase):

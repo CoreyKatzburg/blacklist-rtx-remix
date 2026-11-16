@@ -92,6 +92,7 @@ class Builder:
                "zeroNormalStaticTriangles": 0, "zeroNormalStaticInstances": 0}
         # recorder fields (gate.recorder_checks): healthy values, with one fault per case below
         rec.update({"replacedMaterialDraws": 354, "legacyMaterialDraws": 25, "texturesDemoted": 0,
+                    "instancedSharedSlotDraws": 0, "instancedCapturedDraws": 4,
                     "skips": {"occlusionQuery": 300},
                     "passMs": {"InjectRTX": [10.0, 4.0, 1], "InjectRTX/Ray Reconstruction": [5.0, 0.2, 1],
                                "InjectRTX/Ray Reconstruction/Prepare DLSS": [0.3, 0.02, 1]}})
@@ -146,6 +147,10 @@ class Builder:
             rec["skips"]["unsupportedTopology"] = 90 if c == "other_skips_6pct" else 60   # 6% and 4% of 1500 draws
         if c == "no_mod_materials": rec["replacedMaterialDraws"], rec["legacyMaterialDraws"] = 0, 379
         if c == "demoted_textures" and kind == "still" and i % 2 == 0: rec["texturesDemoted"] = 1
+        if c in ("shared_slots_capture_on", "shared_slots_capture_off") and kind == "still" and i == 3:
+            rec["instancedSharedSlotDraws"] = 3
+        if c == "no_instanced_field":
+            del rec["instancedSharedSlotDraws"], rec["instancedCapturedDraws"]
         if c == "renamed_fields":
             rec["frameMs"] = rec.pop("frameTimeMs")
         rec["lumaThumb"] = base64.b64encode(img.astype(np.uint8).tobytes()).decode()
@@ -170,7 +175,8 @@ class Builder:
             self.pgate.append(f"{self.pframe},1400,40,1,{1 if goggles else 0},1")
         else:
             fx, fy, fz = math.cos(cp) * math.cos(cy), math.cos(cp) * math.sin(cy), math.sin(cp)
-            self.proxy.append(f"{self.pframe},{self.clk:.3f},14.0,{pms},1500,1,P:22:0:1.0:2.0:3.0:{fx:.5f}:{fy:.5f}:{fz:.5f}:0.0")
+            gap = 61.0 if (c == "frame_gap" and kind == "pan" and i == 30) else 14.0   # long gap, short Present
+            self.proxy.append(f"{self.pframe},{self.clk:.3f},{gap},{pms},1500,1,P:22:0:1.0:2.0:3.0:{fx:.5f}:{fy:.5f}:{fz:.5f}:0.0")
             handoff = 0 if (c == "raster_flash" and kind == "pan" and i == 70) else 1
             sdraws = 0 if c == "noremix_scenedraws0" else 1400
             skdraws = 0 if (c == "proxy_no_char_ok" and kind == "still" and i == 3) else 40
@@ -293,9 +299,11 @@ class Builder:
                 "proxyLog": "proxy.log"}
         if self.case != "no_mouse_lag":
             bump = 5.0 if self.case == "lag_within_margin" else (5.5 if self.case == "lag_over_margin" else 0.0)
-            samples = [round(22.0 + bump + ((i % 3) - 1) * 0.5, 2) for i in range(20)]
-            spot["mouse_lag"] = {"samples_ms": samples, "game_share_ms": 14.0, "after_game_ms": round(8.0 + bump, 2),
-                                 "method": "fake 20x5deg gdigrab"}
+            # the bump goes on the game share (trials gameMs), which input_latency_ms judges; the screen share
+            # (samples_ms) is only printed under input_latency_screen_ms
+            trials = [{"screenMs": 22.0, "gameMs": round(14.0 + bump + ((i % 3) - 1) * 0.5, 2)} for i in range(20)]
+            spot["mouse_lag"] = {"samples_ms": [22.0] * 20, "game_share_ms": round(14.0 + bump, 2), "after_game_ms": 8.0,
+                                 "trials": trials, "method": "fake 20x5deg gdigrab"}
         if self.case == "spot_error":
             spot["error"] = "RuntimeError: loaded map 'menu', checkpoint was recorded in 'S_CON_Global'"
         if self.case == "no_thumbs":
@@ -325,7 +333,8 @@ class Builder:
         gate.save_text(os.path.join(self.dir, "proxy_gate.csv"), "\n".join(self.pgate) + "\n")
         if self.case != "no_quit_log":
             lost = "[error] vkQueueSubmit: VK_ERROR_DEVICE_LOST\n" if self.case == "device_lost" else ""
-            gate.save_text(os.path.join(self.dir, "remix-dxvk.log"), "[info] Remix shutdown\n" + lost)
+            opt = "[info]    rtx.captureAllInstances = True\n" if self.case == "shared_slots_capture_on" else ""
+            gate.save_text(os.path.join(self.dir, "remix-dxvk.log"), opt + "[info] Remix shutdown\n" + lost)
             b32 = "[00:01:00.000] info:  Bridge client started\n"
             if self.case != "no_terminate":
                 b32 += "[00:02:00.000] info:  Sending Terminate command to server...\n"
@@ -349,13 +358,18 @@ class Builder:
             f"stand-ins {s_val} on unplaced {um_val} (max {um_val}) on moving {mm_val} (max {mm_val}) "
             f"dimmed 2 (max 2) longest dim {tm_val} frames (max {tm_val}){new_tail}\n"
         )
-        if self.case == "lightpub_missed_notice":   # a later reload turns skip sam gear on; the next line breaks it
+        stray = ("lightpub: stray frame {} lamps 120 without flare 59 (max 59) flares 61 stand-ins 0 on unplaced 0 "
+                 "(max 0) on moving 0 (max 0) dimmed 2 (max 2) longest dim 10 frames (max 10) on sam gear {} (max {}) "
+                 "weapon flips {} recreated 0\n")
+        if self.case == "lightpub_missed_notice":   # a later reload turns skip sam gear on; the line after the
             plog += ("lightpub: settings reloaded after a missed notice (scale 1, sun 1, fill 1, max 20, flare "
                      "stand-ins 0, trace 1, weapon by shape 0, keep tracked 0, skip sam gear 1, stand-in skip "
-                     "unplaced 1, skip moving 1)\n"
-                     "lightpub: stray frame 720 lamps 120 without flare 59 (max 59) flares 61 stand-ins 0 on "
-                     "unplaced 0 (max 0) on moving 0 (max 0) dimmed 2 (max 2) longest dim 10 frames (max 10) "
-                     "on sam gear 4 (max 4) weapon flips 0 recreated 0\n")
+                     "unplaced 1, skip moving 1)\n"   # reload's window (frame 720) is excused, frame 1320 breaks it
+                     + stray.format(720, 4, 4, 0) + stray.format(1320, 4, 4, 0))
+        if self.case == "weapon_flips_reload_window":   # run 20261116-102658: shape 0 -> 2 mid-window, 1 flip on the
+            plog += ("lightpub: settings reloaded (scale 1, sun 1, fill 1, max 20, flare stand-ins 0, trace 1, "
+                     "weapon by shape 2, keep tracked 0, skip sam gear 1, stand-in skip unplaced 1, skip moving 1)\n"
+                     + stray.format(720, 0, 0, 1) + stray.format(1320, 0, 0, 0))   # line spanning it, 0 after
         gate.save_text(os.path.join(self.dir, "proxy.log"), plog)
         trows = ["frame,node,id,change,old,new", "100,0x1,1,started,0.0,100.0"]
         if self.case == "switchoff_lag":
@@ -380,7 +394,8 @@ LP_COUNTS = {"sam_gear_skip_ignored": (11, 0, 0), "sam_gear_noskip": (11, 0, 0),
 
 
 # checks that read telemetry the recorder writes per frame: NOT MEASURED whenever that telemetry is missing
-RECORDER = ("step_timing", "skip_occlusion_share", "skip_other_share", "material_share", "textures_demoted")
+RECORDER = ("step_timing", "skip_occlusion_share", "skip_other_share", "material_share", "textures_demoted",
+            "instanced_shared_slot_draws")
 
 _ZERO_NORMALS = ("zero_normal_skinned_triangles", "zero_normal_instances",
                  "zero_normal_static_triangles", "zero_normal_static_instances")
@@ -403,11 +418,11 @@ CASES = {
     "never_ray_traced": (("remix_ray_tracing", "remix_compile_stall", "compile_wait_stuck", "latency_overhead_ms"),
                          ("nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
                           "outline_overlap", "flashes", "still_flicker",
-                          "goggles_toggle_rebuilds", "goggles_dark_frame")),
+                          "goggles_toggle_rebuilds", "goggles_dark_frame", "instanced_shared_slot_draws")),
     "never_rt_no_compiles": (("remix_ray_tracing", "remix_compile_stall", "never_ray_traced", "latency_overhead_ms"),
                              ("nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
                               "outline_overlap", "flashes", "still_flicker",
-                              "goggles_toggle_rebuilds", "goggles_dark_frame")),
+                              "goggles_toggle_rebuilds", "goggles_dark_frame", "instanced_shared_slot_draws")),
     "goggles_off_only": ((), ()),
     "one_stop_not_ray_traced": (("remix_ray_tracing",),
                                 ("nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
@@ -434,7 +449,7 @@ CASES = {
     "loading_in_window": ((), ()),                        # >50 ms frames during a loading screen are excluded: passes
     "missing_cam_col": (("frames_over_50ms",), ()),       # 6-column proxy row (no camera column) is unknown -> fails
     "cut_short_cam_col": (("frames_over_50ms",), ()),     # cut-short camera column text is unknown -> fails
-    "short_row_in_window": ((), ("skip_occlusion_share", "skip_other_share", "present_stalls")),
+    "short_row_in_window": ((), ("skip_occlusion_share", "skip_other_share", "present_stalls")),  # 3 columns: gap measured
     "cut_short_proxy": ((), ()),                          # last proxy row cut short mid-write: finishes and passes
     "load_count_mismatch": (("frames_over_50ms",), ()),   # 7 tel vs 6 proxy: 1 loading frame excuses only t0, t1 fails
     "slow_missing_proxy": (("frames_over_50ms",), ()),    # slow frame whose frame number is absent from proxy -> fails
@@ -448,7 +463,7 @@ CASES = {
     "no_mouse_lag": ((), ("input_latency_ms",)),        # missing mouse_lag in spot.json: NOT MEASURED, fails the gate
     "fps_regression": (("fps_regression",), ()),        # 15% below the previous run
     "fps_drop_9pct": ((), ()),                          # 9% below the previous run: passes
-    "no_reference": ((), ("input_latency_ms", "lamps_without_flare", "scene_brightness")),
+    "no_reference": ((), ("input_latency_ms", "lamps_without_flare", "scene_brightness", "lights_orbs_unmatched", "lights_puffs", "lights_glows_lost")),
     "too_dark": (("scene_brightness",), ()),
     "too_dark_vs_raster": (("scene_brightness",), ()),
     "too_bright_vs_raster": (("scene_brightness",), ()),
@@ -460,7 +475,15 @@ CASES = {
     "goggles_untoggled": ((), ("goggles",)),
     "goggles_toggle_rebuilds": (("goggles_toggle_rebuilds",), ()),
     "goggles_dark_frame": (("goggles_dark_frame",), ()),
-    "present_stall": (("present_stalls",), ()),
+    "present_stall": (("present_stalls",), ()),           # 120 ms inside Present, 14 ms gap: only present_stalls
+    "frame_gap": (("frame_gap_over_50ms",), ()),         # 61 ms gap, 0.5 ms Present, 10 ms telemetry: only the gap
+    "orbs_unmatched": (("lights_orbs_unmatched",), ()),  # glow_blobs: 12 unmatched blobs at y0_p0
+    "glow_puffs": (("lights_puffs",), ()),               # glow_blobs: 2 puffs at y90_p0
+    "glows_lost": (("lights_glows_lost",), ()),          # glow_blobs: 6 original glows lost at y45_p0
+    "orbs_pose_apart_one": ((), ()),                     # one stop with poses apart is listed; the rest pass
+    "orbs_all_poses_apart": ((), ("lights_orbs_unmatched", "lights_puffs", "lights_glows_lost")),   # nothing compared: NOT MEASURED
+    "orbs_script_error": ((), ("lights_orbs_unmatched", "lights_puffs", "lights_glows_lost")),      # glow_blobs broke on a stop: NOT MEASURED
+    "orbs_remix_reference": ((), ("lights_orbs_unmatched", "lights_puffs", "lights_glows_lost")),   # --reference is a Remix run: NOT MEASURED
     "quit_present_stall": (("clean_quit",), ()),
     "no_terminate": ((), ("clean_quit",)),
     "no_telemetry": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms",
@@ -485,7 +508,8 @@ CASES = {
                            "remix_ray_tracing")),
     "no_thumbs": ((), ()),                       # still measurable from the screen captures (pan at full rate)
     "half_rate_capture": ((), ("flashes",)),     # screen capture saw half the game frames of the pan
-    "spot_error": (("s1: setup",), ("frames_over_50ms", "present_stalls", "min_median_fps", "latency_overhead_ms",
+    "spot_error": (("s1: setup",), ("frames_over_50ms", "present_stalls", "frame_gap_over_50ms", "min_median_fps",
+                                    "latency_overhead_ms", "lights_orbs_unmatched", "lights_puffs", "lights_glows_lost",
                                     "input_latency_ms", "skinned_min", "remix_dropped_character_frames",
                                     "static_blas_rebuilds", "inward_fraction", "frame_join_clock",
                                     "remix_ray_tracing", "remix_compile_stall", "compile_wait_stuck", "never_ray_traced",
@@ -508,6 +532,7 @@ CASES = {
     "weapon_flips_shape1": (("lights_weapon_flips",), ()),      # weapon by shape 1, 3 flips
     "weapon_flips_shape2": (("lights_weapon_flips",), ()),      # weapon by shape 2 (4d7cb45), 3 flips
     "weapon_flips_shape0": ((), ()),                            # weapon by shape 0, 3 flips: report only
+    "weapon_flips_reload_window": ((), ()),                     # 1 flip on the line whose window holds the 0 -> 2 reload
     "recreated_kept_40": (("lights_recreated",), ()),           # keep tracked 1, 40 re-creates
     "recreated_kept_1": ((), ()),                               # keep tracked 1, 1 re-create: under 2
     "recreated_untracked_150": ((), ()),                        # keep tracked 0, 150: report only
@@ -521,7 +546,10 @@ CASES = {
     "no_mod_materials": (("material_share",), ()),        # the mod's materials never drew
     "demoted_textures": (("textures_demoted",), ()),      # half the still frames shrunk textures
     "device_lost": (("clean_quit",), ()),                 # Remix's log shows VK_ERROR_DEVICE_LOST
-    "no_quit_log": ((), ("clean_quit",)),                 # no remix-dxvk.log in the spot folder
+    "no_quit_log": ((), ("clean_quit", "instanced_shared_slot_draws")),   # no remix-dxvk.log in the spot folder
+    "shared_slots_capture_on": (("instanced_shared_slot_draws",), ()),   # captureAllInstances on, 3 shared draws
+    "shared_slots_capture_off": ((), ()),                 # the same 3 shared draws with the option off: report only
+    "no_instanced_field": ((), ("instanced_shared_slot_draws",)),        # builds before cb7d3b6: NOT MEASURED fails the gate
 }
 
 
@@ -530,33 +558,44 @@ WARNS = {"low_fps": ("min_median_fps",), "near_target_fps": ("min_median_fps",),
          "near_target_89_996": ("min_median_fps",), "never_ray_traced": ("min_median_fps",),
          "never_rt_no_compiles": ("min_median_fps",),
          "high_latency": ("min_median_fps",), "fps_regression": ("min_median_fps",),
-         "dimmed_linger": ("lights_dimmed_linger",), "switchoff_lag": ("light_switchoff_lag",)}
+         "dimmed_linger": ("lights_dimmed_linger",), "switchoff_lag": ("light_switchoff_lag",),
+         "no_reference": ("frame_interval_vs_reference",), "spot_error": ("frame_interval_vs_reference",)}
 PREVIOUS = {"fps_regression", "fps_drop_9pct"}    # judged against a previous run: the healthy 100 FPS run
 NO_REFERENCE = {"no_reference"}                  # run without --reference
 
 
-def make_run(folder: str, case: str) -> str:
+def make_run(folder: str, case: str, no_remix: bool = False) -> str:
     run = os.path.join(folder, case)
     shutil.rmtree(run, ignore_errors=True)
     os.makedirs(run)
     Builder(run, "s1", case).build()
     manifest = {"spots": ["s1"], "fake": case}
-    if case == "noremix_scenedraws0":
+    if case == "noremix_scenedraws0" or no_remix:
         manifest["noRemix"] = True
     gate.save_json(os.path.join(run, "manifest.json"), manifest)
     return run
 
 
-# Free-play session logs for gate.evaluate_session: case -> checks that must FAIL (every other check must PASS).
-# 300 frames, goggles on at proxy frames 100..139, so the goggles-off is proxy frame 140 and Remix ray traces again
-# from frame 141 (one frame later, as in session 20261115-135449 at frame 41475).
+# Free-play session logs for gate.evaluate_session: case -> (checks that must FAIL, checks that must be NOT MEASURED);
+# every other check must PASS. 300 frames of 10 ms, goggles on at proxy frames 100..139, so the goggles-off is proxy
+# frame 140 and Remix ray traces again from frame 141 (one frame later, as in session 20261115-135449 at frame 41475).
+# The two never-ray-traced cases run 700 frames of 30 ms (21 s, past compile_wait_stuck_s) with 2 ms of GPU work.
+_NO_RT_NM = ("goggles_toggle_rebuilds", "goggles_dark_frame", "instanced_shared_slot_draws")
 SESSION_CASES = {
-    "session_good": (),
-    "session_scene_clear": ("goggles_toggle_rebuilds",),          # 94 static meshes built, as at 135449 frame 41476
-    "session_dark_off": ("goggles_dark_frame",),                  # first ray-traced frame at 0.2x the luma 10 later
-    "session_dropped_character": ("remix_dropped_character_frames",),  # Remix 0 characters, proxy drew them +/-3
-    "session_goggles_no_characters": (),                          # 0 characters inside goggles does not count
-    "session_device_lost": ("clean_quit",),
+    "session_good": ((), ()),
+    "session_scene_clear": (("goggles_toggle_rebuilds",), ()),         # 94 static meshes built, as at 135449 frame 41476
+    "session_dark_off": (("goggles_dark_frame",), ()),                 # first ray-traced frame at 0.2x the luma 10 later
+    "session_dropped_character": (("remix_dropped_character_frames",), ()),  # Remix 0 characters, proxy drew them +/-3
+    "session_goggles_no_characters": ((), ()),                         # 0 characters inside goggles does not count
+    "session_device_lost": (("clean_quit",), ()),
+    "session_slow_frame": (("frames_over_50ms",), ()),                 # one 64.7 ms scene frame
+    "session_slow_goggles": (("frames_over_50ms",), ()),               # 64.7 ms inside goggles counts (135449 frame 41472)
+    "session_slow_loading": ((), ()),                                  # 80 ms on a proxy loading frame (sceneDraws 0)
+    "session_not_rt": (("remix_ray_tracing",), ()),                    # 10 scene frames not ray traced (~4%)
+    "session_compile_stuck": (("compile_wait_stuck", "remix_ray_tracing"), _NO_RT_NM),  # never RT, compiles > 0
+    "session_never_rt_no_compiles": (("never_ray_traced", "remix_ray_tracing"), _NO_RT_NM),  # never RT, 0 compiles
+    "session_capture_on_shared": (("instanced_shared_slot_draws",), ()),  # 2 shared-slot draws, captureAllInstances on
+    "session_capture_off_shared": ((), ()),                            # the same draws with the option off: report only
 }
 
 
@@ -564,35 +603,75 @@ def make_session(folder: str, case: str) -> str:
     d = os.path.join(folder, case)
     shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d)
+    no_rt = case in ("session_compile_stuck", "session_never_rt_no_compiles")
     pg, tel = [], []
-    for f in range(300):
+    for f in range(700 if no_rt else 300):
         g = 1 if 100 <= f < 140 else 0
-        pg.append(f"{f},400,5,1,{g},{1 - g}")
-        rt = not 100 <= f <= 140
+        draws = 0 if (case == "session_slow_loading" and f == 220) else 400
+        pg.append(f"{f},{draws},5,1,{g},{1 - g}")
+        rt = not (no_rt or 100 <= f <= 140 or (case == "session_not_rt" and 200 <= f < 210))
         luma = 20 if (case == "session_dark_off" and f == 141) else 100
         builds = 94 if (case == "session_scene_clear" and f == 141) else (3 if f == 141 else 0)
         skinned = 0 if ((case == "session_dropped_character" and f == 220)
                         or (case == "session_goggles_no_characters" and f == 120)) else 5
+        ms = (64.7 if ((case == "session_slow_frame" and f == 220) or (case == "session_slow_goggles" and f == 120))
+              else 80.0 if (case == "session_slow_loading" and f == 220) else 30.0 if no_rt else 10.0)
         thumb = base64.b64encode(np.full(gate.THUMB_W * gate.THUMB_H, luma, np.uint8).tobytes()).decode()
         tel.append(json.dumps({"frame": f, "rayTraced": rt, "staticBlasBuilds": builds, "skinnedInstances": skinned,
-                               "instances": 500, "lumaThumb": thumb}))
+                               "instances": 500, "lumaThumb": thumb, "frameTimeMs": ms,
+                               "gpuTimeMs": 2.0 if no_rt else 8.0,
+                               "remixShaderCompiles": 5 if case == "session_compile_stuck" else 0,
+                               "instancedSharedSlotDraws": 2 if (case.startswith("session_capture") and f == 220) else 0,
+                               "instancedCapturedDraws": 4}))
     gate.save_text(os.path.join(d, "d3d9_proxy_gate.csv"), "\n".join(pg) + "\n")
     gate.save_text(os.path.join(d, "rtx_telemetry.jsonl"), "\n".join(tel) + "\n")
     lost = "[error] vkQueueSubmit: VK_ERROR_DEVICE_LOST\n" if case == "session_device_lost" else ""
-    gate.save_text(os.path.join(d, "rtx-remix_logs_remix-dxvk.log"), "[info] Remix started\n" + lost)
+    opt = "[info]   rtx.captureAllInstances = True\n" if case == "session_capture_on_shared" else ""
+    gate.save_text(os.path.join(d, "rtx-remix_logs_remix-dxvk.log"), "[info] Remix started\n" + opt + lost)
     return d
 
 
 def check_session_case(folder: str, case: str) -> tuple[bool, str]:
     result = gate.evaluate_session(make_session(folder, case))
     status = {c["check"]: c["status"] for c in result["checks"]}
-    want = {c: gate.FAIL for c in SESSION_CASES[case]}
+    fails, nms = SESSION_CASES[case]
+    want = {**{c: gate.NOT_MEASURED for c in nms}, **{c: gate.FAIL for c in fails}}
     wrong = [f"{c}: {st}, expected {want.get(c, gate.PASS)}" for c, st in status.items() if st != want.get(c, gate.PASS)]
     wrong += [f"{c}: not reported" for c in want if c not in status]
-    if (result["status"] == gate.PASS) != (not want):
+    gate_fails = bool(fails) or any(c not in gate.SOFT_NM for c in nms)
+    if (result["status"] == gate.PASS) == gate_fails:
         wrong.append(f"session status {result['status']}")
     return not wrong, "; ".join(wrong) or "as expected"
 
+
+_REAL_GLOW_BLOBS = gate.glow_blobs_stop
+
+
+def fake_glow_blobs(case: str, still: str) -> tuple[int, str]:
+    """Stand-in for glow_blobs.py (fake stills are not 320x180 pictures): the gate's handling of its exit codes and
+    output is what the fake cases test; the real verdicts are tested in test_gate.py on runs 142638 and 063147 against
+    reference 000454."""
+    orbs, puffs, lost = 0, 0, 0
+    if case == "orbs_unmatched" and still == "y0_p0":
+        orbs = 12
+    if case == "glow_puffs" and still == "y90_p0":
+        puffs = 2
+    if case == "glows_lost" and still == "y45_p0":
+        lost = 6
+    if case == "orbs_all_poses_apart":
+        return 2, "glow_blobs: NOT MEASURED, poses differ by 40 cm, yaw 4.00, pitch 0.00 deg"
+    if case == "orbs_script_error" and still == "y45_p0":
+        return 1, "SystemExit: no window y45_p0 with frames and proxy frames"
+    if case == "orbs_pose_apart_one" and still == "y135_p0":
+        return 2, "glow_blobs: NOT MEASURED, poses differ by 20 cm, yaw 4.37, pitch 0.00 deg"
+    ok = not (orbs or puffs or lost)
+    v = lambda n: "PASS" if n == 0 else "FAIL"
+    return (0 if ok else 1), "\n".join([
+        "glow_blobs: hud mask none",
+        f"glow_blobs: unmatched {orbs} of 50 blobs (fake): {v(orbs)}",
+        f"glow_blobs: puffs {puffs} (fake): {v(puffs)}",
+        f"glow_blobs: lost {lost} of 20 original glows (fake): {v(lost)}",
+        f"glow_blobs: {'PASS' if ok else 'FAIL'} (orbs unmatched {orbs}, puffs {puffs}, lost glows {lost})"])
 
 def check_case(folder: str, case: str) -> tuple[bool, dict, str]:
     """(expectation met, result, explanation). Checks the case does not name must PASS, except fps_regression, which
@@ -600,10 +679,16 @@ def check_case(folder: str, case: str) -> tuple[bool, dict, str]:
     must_fail, must_nm = CASES[case]
     must_warn = WARNS.get(case, ())
     previous = make_run(os.path.join(folder, "previous"), "good") if case in PREVIOUS else None
-    reference = None if case in NO_REFERENCE else make_run(os.path.join(folder, "reference"), "good")
-    result = gate.evaluate(make_run(folder, case), previous=previous, reference=reference)
+    reference = None if case in NO_REFERENCE else make_run(os.path.join(folder, "reference"), "good",
+                                                            no_remix=case != "orbs_remix_reference")
+    gate.glow_blobs_stop = lambda r, o, still, orig: fake_glow_blobs(case, still)
+    try:
+        result = gate.evaluate(make_run(folder, case), previous=previous, reference=reference)
+    finally:
+        gate.glow_blobs_stop = _REAL_GLOW_BLOBS
     status = {c["check"]: c["status"] for c in result["checks"]}
-    expect = {"fps_regression": gate.PASS if case in PREVIOUS else gate.WARN}
+    expect = {"fps_regression": gate.PASS if case in PREVIOUS else gate.WARN,
+              "input_latency_screen_ms": gate.NOT_MEASURED}   # always, until the screen grab works (in SOFT_NM)
     expect.update({c: gate.WARN for c in must_warn})
     expect.update({c: gate.NOT_MEASURED for c in must_nm})
     expect.update({c: gate.FAIL for c in must_fail})
