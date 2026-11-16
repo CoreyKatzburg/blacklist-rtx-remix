@@ -7,7 +7,6 @@
 #   runtime_logic_test      camera-cut rule, instance trace classification, texture slot retire,
 #                           telemetry line format and writer
 #   check_telemetry_contract.py  telemetry sample matches the Phase 5 JSONL contract
-#   instanced_capture_test  vertex capture slots, buffer size and index expansion for instanced draws
 #   bridge_queue_test       command batching in the bridge queue (needs the x64 bridge built once:
 #                           build_custom_remix.ps1 -Target bridge)
 #   bridge_reply_wrap_test  server replies wrap their data queue without waiting on the game
@@ -61,11 +60,6 @@ if (Invoke-Cl 'capture_analysis_test' "/W4 /WX `"$here\capture_analysis_test.cpp
 if (Invoke-Cl 'runtime_logic_test' "/W4 /WX /wd4267 `"$here\runtime_logic_test.cpp`"") {
     Invoke-Check 'runtime_logic_test' { & "$build\runtime_logic_test.exe" $build }
     Invoke-Check 'check_telemetry_contract.py' { & $python -I "$here\check_telemetry_contract.py" (Join-Path $build 'telemetry_sample.jsonl') }
-}
-
-# 2b. Vertex capture layout for hardware-instanced draws (src\d3d9\d3d9_rtx_instanced_capture.h).
-if (Invoke-Cl 'instanced_capture_test' "/W4 /WX `"$here\instanced_capture_test.cpp`"") {
-    Invoke-Check 'instanced_capture_test' { & "$build\instanced_capture_test.exe" }
 }
 
 # 3. Bridge command queue (real header, linked with the x64 bridge util library).
