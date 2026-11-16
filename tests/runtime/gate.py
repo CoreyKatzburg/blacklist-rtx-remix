@@ -13,8 +13,14 @@ Checks (thresholds in THRESHOLDS):
   neon_fraction            worst dump's share of clipped, strongly coloured pixels: max channel >= 1.0 and
                            (max - min) / max >= 0.5 (white highlights are allowed, neon colours are not)
   skinned_min              fewest active character meshes in any frame where proxy skinnedSceneDraws > 0
-  remix_dropped_character_frames  frames outside goggles where Remix has 0 skinned instances while proxy sent
-                           skinnedSceneDraws > 0 on that frame and 3 frames either side (must be 0)
+  remix_dropped_character_frames  frames outside goggles (proxy_gate goggles==0 on frame +/-3 and rayTraced!=false)
+                           where Remix has 0 skinned instances while proxy sent skinnedSceneDraws > 0 on +/-3 (must be 0)
+  frame_join_clock         for telemetry frames with qpcMs > 0, qpcMs must lie in (entry+presentMs of row k-1,
+                           entry+presentMs of row k] for matching proxy frame k (NOT MEASURED does not fail gate yet)
+  zero_normal_skinned_triangles   per-spot median/max of telemetry zeroNormalSkinnedTriangles (GUESS max 0)
+  zero_normal_instances           per-spot median/max of telemetry zeroNormalInstances (GUESS max 0)
+  zero_normal_static_triangles    per-spot median/max of telemetry zeroNormalStaticTriangles (GUESS max 0)
+  zero_normal_static_instances    per-spot median/max of telemetry zeroNormalStaticInstances (GUESS max 0)
   outline_overlap          Sam's near-field depth outline, the game's own depth (= Remix off) against Remix's depth
                            of the same frame, before and after the close-camera sweep: share of the game's outline
                            pixels that have a Remix outline pixel within 2 px
@@ -107,7 +113,12 @@ THRESHOLDS = {
     "lamps_without_flare_margin": 10,  # GUESS. Max jump over --reference spot max XM.
     "lights_dimmed_max_frames": 600,   # GUESS. ~10 s at 60 fps.
     "light_switchoff_max_s": 1.0,      # GUESS. Seconds from downward brightness run to stopped.
+    "zero_normal_skinned_tris_max": 0,     # GUESS until first live run with new build.
+    "zero_normal_instances_max": 0,        # GUESS until first live run with new build.
+    "zero_normal_static_tris_max": 0,      # GUESS until first live run with new build.
+    "zero_normal_static_instances_max": 0, # GUESS until first live run with new build.
     }
+SOFT_NM = frozenset({"frame_join_clock"})  # NOT MEASURED does not fail the gate for these checks yet
 TELEMETRY_FIELDS = ("frame", "frameTimeMs", "gpuTimeMs", "instances", "skinnedInstances", "staticBlasRebuilds",
                     "cameraCut", "textureMemoryMB", "vramUsedMB")
 THUMB_W, THUMB_H = 128, 72
@@ -1065,12 +1076,15 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
             for s, w in scene_pairs_list:
                 tel, pg = s["_data"]["telemetry"], s["_data"]["pgate"]
                 for tf in frames_in(w, "telemetry"):
-                    if tf in pg and len(pg[tf]) >= 3 and int(pg[tf][2]) > 0:
+                    if tf in pg and len(pg[tf]) >= 5 and int(pg[tf][2]) > 0:
                         n_char_frames += 1
                         sk_inst = int(tel[tf]["skinnedInstances"])
                         sk_vals.append(sk_inst)
-                        if sk_inst == 0 and all(
-                            f in pg and len(pg[f]) >= 3 and int(pg[f][2]) > 0 for f in range(tf - 3, tf + 4)
+                        in_goggles = (tel[tf].get("rayTraced") is False) or any(
+                            f in pg and len(pg[f]) >= 5 and int(pg[f][4]) == 1 for f in range(tf - 3, tf + 4)
+                        )
+                        if not in_goggles and sk_inst == 0 and all(
+                            f in pg and len(pg[f]) >= 5 and int(pg[f][2]) > 0 for f in range(tf - 3, tf + 4)
                         ):
                             dropped_chars += 1
             if not sk_vals:
@@ -1150,6 +1164,71 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
         worst = max((i / t if t else (1.0 if i else 0.0)) for i, t in tri)
         run.add("inward_fraction", PASS if worst < THRESHOLDS["inward_fraction"] else FAIL, round(worst, 6), "< 0.5%",
                 f"worst frame {worst:.4%} of character triangles inward", tsrc)
+
+    # frame_join_clock: qpcMs cross-check against proxy_frames.csv (entry + presentMs of k-1, k]
+    if not measured_pairs:
+        run.add("frame_join_clock", NOT_MEASURED, None, "0 frames outside proxy window",
+                "no windows of this kind were run (NOT MEASURED does not fail the gate for this check yet)",
+                "rtx_telemetry.jsonl qpcMs + d3d9_proxy_frames.csv")
+    else:
+        qpc_checked, qpc_bad, first_bad = 0, 0, None
+        for s, w in measured_pairs:
+            tel, prx = s["_data"]["telemetry"], s["_data"]["proxy"]
+            for tf in frames_in(w, "telemetry"):
+                qpc = tel.get(tf, {}).get("qpcMs")
+                if not isinstance(qpc, (int, float)) or qpc <= 0:
+                    continue
+                if tf not in prx or (tf - 1) not in prx or len(prx[tf]) < 4 or len(prx[tf - 1]) < 4:
+                    continue
+                try:
+                    lo = float(prx[tf - 1][1]) + float(prx[tf - 1][3])
+                    hi = float(prx[tf][1]) + float(prx[tf][3])
+                except ValueError:
+                    continue
+                qpc_checked += 1
+                if not (lo < float(qpc) <= hi):
+                    qpc_bad += 1
+                    if first_bad is None:
+                        first_bad = (s["name"], tf, float(qpc), lo, hi)
+        if qpc_checked == 0:
+            run.add("frame_join_clock", NOT_MEASURED, None, "0 frames outside proxy window",
+                    "qpcMs absent or 0 on every frame (old build/run); NOT MEASURED does not fail the gate for this check yet",
+                    "rtx_telemetry.jsonl qpcMs + d3d9_proxy_frames.csv")
+        else:
+            bdetail = f"{qpc_bad} of {qpc_checked} qpcMs frames outside (prev_end, cur_end]" + (
+                f" (first: {first_bad[0]} f{first_bad[1]} qpc={first_bad[2]:.3f} not in ({first_bad[3]:.3f}, {first_bad[4]:.3f}])"
+                if first_bad else ""
+            )
+            run.add("frame_join_clock", PASS if qpc_bad == 0 else FAIL, qpc_bad, "0 frames outside proxy window",
+                    bdetail, "rtx_telemetry.jsonl qpcMs + d3d9_proxy_frames.csv")
+
+    # Zero-normal counts per spot (median and max, GUESS limits until first live run)
+    for cname, field, lim_key in (
+        ("zero_normal_skinned_triangles", "zeroNormalSkinnedTriangles", "zero_normal_skinned_tris_max"),
+        ("zero_normal_instances", "zeroNormalInstances", "zero_normal_instances_max"),
+        ("zero_normal_static_triangles", "zeroNormalStaticTriangles", "zero_normal_static_tris_max"),
+        ("zero_normal_static_instances", "zeroNormalStaticInstances", "zero_normal_static_instances_max"),
+    ):
+        lim = THRESHOLDS[lim_key]
+        thresh_zn = f"<= {lim} max per spot (GUESS)"
+        if not good:
+            run.add(cname, NOT_MEASURED, None, thresh_zn, "no spot ran far enough to judge", tsrc)
+            continue
+        spot_stats, missing_zn = [], []
+        for s in good:
+            want_z, recs_z = coverage(scene_pairs(s), "telemetry", "telemetry")
+            vals_z = [int(r[field]) for r in recs_z if isinstance(r.get(field), (int, float))]
+            if want_z == 0 or len(vals_z) < want_z:
+                missing_zn.append(s["name"])
+            else:
+                spot_stats.append((s["name"], float(np.median(vals_z)), max(vals_z)))
+        if missing_zn or not spot_stats:
+            run.add(cname, NOT_MEASURED, None, thresh_zn,
+                    f"missing '{field}' in scene telemetry for: " + (", ".join(missing_zn) or "no spot"), tsrc)
+        else:
+            worst_max = max(x[2] for x in spot_stats)
+            detail_zn = "; ".join(f"{n} med {med:.1f} max {mx}" for n, med, mx in spot_stats)
+            run.add(cname, PASS if worst_max <= lim else FAIL, worst_max, thresh_zn, detail_zn, tsrc)
 
     recorder_checks(run, pick, good, tsrc)
     lightpub_checks(run, good, ref_spots)
@@ -1388,7 +1467,10 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
 
     pose_check(run, good)
     goggles_check(run, good)
-    status = PASS if run.metrics and all(x["status"] in (PASS, WARN) for x in run.metrics) else FAIL
+    status = PASS if run.metrics and all(
+        x["status"] in (PASS, WARN) or (x["status"] == NOT_MEASURED and x["check"] in SOFT_NM)
+        for x in run.metrics
+    ) else FAIL
     result = {"status": status, "run": os.path.abspath(folder), "thresholds": THRESHOLDS, "checks": run.metrics,
               "latencyContributors": latency_contributors}
     save_json(os.path.join(folder, "result.json"), result)

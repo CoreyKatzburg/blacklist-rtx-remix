@@ -68,6 +68,7 @@ class Builder:
         self.name, self.case = name, case
         self.rng = np.random.default_rng(1)
         self.tframe = self.pframe = 1000
+        self.clk, self.prev_pms = 1000.0, 0.5
         self.telemetry, self.proxy, self.pgate, self.windows = [], [], [], []
         self.yaw = self.pitch = 0.0
         self.base_cam = 40.0   # the proxy's yaw for the reference pose (any value)
@@ -75,11 +76,18 @@ class Builder:
     def frame(self, kind: str, wname: str, i: int, goggles: bool = False) -> None:
         self.tframe += 1; self.pframe += 1
         img = view(self.yaw, self.pitch, self.rng)
-        rec = {"frame": self.tframe, "frameTimeMs": 10.0, "gpuTimeMs": 8.0, "instances": 900, "skinnedInstances": 3,
+        c = self.case
+        pms = 120.0 if (c == "present_stall" and kind == "pan" and i == 30) else 0.5
+        self.clk += max(10.0, self.prev_pms + 2.0)
+        self.prev_pms = pms
+        rec = {"frame": self.tframe, "qpcMs": 0.0 if c == "no_qpc_ms" else round(self.clk - 1.0, 3),
+               "frameTimeMs": 10.0, "gpuTimeMs": 8.0, "instances": 900, "skinnedInstances": 3,
                "staticBlasRebuilds": 0, "staticBlasBuilds": 0,
                "rayTraced": not (goggles and wname.endswith("_rtoff") and i < 3),
                "cameraCut": False, "textureMemoryMB": 1800, "vramUsedMB": 6100,
-               "skinnedTriangles": 60000, "inwardSkinnedTriangles": 12, "thumbNonFinite": 0}
+               "skinnedTriangles": 60000, "inwardSkinnedTriangles": 12, "thumbNonFinite": 0,
+               "zeroNormalSkinnedTriangles": 0, "zeroNormalInstances": 0,
+               "zeroNormalStaticTriangles": 0, "zeroNormalStaticInstances": 0}
         # recorder fields (gate.recorder_checks): healthy values, with one fault per case below
         rec.update({"replacedMaterialDraws": 354, "legacyMaterialDraws": 25, "texturesDemoted": 0,
                     "skips": {"occlusionQuery": 300},
@@ -98,6 +106,11 @@ class Builder:
         if c == "loading_in_window" and loading: rec["frameTimeMs"] = 120.0
         if c in FRAME_TIMES: rec["frameTimeMs"], rec["gpuTimeMs"] = FRAME_TIMES[c]
         if c in ("no_skinned", "proxy_no_char_ok") and kind == "still" and i == 3: rec["skinnedInstances"] = 0
+        if c == "goggles_no_char_ok" and wname == "goggles1_rtoff" and i == 1: rec["skinnedInstances"] = 0
+        if c == "zero_normal_skinned_tris" and kind == "still" and i == 3: rec["zeroNormalSkinnedTriangles"] = 10
+        if c == "zero_normal_inst" and kind == "still" and i == 3: rec["zeroNormalInstances"] = 2
+        if c == "zero_normal_static_tris" and kind == "still" and i == 3: rec["zeroNormalStaticTriangles"] = 25
+        if c == "zero_normal_static_inst" and kind == "still" and i == 3: rec["zeroNormalStaticInstances"] = 3
         if c == "blas_rebuild" and kind == "pan" and i == 50: rec["staticBlasRebuilds"] = 1
         if c == "inward" and kind == "move" and i == 2: rec["inwardSkinnedTriangles"] = 900
         if c == "flash_pan" and kind == "pan" and i == 40: img = np.clip(img + 70, 0, 255)
@@ -132,22 +145,20 @@ class Builder:
         if c == "pan_short" and kind == "pan":
             cy = math.radians(self.base_cam - self.yaw * 0.5)
         if loading:
-            self.proxy.append(f"{self.pframe},1.0,1.6,0.5,29,0,")
+            self.proxy.append(f"{self.pframe},{self.clk:.3f},1.6,{pms},29,0,")
             self.pgate.append(f"{self.pframe},0,0,0,0,1")
         elif c == "missing_cam_col" and wname == "to_y45_p0" and i == 2:
-            self.proxy.append(f"{self.pframe},1.0,14.0,0.5,1500,1")  # 6 columns: no camera column -> unknown
+            self.proxy.append(f"{self.pframe},{self.clk:.3f},14.0,{pms},1500,1")  # 6 columns: no camera column -> unknown
             self.pgate.append(f"{self.pframe},1400,40,1,{1 if goggles else 0},1")
         elif c == "cut_short_cam_col" and wname == "to_y45_p0" and i == 2:
-            self.proxy.append(f"{self.pframe},1.0,14.0,0.5,1500,1,G:0:0:1.")  # cut short in camera column -> unknown
+            self.proxy.append(f"{self.pframe},{self.clk:.3f},14.0,{pms},1500,1,G:0:0:1.")  # cut short in camera column -> unknown
             self.pgate.append(f"{self.pframe},1400,40,1,{1 if goggles else 0},1")
         elif c == "short_row_in_window" and wname == "to_y45_p0" and i == 2:
-            self.proxy.append(f"{self.pframe},1.0,14.0")  # cut-short 3-col row inside scene window -> NOT MEASURED
+            self.proxy.append(f"{self.pframe},{self.clk:.3f},14.0")  # cut-short 3-col row inside scene window -> NOT MEASURED
             self.pgate.append(f"{self.pframe},1400,40,1,{1 if goggles else 0},1")
         else:
             fx, fy, fz = math.cos(cp) * math.cos(cy), math.cos(cp) * math.sin(cy), math.sin(cp)
-            pms = 120.0 if (c == "present_stall" and kind == "pan" and i == 30) else 0.5
-            clk = 1000.0 + self.pframe * 10.0
-            self.proxy.append(f"{self.pframe},{clk:.3f},14.0,{pms},1500,1,P:22:0:1.0:2.0:3.0:{fx:.5f}:{fy:.5f}:{fz:.5f}:0.0")
+            self.proxy.append(f"{self.pframe},{self.clk:.3f},14.0,{pms},1500,1,P:22:0:1.0:2.0:3.0:{fx:.5f}:{fy:.5f}:{fz:.5f}:0.0")
             handoff = 0 if (c == "raster_flash" and kind == "pan" and i == 70) else 1
             sdraws = 0 if c == "noremix_scenedraws0" else 1400
             skdraws = 0 if (c == "proxy_no_char_ok" and kind == "still" and i == 3) else 40
@@ -284,8 +295,12 @@ class Builder:
         if self.case == "cut_short_proxy":
             self.proxy.append(f"{self.pframe + 1},1.0,14.0")
         if self.case == "quit_present_stall":
-            clk = 1000.0 + (self.pframe + 1) * 10.0
-            self.proxy.append(f"{self.pframe + 1},{clk:.3f},14.0,1500.0,1500,1,P:22:0:1.0:2.0:3.0:1.0:0.0:0.0:0.0")
+            self.clk += 10.0
+            self.proxy.append(f"{self.pframe + 1},{self.clk:.3f},14.0,1500.0,1500,1,P:22:0:1.0:2.0:3.0:1.0:0.0:0.0:0.0")
+        if self.case == "clock_frame_shift":
+            self.proxy = [f"{int(ln.split(',', 1)[0]) + 1}," + ln.split(',', 1)[1] for ln in self.proxy]
+            for w in self.windows:
+                w["proxy"] = [w["proxy"][0] + 1, w["proxy"][1] + 1]
         gate.save_text(os.path.join(self.dir, "telemetry.jsonl"), "".join(json.dumps(r) + "\n" for r in self.telemetry))
         gate.save_text(os.path.join(self.dir, "proxy_frames.csv"), "\n".join(self.proxy) + "\n")
         gate.save_text(os.path.join(self.dir, "proxy_gate.csv"), "\n".join(self.pgate) + "\n")
@@ -325,6 +340,9 @@ class Builder:
 # checks that read telemetry the recorder writes per frame: NOT MEASURED whenever that telemetry is missing
 RECORDER = ("step_timing", "skip_occlusion_share", "skip_other_share", "material_share", "textures_demoted")
 
+_ZERO_NORMALS = ("zero_normal_skinned_triangles", "zero_normal_instances",
+                 "zero_normal_static_triangles", "zero_normal_static_instances")
+
 # case -> (checks that must FAIL, checks that must be NOT MEASURED); everything else must PASS.
 CASES = {
     "good": ((), ()),
@@ -333,6 +351,13 @@ CASES = {
     "neon": (("neon_fraction",), ()),
     "no_skinned": (("skinned_min", "remix_dropped_character_frames"), ()),
     "proxy_no_char_ok": ((), ()),
+    "goggles_no_char_ok": ((), ()),
+    "clock_frame_shift": (("frame_join_clock",), ()),
+    "no_qpc_ms": ((), ("frame_join_clock",)),
+    "zero_normal_skinned_tris": (("zero_normal_skinned_triangles",), ()),
+    "zero_normal_inst": (("zero_normal_instances",), ()),
+    "zero_normal_static_tris": (("zero_normal_static_triangles",), ()),
+    "zero_normal_static_inst": (("zero_normal_static_instances",), ()),
     "sam_missing": (("outline_overlap",), ()),
     "inward": (("inward_fraction",), ()),
     "raster_flash": (("raster_fallback_frames",), ()),
@@ -378,13 +403,13 @@ CASES = {
     "no_terminate": ((), ("clean_quit",)),
     "no_telemetry": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms",
                           "skinned_min", "remix_dropped_character_frames", "static_blas_rebuilds",
-                          "inward_fraction", "nonfinite_thumb_pixels",
-                          "goggles_toggle_rebuilds", "goggles_dark_frame", *RECORDER)),
+                          "inward_fraction", "nonfinite_thumb_pixels", "frame_join_clock",
+                          "goggles_toggle_rebuilds", "goggles_dark_frame", *_ZERO_NORMALS, *RECORDER)),
     # Remix writing only every 15th frame: per-frame checks can't pass; flashes fall back to the screen captures
     "sparse_telemetry": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms",
                               "skinned_min", "remix_dropped_character_frames", "static_blas_rebuilds",
                               "inward_fraction", "nonfinite_thumb_pixels",
-                              "goggles_toggle_rebuilds", "goggles_dark_frame", *RECORDER)),
+                              "goggles_toggle_rebuilds", "goggles_dark_frame", *_ZERO_NORMALS, *RECORDER)),
     "renamed_fields": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms")),
     "no_dumps": ((), ("nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness", "outline_overlap")),
     "no_proxy_gate": ((), ("raster_fallback_frames", "skinned_min", "remix_dropped_character_frames")),
@@ -392,13 +417,13 @@ CASES = {
     "half_rate_capture": ((), ("flashes",)),     # screen capture saw half the game frames of the pan
     "spot_error": (("s1: setup",), ("frames_over_50ms", "present_stalls", "min_median_fps", "latency_overhead_ms",
                                     "input_latency_ms", "skinned_min", "remix_dropped_character_frames",
-                                    "static_blas_rebuilds", "inward_fraction",
+                                    "static_blas_rebuilds", "inward_fraction", "frame_join_clock",
                                     "nonfinite_thumb_pixels", "raster_fallback_frames", "flashes", "still_flicker",
                                     "nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
                                     "outline_overlap", "pose", "goggles", "goggles_toggle_rebuilds",
                                     "goggles_dark_frame", "flare_standins_off", "flare_unplaced_balls",
                                     "flare_moving_balls", "lamps_without_flare", "lights_dimmed_linger",
-                                    "light_switchoff_lag", *RECORDER, "clean_quit")),
+                                    "light_switchoff_lag", *_ZERO_NORMALS, *RECORDER, "clean_quit")),
     "standins_ignored": (("flare_standins_off",), ()),
     "unplaced_balls": (("flare_unplaced_balls",), ()),
     "moving_balls": (("flare_moving_balls",), ()),
@@ -458,7 +483,7 @@ def check_case(folder: str, case: str) -> tuple[bool, dict, str]:
     for check in must_fail + must_nm + must_warn:
         if check not in status:
             wrong.append(f"{check}: not reported")
-    if (result["status"] == gate.PASS) != (not must_fail and not must_nm):
+    if (result["status"] == gate.PASS) != (not must_fail and not [c for c in must_nm if c not in gate.SOFT_NM]):
         wrong.append(f"overall {result['status']}")
     return not wrong, result, "; ".join(wrong) or "as expected"
 
