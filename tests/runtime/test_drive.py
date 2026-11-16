@@ -432,6 +432,22 @@ class Reference(unittest.TestCase):
             self.assertEqual(drive.wait_exit(p.pid, 10), 3)
         finally:
             p.wait()
+        # The game ignored injected Alt+F4 (20261116-080214), so a quit step can post SC_CLOSE, the message Alt+F4
+        # becomes, to the window instead of typing it. A real window must close on it.
+        with mock.patch.object(drive, "tap") as typed:
+            drive.quit_step(0, "ENTER")
+            self.assertEqual(typed.call_args.args, ("ENTER",))
+        n = subprocess.Popen(["notepad.exe"])
+        try:
+            hwnd, deadline = 0, time.monotonic() + 10
+            while not hwnd and time.monotonic() < deadline:
+                time.sleep(0.2)
+                hwnd = drive.game_window(n.pid)
+            with mock.patch.object(drive, "tap", side_effect=AssertionError("typed instead of posted")):
+                drive.quit_step(hwnd, "SC_CLOSE")
+            self.assertEqual(drive.wait_exit(n.pid, 10), 0)
+        finally:
+            n.kill(); n.wait()
 
     def test_screen_probe_tells_a_lost_game_picture_from_a_dead_display(self):
         # Nov 16: the black no-Remix runs could be the display (off after 30 min idle) or the game picture lost after
@@ -567,6 +583,36 @@ class Reference(unittest.TestCase):
         self.assertNotIn("short", got)
         got = run(["lightpub: settings reloaded (scale 1, stand-in skip unplaced 1, skip moving 0)\n", "lightpub: stray c\n"])
         self.assertIn("1 of 2", got["short"])
+
+    def test_ini_key_lands_in_its_section_not_after_a_comment_naming_it(self):
+        # Live failure in 20261116-080214 con_bright_hall_samgear: the staged ini's comment "; [Lights] with ..."
+        # was taken for the header, so StandInSkipSamGear went into [Proxy] and the proxy kept its default 0.
+        import configparser, os, tempfile
+        staged = ("[Proxy]\r\nEnableDebuggingTelemetry=1\r\n; Lights: defaults to 1. To bring them back, add\r\n"
+                  "; [Lights] with StandInSkipUnplaced=0.\r\n")
+
+        def read(text):   # sections as GetPrivateProfileInt sees them
+            p = configparser.ConfigParser(comment_prefixes=(";",), strict=False, interpolation=None)
+            p.optionxform = str
+            p.read_string(text)
+            return {s: dict(p[s]) for s in p.sections()}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ini = os.path.join(tmp, "d3d9_proxy.ini")
+            with open(ini, "w", encoding="latin-1", newline="") as f:
+                f.write(staged)
+            for value in ("0", "1"):
+                drive.set_ini(ini, "Lights", "StandInSkipSamGear", value)
+            drive.set_ini(ini, "Proxy", "GateDump", "a")
+            drive.set_ini(ini, "Lights", "StandInSkipMoving", "1")
+            drive.set_ini(ini, "Proxy", "EnableDebuggingTelemetry", "0")
+            with open(ini, encoding="latin-1", newline="") as f:
+                text = f.read()
+        got = read(text)
+        self.assertEqual(got["Lights"], {"StandInSkipSamGear": "1", "StandInSkipMoving": "1"})
+        self.assertEqual(got["Proxy"], {"EnableDebuggingTelemetry": "0", "GateDump": "a"})
+        self.assertIn("; [Lights] with StandInSkipUnplaced=0.\r\n", text)
+        self.assertNotIn("\n", text.replace("\r\n", ""))   # CRLF kept everywhere
 
     def test_rt_off_picture_needs_ten_frames_not_ray_traced(self):
         import json, os, tempfile, types

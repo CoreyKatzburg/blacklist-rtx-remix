@@ -103,13 +103,18 @@ def set_ini(path: str, section: str, key: str, value: str) -> None:
     with open(path, encoding="latin-1", newline="") as f:
         text = f.read()
     line = f"{key} = {value}" if section == "RemixConfig" else f"{key}={value}"
-    pattern = re.compile(r"(?m)^" + re.escape(key) + r"[ \t]*=[^\r\n]*")   # keeps the file's CRLF line ends
-    if pattern.search(text):
-        text = pattern.sub(line, text, count=1)
-    elif f"[{section}]" in text:
-        text = text.replace(f"[{section}]", f"[{section}]\r\n{line}", 1)
-    else:
+    # Only a real header line opens the section: a comment such as "; [Lights] with ..." does not, and the key is
+    # looked up inside its own section only (the proxy reads it there, not from whatever section holds it first).
+    header = re.compile(r"(?m)^[ \t]*\[" + re.escape(section) + r"\][ \t]*(?=\r?$)").search(text)
+    if not header:
         text += f"\r\n[{section}]\r\n{line}\r\n"
+    else:
+        nxt = re.compile(r"(?m)^[ \t]*\[").search(text, header.end())
+        end = nxt.start() if nxt else len(text)
+        body = text[header.end():end]
+        pattern = re.compile(r"(?m)^" + re.escape(key) + r"[ \t]*=[^\r\n]*")   # keeps the file's CRLF line ends
+        body = pattern.sub(line, body, count=1) if pattern.search(body) else f"\r\n{line}" + body
+        text = text[:header.end()] + body + text[end:]
     write_ini(path, text)
 
 
@@ -212,6 +217,20 @@ def tap(key: str) -> None:
             i = _INPUT(type=1, u=_INPUT_UNION(ki=_KEYBDINPUT(0, SCAN[k], 0x8 | up | (1 if k in EXTENDED else 0), 0, None)))
             user32.SendInput(1, ctypes.byref(i), ctypes.sizeof(_INPUT))
             time.sleep(0.12)
+
+
+# Window messages a quit step can post instead of a key (Nov 16: the game ignored injected Alt+F4). SC_CLOSE is what
+# Windows turns Alt+F4 into for a window that lets it through; WM_CLOSE is the step after that.
+CLOSE_MESSAGES = {"SC_CLOSE": (0x0112, 0xF060), "WM_CLOSE": (0x0010, 0)}
+
+
+def quit_step(hwnd: int, key: str) -> None:
+    if key in CLOSE_MESSAGES:
+        msg, wparam = CLOSE_MESSAGES[key]
+        if not user32.PostMessageW(ctypes.c_void_p(hwnd), msg, ctypes.c_size_t(wparam), ctypes.c_ssize_t(0)):
+            raise RuntimeError(f"PostMessage {key} failed (error {ctypes.get_last_error()})")
+    else:
+        tap(key)
 
 
 def wait_exit(pid: int, seconds: float) -> int | None:
@@ -1245,7 +1264,8 @@ class Spot:
 
     def quit_test(self, cfg: dict) -> dict:
         """Worker C's quit test (Nov 16): does the game's own quit, or Alt+F4, end in VK_ERROR_DEVICE_LOST?
-        cfg: {"goggles": bool, "keys": [[key or chord, seconds after], ...], "holdSeconds": s, "exitSeconds": s}.
+        cfg: {"goggles": bool, "keys": [[step, seconds after], ...], "holdSeconds": s, "exitSeconds": s}, where a step
+        is a key, a chord such as ALT+F4, or SC_CLOSE / WM_CLOSE posted to the game window.
         Holds the level with ray tracing on (and the goggles on when asked), then sends the keys one by one, each
         followed by a full-screen picture frames/quit_step<i>.png, and waits for the game to exit. Records wall-clock
         times; the logs are read afterwards (tests\\analysis\\quit_crash.py)."""
@@ -1267,7 +1287,7 @@ class Spot:
         code = None
         for i, (key, after) in enumerate(cfg["keys"]):
             front(hwnd)
-            tap(key)
+            quit_step(hwnd, key)
             step = {"key": key, "at": time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"}
             code = wait_exit(self.a.pid, float(after))
             if code is None:
