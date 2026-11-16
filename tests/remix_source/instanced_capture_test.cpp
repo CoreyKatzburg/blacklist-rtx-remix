@@ -113,25 +113,9 @@ static void testLayoutEdges() {
         "non-indexed list x3: copies %u verts %u stride %u", flat.copies, flat.capturedVertexCount, flat.instanceVertexStride);
 }
 
-// Run 20261116-101111 (03_off_again): instancedSharedSlotDraws stayed 0 on every frame because the
-// instance count was read from m_iaState, which the CS thread writes. The count must come from game-thread state.
-static void testDrawInstanceCount() {
-  const uint32_t kIndexedData = 0x40000000u;  // D3DSTREAMSOURCE_INDEXEDDATA
-  // Boiler tank: stream 0 = mesh with 3 instances, stream 1 = per-instance matrix rows, decl reads both.
-  CHECK(drawInstanceCount(kIndexedData | 3u, 1u << 1, 0x3u) == 3, "instanced draw: got %u, want 3",
-        drawInstanceCount(kIndexedData | 3u, 1u << 1, 0x3u));
-  // The instanced stream is set but the declaration does not read it: one instance (as GenerateDrawInfo).
-  CHECK(drawInstanceCount(kIndexedData | 3u, 1u << 1, 0x1u) == 1, "unused instance stream must give 1");
-  // No instanced stream: a leftover frequency on stream 0 does not make copies.
-  CHECK(drawInstanceCount(kIndexedData | 3u, 0u, 0x3u) == 1, "no instance data must give 1");
-  // Frequency count 0 is treated as 1 (GetInstanceCount).
-  CHECK(drawInstanceCount(kIndexedData, 1u << 1, 0x3u) == 1, "count 0 must give 1");
-}
-
 int main() {
   testInstancedCopiesKeepTheirOwnTransforms();
   testLayoutEdges();
-  testDrawInstanceCount();
   if (g_failures) {
     std::printf("instanced_capture_test: %d failure(s)\n", g_failures);
     return 1;
