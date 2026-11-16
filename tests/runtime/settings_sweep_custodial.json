@@ -1,0 +1,19 @@
+{
+ "about": "Worker C's settings sweep (Nov 16): one clean launch per variant at con_custodial y0_p0, one setting changed against the play-setup baseline. verify_runtime.ps1 -Variants <this file>. rtx: rtx.conf lines (replaced, or appended when absent); proxy: [Proxy] keys in this launch's d3d9_proxy.ini. Each launch checks remix-dxvk.log lists every rtx key with the new value.",
+ "spot": "con_custodial",
+ "bench": {"settle": 5, "frames": 150},
+ "variants": [
+  {"name": "01_base"},
+  {"name": "02_vram_low_mem_gpu", "rtx": {"rtx.lowMemoryGpu": "True"}},
+  {"name": "03_vram_tex_budget_25pct", "rtx": {"rtx.texturemanager.budgetPercentageOfAvailableVram": "25"}},
+  {"name": "04_vram_tex_fixed_768mb", "rtx": {"rtx.texturemanager.fixedBudgetEnable": "True", "rtx.texturemanager.fixedBudgetMiB": "768"}},
+  {"name": "05_dlss_balanced_2", "rtx": {"rtx.qualityDLSS": "2"}},
+  {"name": "06_dlss_perf_1", "rtx": {"rtx.qualityDLSS": "1"}},
+  {"name": "07_dlss_ultraperf_0", "rtx": {"rtx.qualityDLSS": "0"}},
+  {"name": "08_rr_cnn_0", "rtx": {"rtx.rayreconstruction.model": "0"}},
+  {"name": "09_rr_off", "rtx": {"rtx.enableRayReconstruction": "False"}},
+  {"name": "10_bounces_1", "rtx": {"rtx.pathMaxBounces": "1"}},
+  {"name": "11_froxel_scale_16", "rtx": {"rtx.volumetrics.froxelGridResolutionScale": "16"}},
+  {"name": "12_telemetry_off", "proxy": {"EnableDebuggingTelemetry": "0", "FrameTrace": "1", "CallTiming": "0", "HitchSampler": "0"}}
+ ]
+}

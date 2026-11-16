@@ -426,6 +426,13 @@ class Spot:
             return True
         if self._sent and self._sent[0] == cur and time.monotonic() - self._sent[1] < 0.25:
             return False   # the last correction is not applied yet
+        # Without Remix (~178 FPS) the game eases each input over several frames, so the first changed frame is not
+        # the end of it: stacked corrections swung the camera +-5 degrees and stops landed 4 to 7 degrees off
+        # (Custodial reference, Nov 16). There, wait until the camera has stayed still for 50 ms.
+        if cur != getattr(self, "_seen", None):
+            self._seen, self._seen_at = cur, time.monotonic()
+        if getattr(self, "no_remix", False) and self._sent and time.monotonic() - self._seen_at < 0.05:
+            return False
         dx = int(round(max(-900.0, min(900.0, err_yaw * self.counts_per_deg_x * gain))))
         dy = int(round(max(-600.0, min(600.0, err_pitch * self.counts_per_deg_y * gain))))
         if dx == 0 and abs(err_yaw) >= 0.15:
@@ -456,9 +463,13 @@ class Spot:
         self.calibration = {"samplesX": [round(v, 3) for v in samples["x"]],
                             "samplesY": [round(v, 3) for v in samples["y"]],
                             "warmupX": warmup["x"], "warmupY": warmup["y"]}
+        # Without Remix the game runs at ~178 FPS and the turn per count varied 45 to 69 between moves (Paladin,
+        # Nov 16); steering and the pan correct from game memory, so only the rough rate is needed there.
+        spread = 2.0 if getattr(self, "no_remix", False) else 1.25
+        self.calibration["spreadLimit"] = spread
         for axis in ("x", "y"):
             vals = samples[axis]
-            if len(vals) < 3 or min(vals) * max(vals) <= 0 or max(map(abs, vals)) / min(map(abs, vals)) > 1.25:
+            if len(vals) < 3 or min(vals) * max(vals) <= 0 or max(map(abs, vals)) / min(map(abs, vals)) > spread:
                 raise RuntimeError(f"mouse calibration on {axis} is inconsistent: counts per degree {vals}")
             setattr(self, f"counts_per_deg_{axis}", float(np.median(vals)))
         self.calibration.update(countsPerDegX=round(self.counts_per_deg_x, 3), countsPerDegY=round(self.counts_per_deg_y, 3))
@@ -666,6 +677,35 @@ class Spot:
         self.stop("y0_p0_after", outline="after")
         if self.spot.get("gunfire", False):
             self.window("gunfire", "combat", lambda: (mouse_fire_burst(6, 0.12), self.hold(0.5)))
+    def bench(self, cfg: dict) -> None:
+        """Settings sweep (verify_runtime.ps1 -Variants): one launch per setting, so this only has to measure the
+        reference pose. Face y0_p0, let textures and the radiance cache settle, then one "still" window of at least
+        cfg["frames"] game frames (proxy frame log, which stays on when Remix telemetry is off) while nvidia-smi
+        samples video memory every 200 ms into gpu_mem.csv, then one GateDump of the same pose."""
+        self.move("to_bench", 0.0, 0.0, 1.0)
+        self.hold(float(cfg.get("settle", 5.0)))
+        want, rel = int(cfg.get("frames", 150)), "frames/bench.gray"
+        smi = subprocess.Popen(["nvidia-smi", "--query-gpu=timestamp,memory.total,memory.used,memory.free,clocks.gr,"
+                                "clocks.mem,pstate,utilization.gpu", "--format=csv", "-lms", "200",
+                                "-f", os.path.join(self.out, "gpu_mem.csv")],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cap = start_capture(os.path.join(self.out, rel), fps=30, seconds=60.0)
+        start = self.proxy.last_frame()
+        try:
+            w = self.window("bench_y0_p0", "still", lambda: self.hold(60.0, until=lambda: self.proxy.last_frame() - start >= want),
+                            frames=rel, frameSize=[CAP_W, CAP_H], benchFrames=want)
+        finally:
+            for p in (cap, smi):
+                p.terminate()
+                try:
+                    p.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    p.kill(); p.wait()
+        w["gameFrames"] = self.proxy.last_frame() - start
+        w["gamePose"] = [self.rel_pose()]
+        w["samMoved"] = self.sam_moved("bench")
+        self.window("y0_p0", "dump", lambda: self.dump("y0_p0"), dump="y0_p0")
+
     def light_dump(self, dest: str) -> str | None:
         """One frame of the proxy's light and flare dump (framedump\\f<frame>_lights.tsv, written when
         [Proxy] CaptureDraws goes from 0 to 1), copied to `dest`."""
@@ -899,24 +939,31 @@ def main() -> int:
         if "teleport" in spot:
             result["teleport"] = s.teleport(spot["teleport"])
         hwnd = game_window(a.pid)
-        if hwnd:
+        if spot.get("bench"):
+            if not hwnd:
+                raise RuntimeError("no game window to bring to the front for the benchmark")
             front(hwnd)
             s._calibrate_mouse()
-            if int(spot.get("mouseLag", 1)):
-                lag: dict = {}
-                s.window("mouse_lag", "lag", lambda: lag.update(s.mouse_lag()))
-                result["mouse_lag"] = lag   # top-level key worker A's gate.py reads
-                back = time.monotonic() + 3.0   # the trials alternate direction; put the camera back on the stop exactly
-                while not s.pose(s.yaw, s.pitch) and time.monotonic() < back:
-                    time.sleep(0.008)
-        if spot.get("switchTest") and not a.no_remix:   # the switches are Remix settings
-            s.switch_test()
-        if not spot.get("switchOnly"):
-            s.sweep_and_pan()
-            if int(spot.get("goggleModes", 3)) and not a.no_remix:   # the goggle check compares ray tracing on/off
-                s.goggles()
-        if spot.get("lightSwitch"):
-            s.light_switch(spot["lightSwitch"])
+            s.bench(spot["bench"])   # one pose per launch: nothing else
+        else:
+            if hwnd:
+                front(hwnd)
+                s._calibrate_mouse()
+                if int(spot.get("mouseLag", 1)):
+                    lag: dict = {}
+                    s.window("mouse_lag", "lag", lambda: lag.update(s.mouse_lag()))
+                    result["mouse_lag"] = lag   # top-level key worker A's gate.py reads
+                    back = time.monotonic() + 3.0   # the trials alternate direction; put the camera back on the stop
+                    while not s.pose(s.yaw, s.pitch) and time.monotonic() < back:
+                        time.sleep(0.008)
+            if spot.get("switchTest") and not a.no_remix:   # the switches are Remix settings
+                s.switch_test()
+            if not spot.get("switchOnly"):
+                s.sweep_and_pan()
+                if int(spot.get("goggleModes", 3)) and not a.no_remix:   # the goggle check compares ray tracing on/off
+                    s.goggles()
+            if spot.get("lightSwitch"):
+                s.light_switch(spot["lightSwitch"])
     except Exception as e:   # recorded in spot.json; gate.py fails the spot
         result["error"] = f"{type(e).__name__}: {e}"
         print("SPOT ERROR", result["error"])

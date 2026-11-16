@@ -19,13 +19,23 @@ class FakeGame:
         self.thread = threading.Thread(target=self._frames, args=(1.0 / fps,), daemon=True)
         self.thread.start()
 
+    ease_frames = 1   # frames the game spreads each mouse input over (time-based easing, so many frames at high FPS)
+
     def _frames(self, dt: float) -> None:
+        easing: list[list[float]] = []   # [counts x left, counts y left, frames left]
         while self.running:
             time.sleep(dt)
             with self.lock:
-                dyaw = self.queued[0] / self.cx
+                if any(self.queued):
+                    easing.append([float(self.queued[0]), float(self.queued[1]), float(self.ease_frames)])
+                mx = my = 0.0
+                for e in easing:
+                    mx, my = mx + e[0] / e[2], my + e[1] / e[2]
+                    e[0], e[1], e[2] = e[0] - e[0] / e[2], e[1] - e[1] / e[2], e[2] - 1
+                easing = [e for e in easing if e[2] > 0]
+                dyaw = mx / self.cx
                 self.yaw, self.turned = self.yaw + dyaw, self.turned + dyaw
-                self.pitch = max(-89.0, min(89.0, self.pitch + self.queued[1] / self.cy))
+                self.pitch = max(-89.0, min(89.0, self.pitch + my / self.cy))
                 self.queued, self.pending = self.pending, [0, 0]
                 self.history.append((self.turned, self.pitch))
 
@@ -117,6 +127,19 @@ class Steering(unittest.TestCase):
         self.assertLess(max(t for t, _ in path), 45.0 + 3.0, "yaw swung past the stop")
         self.assertGreater(min(p for _, p in path), -30.0 - 3.0, "pitch swung past the stop")
 
+    def test_move_lands_on_the_stop_when_the_game_eases_input_over_many_fast_frames(self):
+        # No-Remix reference, Custodial, Nov 16: ~178 FPS and the game eases each input over several frames; a
+        # correction went out as soon as the first frame of the last one showed, they stacked, the camera swung
+        # +-5 degrees and stops were recorded 4 to 7 degrees off (y0_p0 at pitch 4.6, y180_p0 at yaw -174).
+        s = self.run_with(178, 45.0, -26.0, 45.0, -26.0)
+        s.no_remix = True
+        self.game.ease_frames = 8
+        s.move("to_y135_p0", 135.0, -20.0, 1.0)
+        time.sleep(0.15)   # input still in flight lands
+        yaw, pitch = self.game.history[-1]
+        self.assertLess(abs(yaw - 135.0), 0.5)
+        self.assertLess(abs(pitch + 20.0), 0.5)
+
     def test_pan_turns_a_full_circle_when_the_calibration_is_half_the_true_rate(self):
         s = self.run_with(22, 7.0, -9.0, 3.5, -9.0)   # open loop this would turn 180 degrees
         before = self.game.turned
@@ -183,6 +206,29 @@ class Reference(unittest.TestCase):
             drive.check_renderer(drive.chained_dll(log, 999), no_remix=False)
         with self.assertRaisesRegex(RuntimeError, "no 'chained"):          # another process's line does not count
             drive.check_renderer(drive.chained_dll(log, 1234), no_remix=True)
+
+    def test_calibration_spread_is_looser_only_without_remix(self):
+        # Paladin, Nov 16, no Remix (~178 FPS): counts per degree 45 to 69 between moves. 1.6x must pass a reference
+        # run and still fail a Remix run; 2.5x fails both.
+        def calibrate(rates, no_remix):
+            pos = [0.0, 0.0]
+            seq = iter(rates * 4)
+            def move(dx, dy):
+                r = next(seq)
+                pos[0] += dx / r
+                pos[1] += dy / r
+            s = drive.Spot.__new__(drive.Spot)
+            s.no_remix = no_remix
+            s._settled = lambda: (pos[0], pos[1], 0)
+            with mock.patch.object(drive, "mouse_move_rel", move):
+                s._calibrate_mouse()
+            return s
+        loose = [50.0, 80.0, 50.0, 80.0, 50.0, 80.0]
+        self.assertEqual(calibrate(loose, True).calibration["spreadLimit"], 2.0)
+        with self.assertRaisesRegex(RuntimeError, "inconsistent"):
+            calibrate(loose, False)
+        with self.assertRaisesRegex(RuntimeError, "inconsistent"):
+            calibrate([40.0, 100.0, 40.0, 100.0, 40.0, 100.0], True)
 
     def test_rt_off_picture_needs_ten_frames_not_ray_traced(self):
         import json, os, tempfile, types

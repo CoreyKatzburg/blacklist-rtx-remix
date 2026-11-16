@@ -27,6 +27,13 @@
 #                                          spots, stops, mouse lag and cutscene recording; each still stop saves
 #                                          gate\<tag>_raster.pfm (the screen, display-encoded 0..1) for worker F2's
 #                                          brightness limits. How Remix was turned off is in reference.json.
+#   verify_runtime.ps1 -Variants runtime\settings_sweep_custodial.json
+#                                          settings sweep, in experiments\remix-gate\<stamp>-settings\<variant>\: one
+#                                          clean launch per variant at the file's spot, each with one rtx.conf or proxy
+#                                          ini change; drive.py only holds y0_p0 (frame times, nvidia-smi video memory
+#                                          in gpu_mem.csv, one GateDump). Every config is put back after each launch.
+#                                          variant.json says whether remix-dxvk.log lists each changed rtx key with
+#                                          its new value; settings_report.py compares the variants. No gate verdict.
 # In Remix runs drive.py also saves <tag>_raster.pfm with ray tracing switched off for the stops in "rasterStops"
 # (default y0_p0), which gate.py compares with Remix's picture.
 # A spot in spots.json may name another spot's saves with "checkpoint" and move Sam elsewhere with "teleport"
@@ -35,7 +42,7 @@
 # off (screen frames come from gdigrab; the camera is set in memory). Only the goggle keys and the title-screen
 # keys need the game window in front, which this script does itself.
 param([string[]]$Spots = @(), [switch]$DryRun, [string]$CaptureCheckpoint = '', [switch]$Launch, [string]$Evaluate = '', [switch]$SkipInstall, [string]$SaveFrom = '',
-      [string]$Previous = '', [string]$Reference = '', [switch]$NoRemix)
+      [string]$Previous = '', [string]$Reference = '', [switch]$NoRemix, [string]$Variants = '')
 $ErrorActionPreference = 'Stop'
 $Tests = $PSScriptRoot
 $Runtime = Join-Path $Tests 'runtime'
@@ -208,8 +215,33 @@ function Set-GoggleBindings($path, $keys) {
     [IO.File]::WriteAllText($path, $text)
 }
 
-$runDir = Join-Path $ResultsRoot $(if ($NoRemix) { "reference-$Stamp" } else { $Stamp })
+$sweep = $null
+if ($Variants) {
+    if ($NoRemix -or $CaptureCheckpoint) { throw '-Variants measures Remix settings at an existing spot.' }
+    $sweep = Get-Content $Variants -Raw | ConvertFrom-Json
+    $Spots = @($sweep.spot)
+}
+$runDir = Join-Path $ResultsRoot $(if ($NoRemix) { "reference-$Stamp" } elseif ($sweep) { "$Stamp-settings" } else { $Stamp })
 if ($NoRemix -and $CaptureCheckpoint) { throw '-NoRemix records the reference at existing spots; capture checkpoints with Remix.' }
+# rtx.conf for one sweep variant: each key's line replaced, or appended when the baseline does not set it.
+function Set-RtxKeys($text, $keys) {
+    foreach ($p in @(if ($keys) { $keys.PSObject.Properties })) {
+        $line = "$($p.Name) = $($p.Value)"
+        $pat = "(?m)^[ \t]*$([Regex]::Escape($p.Name))[ \t]*=[^\r\n]*"
+        $text = if ($text -match $pat) { [Regex]::Replace($text, $pat, $line.Replace('$', '$$')) } else { $text.TrimEnd() + "`r`n$line`r`n" }
+    }
+    $text
+}
+# [Proxy] keys for one sweep variant, set after the gate's EnableDebuggingTelemetry=1.
+function Set-ProxyKeys($text, $keys) {
+    foreach ($p in @(if ($keys) { $keys.PSObject.Properties })) {
+        $pat = "(?m)^$([Regex]::Escape($p.Name))[ \t]*=[^\r\n]*"
+        $text = if ($text -match $pat) { [Regex]::Replace($text, $pat, "$($p.Name)=$($p.Value)") }
+                else { [Regex]::Replace($text, '(?m)^\[Proxy\][ \t]*\r?\n', "`$0$($p.Name)=$($p.Value)`r`n", 1) }
+        if ($text -notmatch "(?m)^$([Regex]::Escape($p.Name))=$([Regex]::Escape([string]$p.Value))") { throw "Could not set [Proxy] $($p.Name)" }
+    }
+    $text
+}
 # -NoRemix: how Remix is turned off. Only this run's copy of the proxy ini changes (put back afterwards like every
 # run's ini); the installed files stay as they are. ChainDll makes the proxy hand every call to Windows' 32-bit d3d9,
 # so d3d9_remix.dll and the bridge never load; the rest switches off everything the proxy changes in the game's
@@ -232,6 +264,14 @@ function Get-NoRemixIni($text) {
 }
 $selected = @(if (-not $CaptureCheckpoint) { $config.spots | Where-Object { -not $Spots.Count -or $Spots -contains $_.name } })
 if (-not $selected.Count -and -not $CaptureCheckpoint) { throw "No spots selected (known: $(($config.spots | ForEach-Object name) -join ', '))." }
+# One launch each: a spot, or for -Variants the same spot once per variant (drive.py runs only its "bench").
+$runs = @(if ($sweep) {
+    foreach ($v in $sweep.variants) {
+        $copy = $selected[0] | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+        $copy | Add-Member bench $sweep.bench -Force
+        [pscustomobject]@{ dir = $v.name; spot = $copy; variant = $v }
+    }
+} else { foreach ($one in $selected) { [pscustomobject]@{ dir = $one.name; spot = $one; variant = $null } } })
 # This run closes the game between spots. It must never close a game it did not start (Corey's own session).
 $running = Get-Process Blacklist_game, Blacklist_DX11_game, Blacklist_Launcher, NvRemixBridge -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($running) { throw "$($running.Name) is already running (pid $($running.Id), started $($running.StartTime.ToString('HH:mm:ss'))). Close it yourself or wait: this script does not close a game it did not start." }
@@ -243,18 +283,22 @@ $evidence = 'D:\BlacklistOverhaul\experiments\playtest-evidence\play-setup-logs'
 Get-ChildItem (Join-Path $Setup 'logs') -Directory -Filter 'before-*' -ErrorAction SilentlyContinue |
     Where-Object { -not (Test-Path (Join-Path $evidence $_.Name)) } |
     ForEach-Object { Copy-Item $_.FullName (Join-Path $evidence $_.Name) -Recurse; Write-Step "Kept session logs $($_.Name) in $evidence" }
-@{ spots = @($selected | ForEach-Object name); started = $Stamp; noRemix = [bool]$NoRemix } | ConvertTo-Json | Set-Content (Join-Path $runDir 'manifest.json')
+@{ spots = @($selected | ForEach-Object name); started = $Stamp; noRemix = [bool]$NoRemix
+   variants = @(if ($sweep) { $runs | ForEach-Object dir }) } | ConvertTo-Json | Set-Content (Join-Path $runDir 'manifest.json')
 
 try { New-Item -ItemType File -Path $GameLock -Value "verify_runtime.ps1 runtime gate $([DateTime]::UtcNow.ToString('u'))" | Out-Null }
 catch { throw "Someone else has the game: $(Get-Content $GameLock -Raw)" }
 $saveBackup = Join-Path $runDir 'save-backup'
 $iniBackup = $null; $inputBackup = $null; $setupIniBackup = $null; $setupIniPath = Join-Path $Setup 'd3d9_proxy.ini'
+# -Variants changes rtx.conf: the setup copy and both game copies get each variant, and the setup text back after it.
+$rtxPaths = @((Join-Path $Setup 'rtx.conf')) + @($Configs.Keys | Where-Object { $Configs[$_] -eq 'rtx.conf' }); $rtxBackup = $null
 try {
     Stop-Game
     New-Item -ItemType Directory -Force $saveBackup | Out-Null
     Copy-Item (Join-Path $SaveDir '*') $saveBackup
     $inputBackup = [IO.File]::ReadAllText($InputIni)
     $setupIniBackup = [IO.File]::ReadAllText($setupIniPath)
+    if ($sweep) { $rtxBackup = [IO.File]::ReadAllText($rtxPaths[0]) }
     $iniBackup = if (Test-Path -LiteralPath "$S\d3d9_proxy.ini") { [IO.File]::ReadAllText("$S\d3d9_proxy.ini") } else { $setupIniBackup }
     $gateIni = [Regex]::Replace($setupIniBackup, '(?m)^EnableDebuggingTelemetry[ \t]*=[ \t]*0', 'EnableDebuggingTelemetry=1')
     if ($NoRemix) {
@@ -291,8 +335,9 @@ try {
         Copy-Item (Join-Path $from '*.save') $dest
         Write-Step "Checkpoint recorded in $dest (not in the library)"
     }
-    foreach ($spot in $selected) {
-        $spotDir = Join-Path $runDir $spot.name
+    foreach ($run in $runs) {
+        $spot = $run.spot
+        $spotDir = Join-Path $runDir $run.dir
         $cp = Join-Path $Library $(if ($spot.checkpoint) { $spot.checkpoint } else { $spot.name })
         New-Item -ItemType Directory -Force $spotDir | Out-Null
         if (-not (Test-Path (Join-Path $cp 'checkpoint.json')) -or -not (Get-ChildItem $cp -Filter '*.save' -ErrorAction SilentlyContinue)) {
@@ -307,7 +352,15 @@ try {
             Get-ChildItem $SaveDir -Filter '*.save' | Remove-Item
             Copy-Item (Join-Path $cp '*.save') $SaveDir
             Set-GoggleBindings $InputIni $spot.goggleKeys
-            [IO.File]::WriteAllText("$S\d3d9_proxy.ini", $gateIni)
+            $spotIni = $gateIni
+            if ($run.variant) {   # the Play script copies setup files over game files that differ, so change both
+                $rtxText = Set-RtxKeys $rtxBackup $run.variant.rtx
+                foreach ($p in $rtxPaths) { [IO.File]::WriteAllText($p, $rtxText) }
+                $spotIni = Set-ProxyKeys $gateIni $run.variant.proxy
+                [IO.File]::WriteAllText($setupIniPath, $spotIni)
+                Write-Step "$($run.dir): $(@(@($run.variant.rtx, $run.variant.proxy) | Where-Object { $_ } | ForEach-Object { $_.PSObject.Properties } | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', ')"
+            }
+            [IO.File]::WriteAllText("$S\d3d9_proxy.ini", $spotIni)
             # "cinematic": the level opens with a cutscene; cinematic.py records it as numbers before drive.py moves Sam.
             $cine = if ($spot.cinematic) {
                 Start-Process $Py -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $spotDir 'cinematic.log') `
@@ -330,7 +383,19 @@ try {
             Write-Step "$($spot.name): $((Get-Content (Join-Path $spotDir 'drive.log') -Tail 1))"
             Stop-Game   # the next launch starts remix-dxvk.log over; gate.py's clean_quit reads this spot's copy
             Copy-Item -LiteralPath "$S\rtx-remix\logs\remix-dxvk.log" $spotDir -ErrorAction SilentlyContinue
-            if ($spot.switchTest -or $spot.lightSwitch) {
+            if ($run.variant) {
+                # Proof the change loaded: Remix lists every option it read ("info:    rtx.qualityDLSS = 2").
+                $remixLog = Join-Path $spotDir 'remix-dxvk.log'
+                $loaded = [ordered]@{}
+                foreach ($p in @(if ($run.variant.rtx) { $run.variant.rtx.PSObject.Properties })) {
+                    $loaded[$p.Name] = @(if (Test-Path $remixLog) { Select-String -LiteralPath $remixLog -Pattern "info:\s+$([Regex]::Escape($p.Name)) = (.*?)\s*$" |
+                        ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -Unique })
+                }
+                $ok = -not @($loaded.Keys | Where-Object { $loaded[$_].Count -ne 1 -or $loaded[$_][0] -ne [string]$run.variant.rtx.$_ }).Count
+                [ordered]@{ name = $run.dir; rtx = $run.variant.rtx; proxy = $run.variant.proxy; remixLogValues = $loaded; rtxLoaded = $ok
+                            proxyIni = $spotIni } | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $spotDir 'variant.json')
+                Write-Step "$($run.dir): $(if ($ok) { 'remix-dxvk.log lists the new values' } else { "NOT LOADED as asked: $($loaded | ConvertTo-Json -Compress)" })"
+            } elseif ($spot.switchTest -or $spot.lightSwitch) {
                 & $Py (Join-Path $Runtime 'switch_report.py') $spotDir | Out-Null
                 Write-Step "$($spot.name): switch test numbers in $(Join-Path $spotDir 'switch.md')"
             }
@@ -340,10 +405,17 @@ try {
             if (-not (Test-Path (Join-Path $spotDir 'spot.json'))) {
                 @{ name = $spot.name; error = $_.Exception.Message; windows = @() } | ConvertTo-Json | Set-Content (Join-Path $spotDir 'spot.json')
             }
+        } finally {
+            if ($run.variant) {   # back to the baseline before the next variant (the game is closed by now)
+                Stop-Game
+                foreach ($p in $rtxPaths) { [IO.File]::WriteAllText($p, $rtxBackup) }
+                [IO.File]::WriteAllText($setupIniPath, $gateIni)
+            }
         }
     }
 } finally {
     Stop-Game
+    if ($rtxBackup) { foreach ($p in $rtxPaths) { [IO.File]::WriteAllText($p, $rtxBackup) } }
     if (Test-Path $saveBackup) {
         Get-ChildItem $SaveDir -Filter '*.save' | Remove-Item
         Copy-Item (Join-Path $saveBackup '*') $SaveDir -Force
@@ -366,6 +438,11 @@ try {
     Remove-Item -LiteralPath $GameLock -ErrorAction SilentlyContinue
 }
 if ($CaptureCheckpoint) { exit 0 }
+if ($sweep) {   # numbers for the requester to weigh, not a pass/fail
+    & $Py (Join-Path $Runtime 'settings_report.py') $runDir | Out-Host
+    "Result: $(Join-Path $runDir 'settings.md')"
+    exit $LASTEXITCODE
+}
 $code = Gate $runDir
 "Result: $(Join-Path $runDir 'result.md')"
 exit $code
