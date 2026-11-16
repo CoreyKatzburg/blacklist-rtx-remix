@@ -584,14 +584,23 @@ class Spot:
             raise RuntimeError(f"screen capture {rel} is all black: the game picture did not reach the desktop grab")
 
     def dump(self, tag: str) -> None:
-        """Asks the proxy (and through it Remix) for this frame's depth/colour dumps; copies what arrives."""
-        set_ini(self.ini, "Proxy", "GateDump", tag)
+        """Asks the proxy (and through it Remix) for this frame's depth/colour dumps; copies what arrives.
+        Only files written after the ask count: the game folder keeps every spot's dumps under the same names, and
+        on Nov 16 (run 063147) Remix wrote none at con_bright_hall while not ray tracing, so 31 of its 32 pictures
+        were con_custodial's, copied unchanged and scored as 2.63x brighter than the original."""
         names = [f"{tag}_final.pfm", f"{tag}_depth.pfm", f"{tag}_gamedepth.pfm"]
-        found = lambda: [os.path.join(d, n) for d in self.dump_dirs for n in names if os.path.exists(os.path.join(d, n))]
+        paths = [os.path.join(d, n) for d in self.dump_dirs for n in names]
+        before = {p: os.stat(p).st_mtime_ns for p in paths if os.path.exists(p)}
+        found = lambda: [p for p in paths if os.path.exists(p) and os.stat(p).st_mtime_ns != before.get(p)]
+        set_ini(self.ini, "Proxy", "GateDump", tag)
         self.hold(8.0, until=lambda: len(found()) >= len(names))
         time.sleep(0.3)   # let the last write finish
-        for p in found():
+        fresh = found()
+        for p in fresh:
             shutil.copy2(p, os.path.join(self.out, "gate", os.path.basename(p)))
+        missing = sorted(set(names) - {os.path.basename(p) for p in fresh})
+        if missing:
+            print(f"DUMP MISSING {tag}: no new {', '.join(missing)} (old files with these names are not copied)")
 
     def steady(self, fps: float = 10.0, span: float = 1.0, timeout: float = 15.0) -> float:
         """Waits until the game has drawn at least fps*span frames in the last `span` seconds; returns the seconds

@@ -395,6 +395,30 @@ class Reference(unittest.TestCase):
             with mock.patch.object(drive, "start_capture", fake_capture(bytes(57600 * 20 - 1) + b"\x07")):
                 s.capture("dark.gray", 20)   # a nearly black room is still a picture
 
+    def test_old_dumps_from_an_earlier_spot_are_not_copied(self):
+        # Run 063147: Remix wrote no dumps at con_bright_hall (not ray tracing), and con_custodial's files of the
+        # same names were copied and scored as con_bright_hall's picture.
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            game, out = os.path.join(tmp, "gate"), os.path.join(tmp, "out")
+            os.makedirs(game), os.makedirs(os.path.join(out, "gate"))
+            for n in ("y0_p0_final.pfm", "y0_p0_depth.pfm", "y0_p0_gamedepth.pfm"):
+                with open(os.path.join(game, n), "wb") as fh:
+                    fh.write(b"custodial")
+                os.utime(os.path.join(game, n), (1, 1))
+            s = drive.Spot.__new__(drive.Spot)
+            s.dump_dirs, s.out, s.ini = [game], out, os.path.join(tmp, "d3d9_proxy.ini")
+
+            def proxy_answers(seconds, until=None):   # the proxy writes its game depth; Remix writes nothing
+                with open(os.path.join(game, "y0_p0_gamedepth.pfm"), "wb") as fh:
+                    fh.write(b"bright_hall")
+            s.hold = proxy_answers
+            with mock.patch.object(drive, "set_ini", lambda *a: None), mock.patch.object(drive.time, "sleep"):
+                s.dump("y0_p0")
+            self.assertEqual(os.listdir(os.path.join(out, "gate")), ["y0_p0_gamedepth.pfm"])
+            with open(os.path.join(out, "gate", "y0_p0_gamedepth.pfm"), "rb") as fh:
+                self.assertEqual(fh.read(), b"bright_hall")
+
     def test_a_dead_or_black_screen_read_is_an_error_not_an_empty_list(self):
         # No-Remix reference, Nov 16: every shot was black, so samples_ms was [] with noise 0 and no error.
         for name, chunk in (("black", lambda n: bytes(n)), ("dead", lambda n: b"")):
