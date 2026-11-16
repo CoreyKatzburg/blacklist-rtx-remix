@@ -236,6 +236,31 @@ class FakeRunTest(unittest.TestCase):
             self.assertEqual(st, gate.PASS, detail)
             self.assertIn("not-disposed", detail)
 
+    def test_ray_tracing_checks_on_20261116_063147(self):
+        base = r"D:\BlacklistOverhaul\experiments\remix-gate\20261116-063147"
+        if not os.path.isdir(base):
+            return
+        for spot_name, want_rt, want_cs in (("con_bright_hall", gate.FAIL, gate.FAIL),
+                                            ("con_custodial", gate.PASS, gate.PASS)):
+            sdir = os.path.join(base, spot_name)
+            if not os.path.isdir(sdir):
+                continue
+            s = gate.load_json(os.path.join(sdir, "spot.json"))
+            s["_dir"] = sdir
+            tel, _ = gate.read_telemetry(gate.spot_path(s, s.get("telemetry")))
+            s["_data"] = {
+                "telemetry": tel,
+                "proxy": gate.read_csv_frames(gate.spot_path(s, s.get("proxyFrames")), 7),
+                "pgate": gate.read_csv_frames(gate.spot_path(s, s.get("proxyGate")), 6),
+            }
+            with tempfile.TemporaryDirectory() as td:
+                gate.save_json(os.path.join(td, "manifest.json"), {"spots": [spot_name]})
+                r = gate.Run(td)
+                gate.ray_tracing_checks(r, [s], "rtx_telemetry.jsonl")
+                by_name = {m["check"]: m for m in r.metrics}
+                self.assertEqual(by_name["remix_ray_tracing"]["status"], want_rt, (spot_name, by_name["remix_ray_tracing"]))
+                self.assertEqual(by_name["remix_compile_stall"]["status"], want_cs, (spot_name, by_name["remix_compile_stall"]))
+
 
 class DriveHelpersTest(unittest.TestCase):
     def test_set_ini_replaces_and_inserts(self):

@@ -52,6 +52,7 @@ FRAME_TIMES = {
     "low_fps": (14.0, 12.0),           # 71 FPS: WARN under the 90 target, the gate still passes
     "near_target_fps": (1000.0 / 89.96, 8.0),    # 89.96 FPS: WARN, must print "89.96 FPS" not "90.0 FPS"
     "near_target_89_996": (1000.0 / 89.996, 8.0), # 89.996 FPS: WARN, must print "89.996 FPS" not "90.00 FPS"
+    "never_ray_traced": (35.0, 5.0),               # 28.6 FPS, 30 ms CPU wait with rayTraced=false -> compile stall
     "high_latency": (17.5, 9.0),       # 57 FPS, CPU wait 8.5 ms -> fails latency_overhead_ms
     "fps_regression": (11.8, 8.0),     # 84.7 FPS: 15% below the 100 FPS previous run: FAIL
     "fps_drop_9pct": (10.98, 8.0),     # 91 FPS: 9% below the previous run: passes
@@ -94,6 +95,12 @@ class Builder:
                     "passMs": {"InjectRTX": [10.0, 4.0, 1], "InjectRTX/Ray Reconstruction": [5.0, 0.2, 1],
                                "InjectRTX/Ray Reconstruction/Prepare DLSS": [0.3, 0.02, 1]}})
         c = self.case
+        if c == "never_ray_traced":
+            rec["rayTraced"] = False
+        if c == "one_stop_not_ray_traced" and wname == "y0_p0":
+            rec["rayTraced"] = False
+        if c == "goggles_off_only" and goggles and i < 3:
+            rec["rayTraced"] = False
         if c == "nan_frame" and kind == "still" and i == 3: rec["thumbNonFinite"] = 40
         if c == "goggles_toggle_rebuilds" and wname == "goggles1_rtoff" and i == 3: rec["staticBlasBuilds"] = 300
         if c == "goggles_dark_frame" and wname == "goggles1_rtoff" and i == 3: img = img * 0.2
@@ -358,6 +365,14 @@ CASES = {
     "zero_normal_inst": (("zero_normal_instances",), ()),
     "zero_normal_static_tris": (("zero_normal_static_triangles",), ()),
     "zero_normal_static_inst": (("zero_normal_static_instances",), ()),
+    "never_ray_traced": (("remix_ray_tracing", "remix_compile_stall", "latency_overhead_ms"),
+                         ("nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
+                          "outline_overlap", "flashes", "still_flicker",
+                          "goggles_toggle_rebuilds", "goggles_dark_frame")),
+    "goggles_off_only": ((), ()),
+    "one_stop_not_ray_traced": (("remix_ray_tracing",),
+                                ("nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
+                                 "outline_overlap", "flashes", "still_flicker")),
     "sam_missing": (("outline_overlap",), ()),
     "inward": (("inward_fraction",), ()),
     "raster_flash": (("raster_fallback_frames",), ()),
@@ -404,20 +419,24 @@ CASES = {
     "no_telemetry": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms",
                           "skinned_min", "remix_dropped_character_frames", "static_blas_rebuilds",
                           "inward_fraction", "nonfinite_thumb_pixels", "frame_join_clock",
+                          "remix_ray_tracing", "remix_compile_stall",
                           "goggles_toggle_rebuilds", "goggles_dark_frame", *_ZERO_NORMALS, *RECORDER)),
     # Remix writing only every 15th frame: per-frame checks can't pass; flashes fall back to the screen captures
     "sparse_telemetry": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms",
                               "skinned_min", "remix_dropped_character_frames", "static_blas_rebuilds",
                               "inward_fraction", "nonfinite_thumb_pixels",
+                              "remix_ray_tracing",
                               "goggles_toggle_rebuilds", "goggles_dark_frame", *_ZERO_NORMALS, *RECORDER)),
-    "renamed_fields": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms")),
+    "renamed_fields": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms", "remix_compile_stall")),
     "no_dumps": ((), ("nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness", "outline_overlap")),
-    "no_proxy_gate": ((), ("raster_fallback_frames", "skinned_min", "remix_dropped_character_frames")),
+    "no_proxy_gate": ((), ("raster_fallback_frames", "skinned_min", "remix_dropped_character_frames",
+                           "remix_ray_tracing")),
     "no_thumbs": ((), ()),                       # still measurable from the screen captures (pan at full rate)
     "half_rate_capture": ((), ("flashes",)),     # screen capture saw half the game frames of the pan
     "spot_error": (("s1: setup",), ("frames_over_50ms", "present_stalls", "min_median_fps", "latency_overhead_ms",
                                     "input_latency_ms", "skinned_min", "remix_dropped_character_frames",
                                     "static_blas_rebuilds", "inward_fraction", "frame_join_clock",
+                                    "remix_ray_tracing", "remix_compile_stall",
                                     "nonfinite_thumb_pixels", "raster_fallback_frames", "flashes", "still_flicker",
                                     "nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
                                     "outline_overlap", "pose", "goggles", "goggles_toggle_rebuilds",
@@ -445,7 +464,7 @@ CASES = {
 
 # case -> checks that must WARN (shown in the result; the gate still passes)
 WARNS = {"low_fps": ("min_median_fps",), "near_target_fps": ("min_median_fps",),
-         "near_target_89_996": ("min_median_fps",),
+         "near_target_89_996": ("min_median_fps",), "never_ray_traced": ("min_median_fps",),
          "high_latency": ("min_median_fps",), "fps_regression": ("min_median_fps",)}
 PREVIOUS = {"fps_regression", "fps_drop_9pct"}    # judged against a previous run: the healthy 100 FPS run
 NO_REFERENCE = {"no_reference"}                  # run without --reference

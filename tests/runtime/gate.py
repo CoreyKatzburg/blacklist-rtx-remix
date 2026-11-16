@@ -117,6 +117,9 @@ THRESHOLDS = {
     "zero_normal_instances_max": 0,        # GUESS until first live run with new build.
     "zero_normal_static_tris_max": 0,      # GUESS until first live run with new build.
     "zero_normal_static_instances_max": 0, # GUESS until first live run with new build.
+    "compile_stall_min_frames": 300,       # GUESS. Consecutive rayTraced=false frames with 25-40 ms CPU wait.
+    "compile_stall_wait_min_ms": 25.0,     # GUESS.
+    "compile_stall_wait_max_ms": 40.0,     # GUESS.
     }
 SOFT_NM = frozenset({"frame_join_clock"})  # NOT MEASURED does not fail the gate for these checks yet
 TELEMETRY_FIELDS = ("frame", "frameTimeMs", "gpuTimeMs", "instances", "skinnedInstances", "staticBlasRebuilds",
@@ -718,6 +721,113 @@ def _parse_lightpub_log(path: str) -> list[tuple[tuple[int, int, int], int, int,
     return rows
 
 
+def stop_all_ray_traced(spot: dict, w: dict) -> bool:
+    """False when telemetry has rayTraced=False on any frame of window `w`."""
+    tel = spot["_data"]["telemetry"]
+    tids = frames_in(w, "telemetry")
+    return not any(tel.get(f, {}).get("rayTraced") is False for f in tids)
+
+
+def ray_tracing_checks(run: Run, good: list[dict], tsrc: str) -> None:
+    """remix_ray_tracing (non-goggles scene RT share + every still stop 100% ray traced) and
+    remix_compile_stall (>= 300 consecutive rayTraced=false frames with 25-40 ms CPU wait, GUESS)."""
+    rt_thresh = "all still stops 100% ray traced"
+    cs_lim = THRESHOLDS["compile_stall_min_frames"]
+    w_lo, w_hi = THRESHOLDS["compile_stall_wait_min_ms"], THRESHOLDS["compile_stall_wait_max_ms"]
+    cs_thresh = f"< {cs_lim} consecutive rayTraced=false frames with {w_lo:g}..{w_hi:g} ms wait (GUESS)"
+    if not good:
+        run.add("remix_ray_tracing", NOT_MEASURED, None, rt_thresh, "no spot ran far enough to judge", tsrc)
+        run.add("remix_compile_stall", NOT_MEASURED, None, cs_thresh, "no spot ran far enough to judge", tsrc)
+        return
+
+    # 1. remix_ray_tracing
+    shares, bad_stops, launch_times, missing_rt = [], [], [], []
+    for s in good:
+        tel, pg = s["_data"]["telemetry"], s["_data"]["pgate"]
+        spairs = scene_pairs(s)
+        want_s, recs_s = coverage(spairs, "telemetry", "telemetry")
+        have_rt = sum(1 for r in recs_s if isinstance(r.get("rayTraced"), bool))
+        want_pg, pg_rows = coverage(spairs, "proxy", "pgate")
+        have_pg = sum(1 for r in pg_rows if len(r) >= 5)
+        if want_s == 0 or have_rt < want_s or want_pg == 0 or have_pg < want_pg:
+            missing_rt.append(s["name"])
+            continue
+        non_goggles_total, non_goggles_rt = 0, 0
+        for _, w in spairs:
+            for tf in frames_in(w, "telemetry"):
+                in_goggles = any(f in pg and len(pg[f]) >= 5 and int(pg[f][4]) == 1 for f in range(tf - 3, tf + 4))
+                if not in_goggles:
+                    non_goggles_total += 1
+                    if tel[tf]["rayTraced"]:
+                        non_goggles_rt += 1
+        shares.append((s["name"], non_goggles_rt / non_goggles_total if non_goggles_total else 1.0))
+        for w in s["windows"]:
+            if w["kind"] == "still" and not stop_all_ray_traced(s, w):
+                bad_stops.append(f"{s['name']}/{w['name']}")
+        # Seconds from first telemetry frame of the launch to first rayTraced=true frame
+        t_ms = 0.0
+        first_rt_s = None
+        for fr in sorted(tel):
+            r = tel[fr]
+            if r.get("rayTraced") is True:
+                first_rt_s = t_ms / 1000.0
+                break
+            ft = r.get("frameTimeMs")
+            if isinstance(ft, (int, float)):
+                t_ms += float(ft)
+        launch_times.append(f"{s['name']} " + (f"{first_rt_s:.1f}s to RT" if first_rt_s is not None else "never RT"))
+
+    if missing_rt or not shares:
+        run.add("remix_ray_tracing", NOT_MEASURED, None, rt_thresh,
+                "missing rayTraced or proxy_gate for: " + (", ".join(missing_rt) or "no spot"), tsrc)
+    else:
+        worst_share = min(sh for _, sh in shares)
+        share_str = ", ".join(f"{n} {sh:.1%}" for n, sh in shares)
+        lt_str = "; ".join(launch_times)
+        detail = (f"{len(bad_stops)} non-RT still stop(s) ({', '.join(bad_stops[:5])}); "
+                  if bad_stops else "") + f"scene RT: {share_str} ({lt_str})"
+        run.add("remix_ray_tracing", PASS if not bad_stops else FAIL, round(worst_share, 4), rt_thresh, detail, tsrc)
+
+    # 2. remix_compile_stall
+    worst_run, stall_runs, missing_cs = 0, [], []
+    for s in good:
+        tel = s["_data"]["telemetry"]
+        frames = sorted(tel)
+        valid = [fr for fr in frames if isinstance(tel[fr].get("rayTraced"), bool)
+                 and isinstance(tel[fr].get("frameTimeMs"), (int, float))
+                 and isinstance(tel[fr].get("gpuTimeMs"), (int, float))]
+        if not frames or len(valid) < len(frames):
+            missing_cs.append(s["name"])
+            continue
+        cur_start = cur_len = 0
+        for fr in frames:
+            r = tel[fr]
+            wait = float(r["frameTimeMs"]) - float(r["gpuTimeMs"])
+            if r["rayTraced"] is False and w_lo <= wait <= w_hi:
+                if cur_len == 0:
+                    cur_start = fr
+                cur_len += 1
+                if cur_len > worst_run:
+                    worst_run = cur_len
+            else:
+                if cur_len >= cs_lim:
+                    stall_runs.append((s["name"], cur_start, fr - 1, cur_len))
+                cur_len = 0
+        if cur_len >= cs_lim:
+            stall_runs.append((s["name"], cur_start, frames[-1], cur_len))
+
+    if missing_cs:
+        run.add("remix_compile_stall", NOT_MEASURED, None, cs_thresh,
+                "missing rayTraced/frameTimeMs/gpuTimeMs for: " + ", ".join(missing_cs), tsrc)
+    elif stall_runs:
+        s0, a0, b0, n0 = max(stall_runs, key=lambda x: x[3])
+        run.add("remix_compile_stall", FAIL, n0, cs_thresh,
+                f"{s0} frames {a0}..{b0} ({n0} frames) rayTraced=false with {w_lo:g}..{w_hi:g} ms wait", tsrc)
+    else:
+        run.add("remix_compile_stall", PASS, worst_run, cs_thresh,
+                f"longest rayTraced=false 25..40ms-wait run: {worst_run} frames", tsrc)
+
+
 def lightpub_checks(run: Run, good: list[dict], reference: dict[str, dict] | None) -> None:
     """Worker B's lightpub checks: S1..S5 from proxy.log and T1 from lightpub_trace.csv."""
     log_src = "proxy.log (lightpub)"
@@ -1231,6 +1341,7 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
             run.add(cname, PASS if worst_max <= lim else FAIL, worst_max, thresh_zn, detail_zn, tsrc)
 
     recorder_checks(run, pick, good, tsrc)
+    ray_tracing_checks(run, good, tsrc)
     lightpub_checks(run, good, ref_spots)
 
     # goggles_toggle_rebuilds & goggles_dark_frame: first rayTraced=true frame after rayTraced=false in goggles windows.
@@ -1322,6 +1433,8 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
     # flashes: every still stop (>= 15 frames) and the pan (frames for >= 90% of the game's frames)
     flash_total, flash_detail, flash_missing, sources = 0, [], [], set()
     for s, w in pick(("still", "pan")):
+        if w["kind"] == "still" and not stop_all_ray_traced(s, w):
+            flash_missing.append(f"{s['name']}/{w['name']}: not all frames ray traced"); continue
         frames, src = window_frames(s, w)
         sources.add(src)
         n_game = len(frames_in(w, "telemetry")) or len(frames_in(w, "proxy"))
@@ -1349,6 +1462,8 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
     flicker_thresh = (f"block jitter <= {j_limit:g}, drift <= {d_limit:g}, "
                       f"pulse <= {p_limit:g}, step4 <= {s4_limit:g} (/255)")
     for s, w in pick(("still",)):
+        if not stop_all_ray_traced(s, w):
+            flicker_missing.append(f"{s['name']}/{w['name']}: not all frames ray traced"); continue
         frames, src = window_frames(s, w)
         flicker_sources.add(src)
         n = 0 if frames is None else len(dedupe(frames))
@@ -1372,12 +1487,17 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
                 ", ".join(sorted(flicker_sources)))
 
     # image dumps at the stops: NaN, neon, two-sided scene_brightness vs raster, angled sharpness, outline
-    nan_total, worst_neon, n_final, missing_final, overlaps, outline_missing = 0, 0.0, 0, [], [], []
+    nan_total, worst_neon, n_final, missing_final, not_rt_stops, overlaps, outline_missing = 0, 0.0, 0, [], [], [], []
     worst_angled_sharp = float("inf")
     n_angled = 0
     for s, w in pick(("still",)):
         tag = w.get("dump")
         if not tag:
+            continue
+        if not stop_all_ray_traced(s, w):
+            not_rt_stops.append(f"{s['name']}/{tag}")
+            if w.get("outline"):
+                outline_missing.append(f"{s['name']}/{tag}: not all frames ray traced")
             continue
         final = spot_path(s, os.path.join("gate", f"{tag}_final.pfm"))
         if os.path.exists(final):
@@ -1403,9 +1523,13 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
                 f"{THRESHOLDS['max_raster_luma_ratio']:.2f}x], median [{THRESHOLDS['min_spot_median_ratio']:.2f}x, "
                 f"{THRESHOLDS['max_spot_median_ratio']:.2f}x], near-white <= +{THRESHOLDS['max_near_white_delta']:.2f}")
     b_src = "Remix <tag>_final.pfm + reference <tag>_raster.pfm"
-    if missing_final or n_final == 0 or not good:
-        detail = (f"{len(missing_final)} of {len(missing_final) + n_final} stops have no final image dump"
-                  if (missing_final or n_final == 0) else "no spot ran far enough to judge")
+    if missing_final or not_rt_stops or n_final == 0 or not good:
+        if not_rt_stops:
+            detail = f"{len(not_rt_stops)} stop(s) not all ray traced ({', '.join(not_rt_stops[:5])})"
+        elif missing_final or n_final == 0:
+            detail = f"{len(missing_final)} of {len(missing_final) + n_final} stops have no final image dump"
+        else:
+            detail = "no spot ran far enough to judge"
         run.add("nan_pixels", NOT_MEASURED, nan_total, "0", detail, "Remix <tag>_final.pfm")
         run.add("neon_fraction", NOT_MEASURED, round(worst_neon, 6), "< 0.1%", detail, "Remix <tag>_final.pfm")
         run.add("scene_brightness", NOT_MEASURED, None, b_thresh, detail, b_src)
