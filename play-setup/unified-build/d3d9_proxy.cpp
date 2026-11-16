@@ -227,7 +227,7 @@ bool LoadRealD3D9(HINSTANCE proxyInstance) {
     diag.frameTraceMax = GetPrivateProfileIntW(L"Proxy", L"FrameTraceMax", 500000, iniPath);
     diag.callTiming = diag.frameTrace && GetPrivateProfileIntW(L"Proxy", L"CallTiming", debuggingTelemetry, iniPath) != 0;
     diag.frameTiming = GetPrivateProfileIntW(L"Proxy", L"FrameTiming", 0, iniPath);
-    diag.hitchSampler = GetPrivateProfileIntW(L"Proxy", L"HitchSampler", 0, iniPath) != 0;
+    diag.hitchSampler = GetPrivateProfileIntW(L"Proxy", L"HitchSampler", debuggingTelemetry, iniPath) != 0;
     diag.sampleMs = std::clamp(GetPrivateProfileIntW(L"Proxy", L"SampleMs", 5, iniPath), 1u, 1000u);
     diag.hitchMs = GetPrivateProfileIntW(L"Proxy", L"HitchMs", 50, iniPath);
     diag.texStats = diag.callTiming && GetPrivateProfileIntW(L"Proxy", L"TexStats", 0, iniPath) != 0;
