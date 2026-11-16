@@ -367,7 +367,8 @@ class FakeRunTest(unittest.TestCase):
         m = score()
         self.assertEqual((m["status"], m["value"]), (gate.PASS, 0), m)
         self.assertIn("0 of 4 changes", m["detail"])
-        self.assertIn("switch_flare_balls_off 0 of 5", m["detail"])
+        # The reference still is picked by pose: y0_p0_after is 0.2 cm from the switch pose, y0_p0 0.9 cm.
+        self.assertIn("switch_flare_balls_off (vs original y0_p0_after) 0 of", m["detail"])
         self.assertNotIn("goggles", m["detail"])
         real = gate.glow_dimmed_stop
         try:
@@ -376,9 +377,30 @@ class FakeRunTest(unittest.TestCase):
                 else real(r, o, on, os_, ch, ag))
             m = score()
             self.assertEqual((m["status"], m["value"]), (gate.FAIL, 1), m)
-            self.assertIn("switch_flare_balls_off 1 of 5", m["detail"])
+            self.assertIn("switch_flare_balls_off (vs original y0_p0_after) 1 of 5", m["detail"])
             gate.glow_dimmed_stop = lambda *a: (2, "glow_blobs: NOT MEASURED, changed pose differs from on by 40 cm")
             self.assertEqual(score()["status"], gate.NOT_MEASURED)
+            # The see-through probe's names (worker B): on = switch_on, change = switch_off, on_again = switch_on_again.
+            calls = []
+            gate.glow_dimmed_stop = lambda *a: (calls.append(a[2:]) or
+                                                (0, "glow_blobs: dimmed 0 of 5 lamps the original shows (fake): PASS"))
+            rename = {"switch_base": "switch_on", "switch_flare_balls_off": "switch_off",
+                      "switch_base_again": "switch_on_again"}
+            probe = dict(good[0], windows=[dict(w, name=rename[w["name"]]) if w["name"] in rename else w
+                                           for w in good[0]["windows"] if w["kind"] != "switch" or w["name"] in rename])
+            run = gate.Run.__new__(gate.Run)
+            run.dir, run.manifest, run.metrics = "", {}, []
+            gate.lamps_dimmed_check(run, [probe], ref, True)
+            self.assertEqual(calls, [("switch_on", "y0_p0_after", "switch_off", "switch_on_again")])
+            self.assertEqual(run.metrics[0]["status"], gate.PASS, run.metrics[0])
+            # No reference still at the on pose (only y90_p0 left): NOT MEASURED, never a fixed y0_p0.
+            far = {k: dict(v, windows=[w for w in v["windows"] if w["name"] == "y90_p0"]) for k, v in ref.items()}
+            calls.clear()
+            run.metrics.clear()
+            gate.lamps_dimmed_check(run, good, far, True)
+            self.assertEqual(run.metrics[0]["status"], gate.NOT_MEASURED, run.metrics[0])
+            self.assertIn("no reference still within 25 cm", run.metrics[0]["detail"])
+            self.assertEqual(calls, [])
         finally:
             gate.glow_dimmed_stop = real
 

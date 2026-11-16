@@ -81,8 +81,10 @@ Checks (thresholds in THRESHOLDS):
                            glows: limit 0 per stop. Poses apart: that stop is listed, not compared. No no-Remix
                            reference: NOT MEASURED
   lights_lamps_dimmed      must-stay check for a change (glow_blobs.py --dimmed, 32a905d): each switch step against
-                           switch_base and switch_base_again at the original's y0_p0 lamps; a lamp is dimmed when its
-                           glow drops by more than max(12, 3 x |on - on_again|). Limit 0. Goggles switches left out.
+                           the on / on_again pair (switch_base / switch_base_again, or the see-through probe's
+                           switch_on / switch_on_again) at the lamps of the reference still nearest the on pose that
+                           passes glow_blobs.pose_ok (none: NOT MEASURED); a lamp is dimmed when its glow drops by more
+                           than max(12, 3 x |on - on_again|). Limit 0. Goggles switches left out.
                            Runs without that triplet: NOT MEASURED, which does not fail the gate (SOFT_NM)
   lights_dimmed_linger     report only (WARN above 600 frames, never FAIL): stray line max longest dim TM. It measures
                            the game: guard rifle flashlights dim on their own (2060 frames at con_bright_hall)
@@ -1585,17 +1587,91 @@ def glow_dimmed_stop(remix_spot: str, orig_spot: str, on: str, orig_still: str, 
 
 
 _DIMMED_RE = re.compile(r"glow_blobs: dimmed (\d+) of (\d+) lamps the original shows")
+# (on, on_again) window names of a must-stay triplet: the gate's switch steps (142638) and worker B's see-through
+# probe (variants_con_bright_hall_seethrough.json: on / off / on_again). Every other non-goggles switch window in the
+# spot is a change.
+_DIMMED_TRIPLETS = (("switch_base", "switch_base_again"), ("switch_on", "switch_on_again"))
+_glow_blobs = None
+
+
+def glow_blobs_module():
+    """Worker B's tests\\analysis\\glow_blobs.py, imported once (its pose_ok is the pose rule; not copied)."""
+    global _glow_blobs
+    if _glow_blobs is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("glow_blobs", GLOW_BLOBS)
+        _glow_blobs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_glow_blobs)
+    return _glow_blobs
+
+
+def window_poses(spot: dict) -> dict[str, np.ndarray]:
+    """name -> camera (x, y, z, yaw, pitch) of each still or switch window with frames, as glow_blobs.spot_still
+    computes it (median render camera, publish slot 0, over the window's proxy frames in proxy_frames.csv), read in
+    one pass over the file instead of one per window."""
+    wins = [(w["name"], *w["proxy"]) for w in spot["windows"]
+            if w["kind"] in ("still", "switch") and w.get("frames") and w.get("proxy")]
+    cams: dict[str, list] = {n: [] for n, _, _ in wins}
+    path = os.path.join(spot["_dir"], "proxy_frames.csv")
+    if not wins or not os.path.exists(path):
+        return {}
+    with open(path, errors="replace") as f:
+        for line in f:
+            c = line.rstrip("\n").split(",")
+            if len(c) < 7 or not c[0].isdigit() or not c[6]:
+                continue
+            fr = int(c[0])
+            hit = [n for n, lo, hi in wins if lo <= fr <= hi]
+            if not hit:
+                continue
+            for pub in c[6].split("|"):
+                p = pub.split(":")
+                if len(p) >= 9 and p[2] == "0":
+                    for n in hit:
+                        cams[n].append([float(v) for v in p[3:9]])
+                    break
+    out = {}
+    for n, rows in cams.items():
+        if rows:
+            m = np.median(np.array(rows), axis=0)
+            out[n] = np.array([*m[:3], math.degrees(math.atan2(m[4], m[3])),
+                               math.degrees(math.asin(float(np.clip(m[5], -1, 1))))])
+    return out
+
+
+def nearest_reference_still(on_pose, ref: dict) -> tuple[str | None, str]:
+    """(name, note): the reference still nearest the on step's camera among those glow_blobs.pose_ok accepts (25 cm,
+    1.5 deg), or (None, why) when none does (worker B, Nov 16: never fixed to y0_p0)."""
+    gb = glow_blobs_module()
+    best, closest = None, None
+    for n, p in window_poses(ref).items():
+        if not n.startswith("y"):
+            continue                       # stills only (y<yaw>_p<pitch>...), not the reference's own switch steps
+        ok, dist, dyaw, dpitch = gb.pose_ok((on_pose, p))
+        key = (dist, dyaw + dpitch)
+        if closest is None or key < closest[0]:
+            closest = (key, n, dist, dyaw, dpitch)
+        if ok and (best is None or key < best[0]):
+            best = (key, n)
+    if best:
+        return best[1], ""
+    if closest is None:
+        return None, "the reference has no still with a camera"
+    _, n, dist, dyaw, dpitch = closest
+    return None, (f"no reference still within {gb.POSE_CM:g} cm and {gb.POSE_DEG:g} deg of the on step (nearest {n}: "
+                  f"{dist:.0f} cm, yaw {dyaw:.2f}, pitch {dpitch:.2f} deg)")
 
 
 def lamps_dimmed_check(run: Run, good: list[dict], reference: dict[str, dict] | None, ref_no_remix: bool) -> None:
     """lights_lamps_dimmed (worker B's spec, glow_blobs.py 32a905d): the must-stay check for a change that removes
-    something. For each switch step between switch_base (on) and switch_base_again (on_again), a lamp the original
-    shows (the reference's y0_p0, the pose the switch steps share) is DIMMED when its Remix glow drops by more than
-    max(12, 3 x |on - on_again|). Limit 0 per change. Goggles switches are left out: the goggles replace the picture.
-    Only runs with that on / changed / on_again triplet can be measured, so NOT MEASURED is in SOFT_NM; the detail
-    says why (no triplet, no no-Remix reference, poses apart or a script error)."""
-    name, src, threshold = "lights_lamps_dimmed", "glow_blobs.py --dimmed: switch steps against switch_base, " \
-        "switch_base_again and the --reference (no Remix) y0_p0", "0 per change"
+    something. A spot with an on / on_again pair (_DIMMED_TRIPLETS) has every other non-goggles switch window scored
+    as a change: a lamp the original shows is DIMMED when its Remix glow drops by more than max(12, 3 x |on -
+    on_again|). The original's still is the reference still nearest the on step's camera that passes
+    glow_blobs.pose_ok; with none, that spot is NOT MEASURED. Limit 0 per change. Goggles switches are left out: the
+    goggles replace the picture. Only runs with a triplet can be measured, so NOT MEASURED is in SOFT_NM; the detail
+    says why (no triplet, no no-Remix reference, no reference still at the pose, poses apart or a script error)."""
+    name, src, threshold = "lights_lamps_dimmed", "glow_blobs.py --dimmed: changes against the on and on_again " \
+        "switch steps and the --reference (no Remix) still nearest the on pose", "0 per change"
     if reference is None or not ref_no_remix:
         why = "no reference run given (--reference)" if reference is None else "the reference run is not a no-Remix run"
         run.add(name, NOT_MEASURED, None, threshold, why, src)
@@ -1603,26 +1679,33 @@ def lamps_dimmed_check(run: Run, good: list[dict], reference: dict[str, dict] | 
     jobs, missing = [], []
     for s in good:
         sw = {w["name"]: w for w in s["windows"] if w["kind"] == "switch" and w.get("frames")}
-        if "switch_base" not in sw or "switch_base_again" not in sw:
+        pair = next(((on, ag) for on, ag in _DIMMED_TRIPLETS if on in sw and ag in sw), None)
+        if pair is None:
+            continue
+        changes = [n for n, w in sw.items() if not any(n in t for t in _DIMMED_TRIPLETS)
+                   and not (w.get("switch") or {}).get("goggles")]
+        if not changes:
             continue
         ref = reference.get(s["name"])
-        if ref is None or not any(w["name"] == "y0_p0" and w.get("frames") for w in ref["windows"]):
-            missing.append(s["name"])
+        if ref is None:
+            missing.append(f"{s['name']}: no reference spot")
             continue
-        for n, w in sw.items():
-            if n in ("switch_base", "switch_base_again") or (w.get("switch") or {}).get("goggles"):
-                continue
-            jobs.append((s["name"], s["_dir"], ref["_dir"], n))
+        on_pose = window_poses(s).get(pair[0])
+        orig, why = nearest_reference_still(on_pose, ref) if on_pose is not None else (None, "no camera for the on step")
+        if orig is None:
+            missing.append(f"{s['name']}: {why}")
+            continue
+        jobs += [(s["name"], s["_dir"], ref["_dir"], ch, pair, orig) for ch in changes]
     if not jobs:
         run.add(name, NOT_MEASURED, None, threshold,
-                "no spot with switch_base, a change and switch_base_again plus a reference y0_p0"
-                + (f" (no reference for {', '.join(missing)})" if missing else ""), src)
+                "no spot with an on step, a change and an on_again step plus a reference still at that pose"
+                + (f" ({'; '.join(missing)})" if missing else ""), src)
         return
     with concurrent.futures.ThreadPoolExecutor(4) as pool:
-        outs = list(pool.map(lambda j: glow_dimmed_stop(j[1], j[2], "switch_base", "y0_p0", j[3],
-                                                        "switch_base_again"), jobs))
+        outs = list(pool.map(lambda j: glow_dimmed_stop(j[1], j[2], j[4][0], j[5], j[3], j[4][1]), jobs))
     rows, apart, errors = [], [], []
-    for (spot, _, _, ch), (code, out) in zip(jobs, outs):
+    for (spot, _, _, ch, _, orig), (code, out) in zip(jobs, outs):
+        ch = f"{ch} (vs original {orig})"
         m = _DIMMED_RE.search(out)
         first = (out.splitlines()[0] if out else f"exit {code}").replace("glow_blobs: ", "")
         if code == 2 and "NOT MEASURED" in out:
@@ -1636,7 +1719,7 @@ def lamps_dimmed_check(run: Run, good: list[dict], reference: dict[str, dict] | 
               + "; ".join(f"{lab} {n} of {of}" for lab, n, of in rows)
               + (f"; poses apart, not compared: {'; '.join(apart)}" if apart else "")
               + (f"; glow_blobs.py errors: {'; '.join(errors)}" if errors else "")
-              + (f"; no reference for {', '.join(missing)}" if missing else ""))
+              + (f"; not measured: {'; '.join(missing)}" if missing else ""))
     if bad:
         run.add(name, FAIL, sum(r[1] for r in bad), threshold, detail, src)
     elif errors or apart or missing or not rows:
