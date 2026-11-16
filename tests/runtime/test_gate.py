@@ -341,6 +341,47 @@ class FakeRunTest(unittest.TestCase):
         self.assertEqual(counts(rx, "switch_flare_balls_off", "y0_p0"), (0, (0, 0, 0)))
         self.assertEqual(counts(dark, "y0_p0", "y0_p0"), (1, (13, 5, 6)))
         self.assertEqual(gate.glow_blobs_stop(rx, og, "y135_p0", "y135_p0")[0], 2)
+    def test_lamps_dimmed_on_142638(self):
+        """lights_lamps_dimmed (worker B's 32a905d): 142638 con_bright_hall's switch steps against switch_base,
+        switch_base_again and reference 000454's y0_p0. Real: every change dims 0 of 5 lamps, PASS; the goggles switch
+        is left out. Fake: glow_blobs reporting 1 dimmed lamp on one change must FAIL with that change named; a pose
+        mismatch (exit 2) must give NOT MEASURED, not PASS."""
+        g = r"D:\BlacklistOverhaul\experiments\remix-gate"
+        if not all(os.path.isdir(os.path.join(g, r, "con_bright_hall"))
+                   for r in ("20261115-142638", "reference-20261116-000454")):
+            self.skipTest("run 142638 or reference 000454 not on this machine")
+
+        def spots(r):
+            run = gate.Run(os.path.join(g, r))
+            run.manifest = {"spots": ["con_bright_hall"]}
+            return gate.load_spots(run)
+
+        good, ref = spots("20261115-142638"), {s["name"]: s for s in spots("reference-20261116-000454")}
+
+        def score():
+            run = gate.Run.__new__(gate.Run)
+            run.dir, run.manifest, run.metrics = "", {}, []
+            gate.lamps_dimmed_check(run, good, ref, True)
+            return run.metrics[0]
+
+        m = score()
+        self.assertEqual((m["status"], m["value"]), (gate.PASS, 0), m)
+        self.assertIn("0 of 4 changes", m["detail"])
+        self.assertIn("switch_flare_balls_off 0 of 5", m["detail"])
+        self.assertNotIn("goggles", m["detail"])
+        real = gate.glow_dimmed_stop
+        try:
+            gate.glow_dimmed_stop = lambda r, o, on, os_, ch, ag: (
+                (1, "glow_blobs: dimmed 1 of 5 lamps the original shows (fake): FAIL") if ch == "switch_flare_balls_off"
+                else real(r, o, on, os_, ch, ag))
+            m = score()
+            self.assertEqual((m["status"], m["value"]), (gate.FAIL, 1), m)
+            self.assertIn("switch_flare_balls_off 1 of 5", m["detail"])
+            gate.glow_dimmed_stop = lambda *a: (2, "glow_blobs: NOT MEASURED, changed pose differs from on by 40 cm")
+            self.assertEqual(score()["status"], gate.NOT_MEASURED)
+        finally:
+            gate.glow_dimmed_stop = real
+
     def test_session_mode_fake_sessions(self):
         with tempfile.TemporaryDirectory() as td:
             for case in fakerun.SESSION_CASES:

@@ -702,7 +702,9 @@ def check_case(folder: str, case: str) -> tuple[bool, dict, str]:
         gate.glow_blobs_stop = _REAL_GLOW_BLOBS
     status = {c["check"]: c["status"] for c in result["checks"]}
     expect = {"fps_regression": gate.PASS if case in PREVIOUS else gate.WARN,
-              "input_latency_screen_ms": gate.NOT_MEASURED}   # always, until the screen grab works (in SOFT_NM)
+              "input_latency_screen_ms": gate.NOT_MEASURED,   # always, until the screen grab works (in SOFT_NM)
+              "lights_lamps_dimmed": gate.NOT_MEASURED}       # fake runs have no switch steps (in SOFT_NM; its
+                                                              # verdicts are tested in test_gate.py on 142638)
     expect.update({c: gate.WARN for c in must_warn})
     expect.update({c: gate.NOT_MEASURED for c in must_nm})
     expect.update({c: gate.FAIL for c in must_fail})

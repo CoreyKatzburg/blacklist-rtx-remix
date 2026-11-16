@@ -80,6 +80,10 @@ Checks (thresholds in THRESHOLDS):
                            Glows lost: lamp glows the original shows that Remix lost (what must stay). Orbs and lost
                            glows: limit 0 per stop. Poses apart: that stop is listed, not compared. No no-Remix
                            reference: NOT MEASURED
+  lights_lamps_dimmed      must-stay check for a change (glow_blobs.py --dimmed, 32a905d): each switch step against
+                           switch_base and switch_base_again at the original's y0_p0 lamps; a lamp is dimmed when its
+                           glow drops by more than max(12, 3 x |on - on_again|). Limit 0. Goggles switches left out.
+                           Runs without that triplet: NOT MEASURED, which does not fail the gate (SOFT_NM)
   lights_dimmed_linger     report only (WARN above 600 frames, never FAIL): stray line max longest dim TM. It measures
                            the game: guard rifle flashlights dim on their own (2060 frames at con_bright_hall)
   light_switchoff_lag      report only (WARN above 1.0 s, never FAIL): longest downward brightness run before stopped
@@ -163,8 +167,10 @@ THRESHOLDS = {
 # 0c13881 (staged in 81c0328) ran live on Nov 16 with qpcMs and instancedSharedSlotDraws (run 20261116-100605).
 # input_latency_screen_ms is always NOT MEASURED until the desktop grab works in Remix runs (coordinator, Nov 16);
 # input_latency_ms (the game share) is the judged lag check. lights_puffs is report only (worker B's 9ddc95d), as
-# are the session lines freeze_gaps_excluded and quit_gap_ms.
-SOFT_NM: frozenset[str] = frozenset({"input_latency_screen_ms", "lights_puffs", "freeze_gaps_excluded", "quit_gap_ms"})
+# are the session lines freeze_gaps_excluded and quit_gap_ms. lights_lamps_dimmed applies only to runs with switch_base,
+# a change and switch_base_again; its NOT MEASURED says why in the detail.
+SOFT_NM: frozenset[str] = frozenset({"input_latency_screen_ms", "lights_puffs", "freeze_gaps_excluded", "quit_gap_ms",
+                                     "lights_lamps_dimmed"})
 TELEMETRY_FIELDS = ("frame", "frameTimeMs", "gpuTimeMs", "instances", "skinnedInstances", "staticBlasRebuilds",
                     "cameraCut", "textureMemoryMB", "vramUsedMB")
 THUMB_W, THUMB_H = 128, 72
@@ -1565,6 +1571,80 @@ def glow_checks(run: Run, good: list[dict], reference: dict[str, dict] | None, r
             run.add(name, PASS, 0, threshold, detail, src)
 
 
+def glow_dimmed_stop(remix_spot: str, orig_spot: str, on: str, orig_still: str, changed: str,
+                     again: str) -> tuple[int, str]:
+    """Run glow_blobs.py's dimmed-lamp count (worker B, 32a905d) on one change: (exit code, output).
+    0 PASS, 1 FAIL, 2 NOT MEASURED (a pose differs from the on step)."""
+    try:
+        p = subprocess.run([sys.executable, "-I", GLOW_BLOBS, "--remix-spot", remix_spot, "--orig-spot", orig_spot,
+                            "--still", on, "--orig-still", orig_still, "--dimmed", changed, "--again", again],
+                           capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return -1, f"glow_blobs.py did not run: {e}"
+    return p.returncode, (p.stdout + p.stderr).strip()
+
+
+_DIMMED_RE = re.compile(r"glow_blobs: dimmed (\d+) of (\d+) lamps the original shows")
+
+
+def lamps_dimmed_check(run: Run, good: list[dict], reference: dict[str, dict] | None, ref_no_remix: bool) -> None:
+    """lights_lamps_dimmed (worker B's spec, glow_blobs.py 32a905d): the must-stay check for a change that removes
+    something. For each switch step between switch_base (on) and switch_base_again (on_again), a lamp the original
+    shows (the reference's y0_p0, the pose the switch steps share) is DIMMED when its Remix glow drops by more than
+    max(12, 3 x |on - on_again|). Limit 0 per change. Goggles switches are left out: the goggles replace the picture.
+    Only runs with that on / changed / on_again triplet can be measured, so NOT MEASURED is in SOFT_NM; the detail
+    says why (no triplet, no no-Remix reference, poses apart or a script error)."""
+    name, src, threshold = "lights_lamps_dimmed", "glow_blobs.py --dimmed: switch steps against switch_base, " \
+        "switch_base_again and the --reference (no Remix) y0_p0", "0 per change"
+    if reference is None or not ref_no_remix:
+        why = "no reference run given (--reference)" if reference is None else "the reference run is not a no-Remix run"
+        run.add(name, NOT_MEASURED, None, threshold, why, src)
+        return
+    jobs, missing = [], []
+    for s in good:
+        sw = {w["name"]: w for w in s["windows"] if w["kind"] == "switch" and w.get("frames")}
+        if "switch_base" not in sw or "switch_base_again" not in sw:
+            continue
+        ref = reference.get(s["name"])
+        if ref is None or not any(w["name"] == "y0_p0" and w.get("frames") for w in ref["windows"]):
+            missing.append(s["name"])
+            continue
+        for n, w in sw.items():
+            if n in ("switch_base", "switch_base_again") or (w.get("switch") or {}).get("goggles"):
+                continue
+            jobs.append((s["name"], s["_dir"], ref["_dir"], n))
+    if not jobs:
+        run.add(name, NOT_MEASURED, None, threshold,
+                "no spot with switch_base, a change and switch_base_again plus a reference y0_p0"
+                + (f" (no reference for {', '.join(missing)})" if missing else ""), src)
+        return
+    with concurrent.futures.ThreadPoolExecutor(4) as pool:
+        outs = list(pool.map(lambda j: glow_dimmed_stop(j[1], j[2], "switch_base", "y0_p0", j[3],
+                                                        "switch_base_again"), jobs))
+    rows, apart, errors = [], [], []
+    for (spot, _, _, ch), (code, out) in zip(jobs, outs):
+        m = _DIMMED_RE.search(out)
+        first = (out.splitlines()[0] if out else f"exit {code}").replace("glow_blobs: ", "")
+        if code == 2 and "NOT MEASURED" in out:
+            apart.append(f"{spot} {ch}: {first}")
+        elif code in (0, 1) and m:
+            rows.append((f"{spot} {ch}", int(m[1]), int(m[2])))
+        else:
+            errors.append(f"{spot} {ch}: exit {code}, {first}")
+    bad = [r for r in rows if r[1] > 0]
+    detail = (f"{len(bad)} of {len(rows)} changes dimmed a lamp the original shows: "
+              + "; ".join(f"{lab} {n} of {of}" for lab, n, of in rows)
+              + (f"; poses apart, not compared: {'; '.join(apart)}" if apart else "")
+              + (f"; glow_blobs.py errors: {'; '.join(errors)}" if errors else "")
+              + (f"; no reference for {', '.join(missing)}" if missing else ""))
+    if bad:
+        run.add(name, FAIL, sum(r[1] for r in bad), threshold, detail, src)
+    elif errors or apart or missing or not rows:
+        run.add(name, NOT_MEASURED, None, threshold, detail, src)
+    else:
+        run.add(name, PASS, 0, threshold, detail, src)
+
+
 def evaluate(folder: str, previous: str | None = None, reference: str | None = None) -> dict:
     run = Run(folder)
     if not run.manifest.get("spots"):
@@ -1714,6 +1794,7 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
     ref_manifest = os.path.join(reference, "manifest.json") if reference else None
     ref_no_remix = bool(ref_manifest and os.path.exists(ref_manifest) and load_json(ref_manifest).get("noRemix"))
     glow_checks(run, good, ref_spots, ref_no_remix)
+    lamps_dimmed_check(run, good, ref_spots, ref_no_remix)
     latency_contributors = build_latency_contributors(good, pick(SCENE))
 
     # inward-facing character triangles: two extra telemetry fields, judged per frame
