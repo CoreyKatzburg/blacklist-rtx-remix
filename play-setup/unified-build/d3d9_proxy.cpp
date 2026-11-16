@@ -20,6 +20,7 @@
 #include "draw_filter.h"
 #include "handoff_renderer.h"
 #include "lightpub.h"
+#include "present_tag.h"
 #include "proxy_diagnostics.h"
 #include "proxy_log.h"
 #include "proxy_types.h"
@@ -622,7 +623,8 @@ HRESULT WINAPI HookPresent(IDirect3DDevice9* self, const RECT* sourceRect,
     LARGE_INTEGER entry;
     QueryPerformanceCounter(&entry);
     if (proxy::IsHitchSamplerEnabled()) proxy::HitchSamplerFrame(entry.QuadPart);
-    const HRESULT result = hook->present(self, sourceRect, destRect, destWindow, dirtyRegion);
+    const HRESULT result = proxy::CallPresentTagged(
+        [&] { return hook->present(self, sourceRect, destRect, destWindow, dirtyRegion); });
     LARGE_INTEGER exit;
     QueryPerformanceCounter(&exit);
     if (proxy::IsFrameTraceEnabled()) {
