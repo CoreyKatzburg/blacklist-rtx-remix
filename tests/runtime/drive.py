@@ -868,7 +868,17 @@ class Spot:
         """Largest yaw or pitch distance, in degrees, of the game-memory poses from the stop's asked view."""
         return round(max(max(abs(gate.wrap(y - self.yaw)), abs(p - self.pitch)) for y, p in poses), 2)
 
-    def stop(self, name: str, outline: str | None = None) -> None:
+    def reference_stills(self) -> None:
+        """spot "referenceStills" [{name, yaw, pitch, frames}] (worker B, Nov 16): in a no-Remix run only, extra
+        stills at views the sweep does not visit, each `frames` screen frames long (30/s), e.g. 210 frames at the
+        con_bright_hall_keys view so the original game's block pulse can be compared over several pulse cycles."""
+        if not self.no_remix:
+            return
+        for v in self.spot.get("referenceStills", []):
+            self.move(f"to_{v['name']}", float(v["yaw"]), float(v["pitch"]), 0.5)
+            self.stop(v["name"], frames=int(v.get("frames", 20)))
+
+    def stop(self, name: str, outline: str | None = None, frames: int = 20) -> None:
         """One still stop. The camera direction is read from game memory before and after the capture; a stop more
         than OFF_POSE_DEG from the asked view is renamed <name>_offpose<n> (kind "off_pose", which no check
         reads), steered back and taken again, up to POSE_TRIES times (worker F2, Nov 16: 24 of 25 Paladin reference
@@ -892,7 +902,7 @@ class Spot:
             trace: list = []
             failed: list = []
             w = self.window(name, "still", lambda: (lambda r: (trace.extend(r[0]), failed.append(r[1])))(
-                                self.pose_trace(lambda: (self.capture(rel, 20), grab()))),
+                                self.pose_trace(lambda: (self.capture(rel, frames), grab()))),
                             frames=rel, frameSize=[CAP_W, CAP_H], **({"outline": outline} if outline else {}))
             w.update(got)
             w["gamePose"] = [before, self.rel_pose()]   # [yaw, pitch] from game memory at the start and end
@@ -1149,6 +1159,27 @@ class Spot:
                     w["logProof"] = proof
                 w["gamePose"] = [self.rel_pose()]
                 w["samMoved"] = self.sam_moved(f"switch_{name}")
+                # v["debugViews"] {"label": idx} (worker B's see-through probe, Nov 16): each Remix debug view in this
+                # step from a screen grab (final.pfm does not hold a debug view), then debugViewIdx 0 again.
+                if v.get("debugViews"):
+                    try:
+                        for label, idx in v["debugViews"].items():
+                            set_ini(self.ini, "RemixConfig", "rtx.debugView.debugViewIdx", str(idx))
+                            self.hold(3.0)
+                            tag = f"switch_{name}_{label}_screen"
+                            self.window(tag, "raster", lambda: None, debugViewIdx=idx,
+                                        **self._try_raster(tag, f"screen, Remix debug view {idx}, switch {name}"))
+                    finally:
+                        set_ini(self.ini, "RemixConfig", "rtx.debugView.debugViewIdx", "0")
+                        self.hold(3.0)
+                # v["usdCapture"]: the same-second draw dump and Remix USD capture at this pose, in this step only.
+                if v.get("usdCapture"):
+                    try:
+                        rec = self.usd_capture({"name": f"switch_{name}", "teleport": self.spot["teleport"]})
+                    except Exception as e:   # noqa: BLE001  (recorded; the other steps still count)
+                        rec = {"name": f"switch_{name}", "error": f"{type(e).__name__}: {e}"}
+                    print("CAPTURE", json.dumps(rec)[:2000], flush=True)
+                    w["capture"] = rec
             finally:
                 if v.get("goggles"):
                     tap(keys["toggle"])
@@ -1227,11 +1258,13 @@ class Spot:
         game hands the frame on (Remix and the bridge, or the plain driver), plus the screen grab's own delay."""
         w, h = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
         pw, ph = 480, 270
-        proc = subprocess.Popen([FFMPEG, "-v", "error", "-f", "gdigrab", "-framerate", "120", "-draw_mouse", "0",
+        grab_fps = 120
+        proc = subprocess.Popen([FFMPEG, "-v", "error", "-f", "gdigrab", "-framerate", str(grab_fps), "-draw_mouse", "0",
                                  "-offset_x", str(w // 4 - pw // 2), "-offset_y", str(h // 3 - ph // 2),
                                  "-video_size", f"{pw}x{ph}", "-i", "desktop", "-vf", "format=gray",
                                  "-f", "rawvideo", "-"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
         shots: collections.deque = collections.deque(maxlen=600)
+        arrivals = {"n": 0, "first": None, "last": None}   # the whole grab, since the deque keeps only the last 600
 
         def reader():
             size = pw * ph
@@ -1242,7 +1275,11 @@ class Spot:
                     if not chunk:
                         return
                     buf += chunk
-                shots.append((time.perf_counter() * 1000.0, np.frombuffer(buf, np.uint8).astype(np.int16)))
+                now = time.perf_counter() * 1000.0
+                shots.append((now, np.frombuffer(buf, np.uint8).astype(np.int16)))
+                arrivals["n"] += 1
+                arrivals["first"] = arrivals["first"] or now
+                arrivals["last"] = now
         threading.Thread(target=reader, daemon=True).start()
         counts = int(round(degrees * self.counts_per_deg_x))
         results, sign = [], 1
@@ -1257,10 +1294,18 @@ class Spot:
                 tq = time.perf_counter() * 1000.0
                 self.hold(0.3)
                 still = [img for t, img in list(shots) if t >= tq]
+                span_ms = time.perf_counter() * 1000.0 - tq
                 if len(still) < 3:
                     results.append({"error": "screen grab delivered under 10 shots a second"}); continue
                 if not any(img.any() for img in still):
                     results.append({"error": "screen grab is all black"}); continue
+                # More shots than gdigrab was asked for means it hands back the same picture again and again (monitors
+                # off, Nov 16 04:54 to 07:30: 5,700 to 7,000 shots a second, noise 0, 0 to 9 of 40 turns seen).
+                if len(still) > 2 * grab_fps * span_ms / 1000.0 + 2:
+                    different = 1 + sum(bool(np.any(a != b)) for a, b in zip(still, still[1:]))
+                    results.append({"error": f"screen grab repeats pictures (over {2 * grab_fps} shots a second, "
+                                             f"{grab_fps} asked)", "shots": len(still),
+                                    "spanMs": round(span_ms), "different": different}); continue
                 base = still[-1]
                 noise = max(float(np.abs(img - base).mean()) for img in still)
                 threshold = max(1.5, 3.0 * noise)
@@ -1273,8 +1318,8 @@ class Spot:
                                 "gameMs": round(turned - t0, 1) if turned else None,
                                 "noise": round(noise, 2), "threshold": round(threshold, 2)})
                 sign = -sign
-            span = list(shots)
-            fps = (len(span) - 1) * 1000.0 / (span[-1][0] - span[0][0]) if len(span) > 1 else 0.0
+            n, first, last = arrivals["n"], arrivals["first"], arrivals["last"]
+            fps = (n - 1) * 1000.0 / (last - first) if n > 1 and last > first else 0.0
         finally:
             proc.kill(); proc.wait()
         # Format agreed with worker A (gate.py input_latency_ms): samples_ms in turn order, only turns the screen showed;
@@ -1289,6 +1334,12 @@ class Spot:
         fail = {} if screen else {"error": "no turn showed on screen" + (
             ": " + "; ".join(f"{e} ({n} turns)" for e, n in errors.items()) if errors else
             f": none of {len(results)} turns changed the screen past the noise threshold")}
+        # A grab that ran faster than asked over the whole measurement repeated pictures somewhere, so even the turns
+        # it did see are not timed by real screen pictures: no screen samples at all (063147 con_bright_hall timed 9).
+        if screen and fps > 2 * grab_fps:
+            screen, after = [], []
+            fail = {"error": f"screen grab repeats pictures: {fps:.0f} shots a second over the whole measurement, "
+                             f"{grab_fps} asked; screen times not used"}
         return {"samples_ms": screen or None, **fail, "game_share_ms": med(game), "after_game_ms": med(after),
                 "method": f"{degrees:g} degree mouse turn at a still camera, alternating left/right until {trials} turns "
                           f"showed on screen (at most {2 * trials} turns); time "
@@ -1623,6 +1674,7 @@ def main() -> int:
                 s.sweep_and_pan()
                 if int(spot.get("goggleModes", 3)) and not a.no_remix:   # the goggle check compares ray tracing on/off
                     s.goggles()
+            s.reference_stills()
             if spot.get("lightSwitch"):
                 s.light_switch(spot["lightSwitch"])
             if spot.get("switchTest") and not a.no_remix and late:

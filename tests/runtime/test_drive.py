@@ -187,6 +187,38 @@ class Steering(unittest.TestCase):
         self.assertEqual((kept["poseTries"], kept["offPose"], kept["poseTraceEmpty"], kept["poseTraceFailedReads"]),
                          (3, True, True, 12))
 
+    def test_reference_stills_run_only_without_remix_at_their_own_length(self):
+        # Worker B, Nov 16: a 210-frame original-game still at the con_bright_hall_keys view (block pulse needs more
+        # than one 52-56 frame cycle; the reference stills were 20 frames).
+        def run(no_remix):
+            s = drive.Spot.__new__(drive.Spot)
+            s.yaw, s.pitch, s.no_remix, s.windows = 0.0, 0.0, no_remix, []
+            s.spot = {"referenceStills": [{"name": "keys_y90_p5", "yaw": 90, "pitch": 5, "frames": 210},
+                                          {"name": "plain", "yaw": -45, "pitch": 0}]}
+            s.counters = lambda: {"telemetry": 0, "proxy": 0}
+            s.save_partial = lambda: None
+            moves, caps = [], []
+
+            def move(name, yaw, pitch, seconds):
+                moves.append((name, yaw, pitch)); s.yaw, s.pitch = yaw, pitch
+            s.move = move
+            s.rel_pose = lambda: [s.yaw, s.pitch]
+            s.pose_trace = lambda body: (body(), ([[s.yaw, s.pitch]], 0))[1]
+            s.snap_pose = lambda: 0
+            s.hold = lambda seconds, until=None: None
+            s.steady = lambda: 0.0
+            s.capture = lambda rel, frames: caps.append((rel, frames))
+            s._try_raster = lambda name, how: {}
+            s.dump = lambda tag: None
+            s.sam_moved = lambda name: 0.0
+            s.reference_stills()
+            return s, moves, caps
+        s, moves, caps = run(True)
+        self.assertEqual(moves, [("to_keys_y90_p5", 90.0, 5.0), ("to_plain", -45.0, 0.0)])
+        self.assertEqual(caps, [("frames/keys_y90_p5.gray", 210), ("frames/plain.gray", 20)])
+        self.assertEqual([w["name"] for w in s.windows if w["kind"] == "still"], ["keys_y90_p5", "plain"])
+        self.assertEqual(run(False)[1:], ([], []))   # a Remix run of the same spot is unchanged
+
     def test_stop_waits_out_a_stall_before_capturing(self):
         # Paladin, Nov 15: frames of 0.5 to 1.6 s for several seconds after the full turn.
         s = self.run_with(22, 7.0, -9.0, 7.0, -9.0)
@@ -409,6 +441,56 @@ class Reference(unittest.TestCase):
         order.clear()
         s.bench({"settle": 0, "frames": 1})
         self.assertNotIn("light_switch", [o[0] for o in order if isinstance(o, tuple)])
+
+    def test_switch_steps_take_their_own_debug_views_and_capture(self):
+        # Worker B's see-through probe: every step grabs its debug views after its still, the view is 0 again before
+        # the next step (even when a grab fails), and only the step that asks for it takes the USD capture.
+        import os, tempfile
+        views = {"opaque": 5, "direct": 100}
+        steps = [{"name": "on", "debugViews": views},
+                 {"name": "off", "ini": [["Lights", "FlareStandIns", "0"]], "debugViews": views},
+                 {"name": "on_again", "debugViews": views, "usdCapture": True}]
+        for fail in (False, True):
+            with tempfile.TemporaryDirectory() as tmp:
+                s = drive.Spot.__new__(drive.Spot)
+                order, idx = [], ["0"]
+                s.spot = {"name": "con_bright_hall", "teleport": {"location": [1, 2, 3], "yaw": -90}, "switches": steps}
+                s.out, s.ini = tmp, os.path.join(tmp, "d3d9_proxy.ini")
+                with open(s.ini, "w") as fh:
+                    fh.write("[Proxy]\n")
+                s.a = mock.Mock(pid=1)
+                s.log = mock.Mock(new_text=lambda: "")
+                s.move = s.hold = lambda *a, **k: None
+                s.light_dump = lambda dest: None
+                s.rel_pose = lambda: [0.0, 0.0]
+                s.sam_moved = lambda tag: False
+                s._try_raster = lambda tag, label: {}
+                s.usd_capture = lambda c: order.append(("usd", c["name"])) or {"name": c["name"]}
+
+                def window(name, kind, body, **k):
+                    if fail and name == "switch_off_direct_screen":
+                        raise RuntimeError("grab failed")
+                    order.append((name, idx[0]) if name.endswith("_screen") else name)
+                    return {}
+
+                def set_ini(path, section, key, value):
+                    if key == "rtx.debugView.debugViewIdx":
+                        idx[0] = value
+                s.window = window
+                with mock.patch.object(drive, "set_ini", set_ini):
+                    if fail:
+                        with self.assertRaisesRegex(RuntimeError, "grab failed"):
+                            s.switch_test()
+                    else:
+                        s.switch_test()
+                self.assertEqual(idx[0], "0")
+                if fail:
+                    continue
+                self.assertEqual(order, [
+                    "switch_on", ("switch_on_opaque_screen", "5"), ("switch_on_direct_screen", "100"),
+                    "switch_off", ("switch_off_opaque_screen", "5"), ("switch_off_direct_screen", "100"),
+                    "switch_on_again", ("switch_on_again_opaque_screen", "5"), ("switch_on_again_direct_screen", "100"),
+                    ("usd", "switch_on_again")])
 
     def test_bench_extra_stops_debug_views_targets_then_capture(self):
         # Worker E2's rtx.captureAllInstances run: every variant measures the same windows in the same order, and
@@ -687,6 +769,53 @@ class Reference(unittest.TestCase):
             self.assertIn("all black" if name == "black" else "under 10 shots", r["error"], name)
             self.assertEqual(len(r["trials"]), 3, name)   # gives up after three dead turns, not forty
             self.assertIsNone(gate.spot_mouse_lag({"mouse_lag": r}))
+
+    def _lag_with_fake_grab(self, burst):
+        """mouse_lag on a fake gdigrab: ~100 real pictures a second, and the picture changes when the mouse turns.
+        `burst`: when the fake hands back the same picture thousands of times a second ("always", "after_turn")."""
+        state = {"turned": 0, "fast": False}
+
+        class Out:
+            def read(self, n):
+                time.sleep(0.0002 if burst == "always" or state["fast"] else 0.01)
+                return bytes([40 + 100 * (state["turned"] % 2)]) * n
+
+        def turn(dx, dy):
+            state["turned"] += 1
+            state["fast"] = burst == "after_turn"
+
+        def hold(seconds, until=None):
+            if seconds == 0.5:          # the start of the next turn: the still window runs at the normal rate again
+                state["fast"] = False
+            time.sleep(min(seconds, 0.05))
+        s = drive.Spot.__new__(drive.Spot)
+        s.counts_per_deg_x, s.proxy, s.hold = 10.0, mock.Mock(path=None), hold
+        with mock.patch.object(drive.subprocess, "Popen", lambda *a, **k: mock.Mock(stdout=Out())), \
+                mock.patch.object(drive, "mouse_move_rel", turn):
+            return s.mouse_lag()
+
+    def test_a_grab_that_repeats_pictures_is_an_error_not_a_lag(self):
+        # Nov 16 04:54 to 07:30 (monitors off): gdigrab gave 5,700 to 7,000 shots a second of one picture (noise 0),
+        # saw 0 to 9 of 40 turns, and the 9 it saw (063147 con_bright_hall) were timed as lag.
+        ok = self._lag_with_fake_grab(None)
+        self.assertNotIn("error", ok)
+        self.assertEqual(len(ok["samples_ms"]), 20)
+        self.assertLess(ok["captureFps"], 240)
+        self.assertIsNotNone(gate.spot_mouse_lag({"mouse_lag": ok}))
+
+        always = self._lag_with_fake_grab("always")
+        self.assertIsNone(always["samples_ms"])
+        self.assertIn("screen grab repeats pictures", always["error"])
+        self.assertEqual(len(always["trials"]), 3)        # gives up after three, like a dead grab
+        self.assertEqual(always["trials"][0]["different"], 1)
+
+        # the still windows look normal, but the grab floods after each turn: the turns it timed are not used
+        late = self._lag_with_fake_grab("after_turn")
+        self.assertTrue(all("error" not in t for t in late["trials"]))
+        self.assertGreater(late["captureFps"], 240)
+        self.assertIsNone(late["samples_ms"])
+        self.assertIn("over the whole measurement", late["error"])
+        self.assertIsNone(gate.spot_mouse_lag({"mouse_lag": late}))
 
     def test_renderer_must_match_the_run(self):
         log = ("2026-11-15 21:42:24.180 [pid 25472] chained RTX Remix DLL: D:\\Steam\\x\\SYSTEM\\d3d9_remix.dll\r\n"
