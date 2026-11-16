@@ -253,6 +253,8 @@ def average_grabs(raw: bytes, w: int, h: int, n: int) -> tuple[np.ndarray, list[
     if len(raw) < n * size:
         raise RuntimeError(f"screen grab returned {len(raw) // size} of {n} frames of {w}x{h}")
     frames = np.frombuffer(raw, np.uint8, n * size).reshape(n, h, w, 3)
+    if not frames.any():   # no-Remix reference runs of Nov 16 04:58-06:22: every grab was black and nothing said so
+        raise RuntimeError(f"screen grab is all black ({n} frames of {w}x{h}): the game picture did not reach the desktop")
     acc = np.zeros((h, w, 3), np.float32)   # exact: at most 10 * 255 per pixel
     lumas = []
     for f in frames:
@@ -569,12 +571,17 @@ class Spot:
                 time.sleep(0.008)
         self.window(name, "move", body)
     def capture(self, rel: str, frames: int) -> None:
-        proc = start_capture(os.path.join(self.out, rel), frames)
+        path = os.path.join(self.out, rel)
+        proc = start_capture(path, frames)
         try:
             self.hold(frames / 30.0 + 10.0, until=lambda: proc.poll() is not None)
         finally:
             if proc.poll() is None:
                 proc.kill(); proc.wait()
+        # Ends the spot: a black screen makes every later stop worthless (no-Remix reference runs of Nov 16
+        # 04:58-06:22 captured 1.5 hours of black frames and reported the stops as good).
+        if os.path.exists(path) and os.path.getsize(path) and not np.fromfile(path, np.uint8).any():
+            raise RuntimeError(f"screen capture {rel} is all black: the game picture did not reach the desktop grab")
 
     def dump(self, tag: str) -> None:
         """Asks the proxy (and through it Remix) for this frame's depth/colour dumps; copies what arrives."""
@@ -1038,12 +1045,16 @@ class Spot:
             # Until `trials` turns showed on screen (gate.py needs 20 samples), at most 2x trials turns: in the Paladin
             # its moving screens hid 9 of 20 turns in the noise (no-Remix reference, Nov 16).
             while sum(r.get("screenMs") is not None for r in results) < trials and len(results) < 2 * trials:
+                if len(results) >= 3 and all("error" in r for r in results[-3:]):
+                    break   # three turns in a row without a usable screen: the grab is broken, not the turn
                 self.hold(0.5)
                 tq = time.perf_counter() * 1000.0
                 self.hold(0.3)
                 still = [img for t, img in list(shots) if t >= tq]
                 if len(still) < 3:
                     results.append({"error": "screen grab delivered under 10 shots a second"}); continue
+                if not any(img.any() for img in still):
+                    results.append({"error": "screen grab is all black"}); continue
                 base = still[-1]
                 noise = max(float(np.abs(img - base).mean()) for img in still)
                 threshold = max(1.5, 3.0 * noise)
@@ -1066,7 +1077,13 @@ class Spot:
         game = [r["gameMs"] for r in results if r.get("gameMs") is not None]
         after = [r["screenMs"] - r["gameMs"] for r in results if r.get("screenMs") is not None and r.get("gameMs") is not None]
         med = lambda v: round(float(np.median(v)), 1) if v else None
-        return {"samples_ms": screen, "game_share_ms": med(game), "after_game_ms": med(after),
+        # No turn on screen is an error, not an empty list (no-Remix reference, Nov 16: black grabs gave
+        # samples_ms [] and nothing else said the screen part was never measured).
+        errors = collections.Counter(r["error"] for r in results if "error" in r)
+        fail = {} if screen else {"error": "no turn showed on screen" + (
+            ": " + "; ".join(f"{e} ({n} turns)" for e, n in errors.items()) if errors else
+            f": none of {len(results)} turns changed the screen past the noise threshold")}
+        return {"samples_ms": screen or None, **fail, "game_share_ms": med(game), "after_game_ms": med(after),
                 "method": f"{degrees:g} degree mouse turn at a still camera, alternating left/right until {trials} turns "
                           f"showed on screen (at most {2 * trials} turns); time "
                           "from SendInput to the first gdigrab shot (480x270 patch, ~120/s, arrival-stamped with "

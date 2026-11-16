@@ -371,6 +371,49 @@ class Reference(unittest.TestCase):
         self.assertEqual((min(lumas), max(lumas)), (0.502, 1.0))
         with self.assertRaisesRegex(RuntimeError, "3 of 4 frames"):
             drive.average_grabs(raw[: 3 * w * h * 3], w, h, 4)
+        # Nov 16 04:58-06:22: every no-Remix grab was black and the raster was written as a picture
+        with self.assertRaisesRegex(RuntimeError, "all black"):
+            drive.average_grabs(bytes(len(raw)), w, h, 4)
+        drive.average_grabs(bytes(len(raw) - 1) + b"\x01", w, h, 4)   # one grey level in one pixel is a picture
+
+    def test_a_black_still_capture_ends_the_spot(self):
+        import os, tempfile
+        s = drive.Spot.__new__(drive.Spot)
+        s.hold = lambda seconds, until=None: None
+        with tempfile.TemporaryDirectory() as tmp:
+            s.out = tmp
+
+            def fake_capture(content):
+                def start(path, frames):
+                    with open(path, "wb") as fh:
+                        fh.write(content)
+                    return mock.Mock(poll=lambda: 0)
+                return start
+            with mock.patch.object(drive, "start_capture", fake_capture(bytes(57600 * 20))):
+                with self.assertRaisesRegex(RuntimeError, "all black"):
+                    s.capture("black.gray", 20)
+            with mock.patch.object(drive, "start_capture", fake_capture(bytes(57600 * 20 - 1) + b"\x07")):
+                s.capture("dark.gray", 20)   # a nearly black room is still a picture
+
+    def test_a_dead_or_black_screen_read_is_an_error_not_an_empty_list(self):
+        # No-Remix reference, Nov 16: every shot was black, so samples_ms was [] with noise 0 and no error.
+        for name, chunk in (("black", lambda n: bytes(n)), ("dead", lambda n: b"")):
+            class Out:
+                def read(self, n):
+                    time.sleep(0.002)
+                    return chunk(n)
+            proc = mock.Mock(stdout=Out())
+            s = drive.Spot.__new__(drive.Spot)
+            s.counts_per_deg_x, s.proxy = 10.0, mock.Mock(path=None)
+            s.hold = lambda seconds, until=None: time.sleep(min(seconds, 0.05))
+            with mock.patch.object(drive.subprocess, "Popen", lambda *a, **k: proc), \
+                    mock.patch.object(drive, "mouse_move_rel", lambda dx, dy: None):
+                r = s.mouse_lag()
+            self.assertIsNone(r["samples_ms"], name)
+            self.assertIn("no turn showed on screen", r.get("error", ""), name)
+            self.assertIn("all black" if name == "black" else "under 10 shots", r["error"], name)
+            self.assertEqual(len(r["trials"]), 3, name)   # gives up after three dead turns, not forty
+            self.assertIsNone(gate.spot_mouse_lag({"mouse_lag": r}))
 
     def test_renderer_must_match_the_run(self):
         log = ("2026-11-15 21:42:24.180 [pid 25472] chained RTX Remix DLL: D:\\Steam\\x\\SYSTEM\\d3d9_remix.dll\r\n"
