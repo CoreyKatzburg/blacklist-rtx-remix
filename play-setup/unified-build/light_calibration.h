@@ -380,5 +380,86 @@ private:
     size_t count_ = 0;
 };
 
+// ---- Change trace (lightpub_trace.csv, on with [Proxy] EnableDebuggingTelemetry) ---------------------------------
+// One event per change of a published light, so a run can show whether a light the game switches off steps to zero,
+// ramps down, or keeps publishing. Brightness is the game's peak colour x intensity. It counts as changed when it
+// moves more than kTraceRelativeStep from the last value written, so a slow ramp shows as a series of events.
+constexpr float kTraceRelativeStep = 0.05f;
+
+enum class TraceChange { Started, Brightness, Flags, Stopped };
+
+inline const char* TraceChangeName(TraceChange c) {
+    switch (c) {
+    case TraceChange::Started: return "started";
+    case TraceChange::Brightness: return "brightness";
+    case TraceChange::Flags: return "flags";
+    default: return "stopped";
+    }
+}
+
+struct TraceEvent {
+    uintptr_t node;
+    TraceChange change;
+    float oldBrightness, newBrightness;
+    uint32_t oldFlags, newFlags;
+};
+
+template <size_t MaxTracked>
+class LightChangeTrace {
+public:
+    // Call for every light published this frame.
+    template <typename EmitFn>
+    void See(uintptr_t node, float brightness, uint32_t flags, uint32_t frame, EmitFn&& emit) {
+        Entry* e = Find(node);
+        if (!e) {
+            if (count_ == MaxTracked) return;
+            e = &entries_[count_++];
+            *e = {node, brightness, flags, frame};
+            emit(TraceEvent{node, TraceChange::Started, 0.0f, brightness, 0u, flags});
+            return;
+        }
+        e->lastSeen = frame;
+        if (flags != e->flags) {
+            emit(TraceEvent{node, TraceChange::Flags, e->brightness, e->brightness, e->flags, flags});
+            e->flags = flags;
+        }
+        if (std::fabs(brightness - e->brightness) > kTraceRelativeStep * std::max(e->brightness, 1e-4f)) {
+            emit(TraceEvent{node, TraceChange::Brightness, e->brightness, brightness, flags, flags});
+            e->brightness = brightness;
+        }
+    }
+
+    // Call once per frame after See: every light not published this frame stopped.
+    template <typename EmitFn>
+    void Sweep(uint32_t frame, EmitFn&& emit) {
+        for (size_t i = 0; i < count_;) {
+            if (entries_[i].lastSeen != frame) {
+                const Entry& e = entries_[i];
+                emit(TraceEvent{e.node, TraceChange::Stopped, e.brightness, 0.0f, e.flags, e.flags});
+                entries_[i] = entries_[--count_];
+            } else {
+                ++i;
+            }
+        }
+    }
+
+    void Clear() { count_ = 0; }
+
+private:
+    struct Entry {
+        uintptr_t node;
+        float brightness;
+        uint32_t flags;
+        uint32_t lastSeen;
+    };
+    Entry* Find(uintptr_t node) {
+        for (size_t i = 0; i < count_; ++i)
+            if (entries_[i].node == node) return &entries_[i];
+        return nullptr;
+    }
+    Entry entries_[MaxTracked] = {};
+    size_t count_ = 0;
+};
+
 
 }  // namespace lightcal
