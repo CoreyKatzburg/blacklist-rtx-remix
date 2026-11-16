@@ -190,11 +190,18 @@ class Steering(unittest.TestCase):
     def test_reference_stills_run_only_without_remix_at_their_own_length(self):
         # Worker B, Nov 16: a 210-frame original-game still at the con_bright_hall_keys view (block pulse needs more
         # than one 52-56 frame cycle; the reference stills were 20 frames).
-        def run(no_remix):
+        def run(no_remix, extra=(), blocked=()):
             s = drive.Spot.__new__(drive.Spot)
             s.yaw, s.pitch, s.no_remix, s.windows = 0.0, 0.0, no_remix, []
-            s.spot = {"referenceStills": [{"name": "keys_y90_p5", "yaw": 90, "pitch": 5, "frames": 210},
-                                          {"name": "plain", "yaw": -45, "pitch": 0}]}
+            s.spot = {"teleport": {"yaw": -90}, "referenceStills": [
+                {"name": "keys_y90_p5", "yaw": 90, "pitch": 5, "frames": 210}, *extra,
+                {"name": "plain", "yaw": -45, "pitch": 0}]}
+
+            def teleport(tp):
+                if tp in blocked:
+                    raise RuntimeError("teleport did not hold")
+                moves.append(("at", tp["yaw"])); return {}
+            s.teleport = teleport
             s.counters = lambda: {"telemetry": 0, "proxy": 0}
             s.save_partial = lambda: None
             moves, caps = [], []
@@ -218,6 +225,17 @@ class Steering(unittest.TestCase):
         self.assertEqual(caps, [("frames/keys_y90_p5.gray", 210), ("frames/plain.gray", 20)])
         self.assertEqual([w["name"] for w in s.windows if w["kind"] == "still"], ["keys_y90_p5", "plain"])
         self.assertEqual(run(False)[1:], ([], []))   # a Remix run of the same spot is unchanged
+        # Worker B's lamp pose A: a still with its own teleport (fallback when blocked), then back to the spawn for
+        # the next still; a pose whose teleports all fail is skipped and the next still is still at the spawn.
+        lamps = {"name": "lampsA", "teleport": {"yaw": 170}, "fallback": {"yaw": 175}, "yaw": 0, "pitch": 30,
+                 "frames": 60}
+        for blocked, at in (((), [("at", 170)]), (({"yaw": 170},), [("at", 175)]), (({"yaw": 170}, {"yaw": 175}), [])):
+            s, moves, caps = run(True, [lamps], blocked)
+            self.assertEqual(moves, [("to_keys_y90_p5", 90.0, 5.0)] + at + ([("to_lampsA", 0.0, 30.0)] if at else [])
+                             + [("at", -90), ("to_plain", -45.0, 0.0)], blocked)
+            self.assertEqual([c[1] for c in caps], [210, 60, 20] if at else [210, 20])
+            tp = [w for w in s.windows if w["name"] == "lampsA_teleport"][0]
+            self.assertEqual(tp.get("fallback"), {0: False, 1: True}.get(len(blocked)))
 
     def test_stop_waits_out_a_stall_before_capturing(self):
         # Paladin, Nov 15: frames of 0.5 to 1.6 s for several seconds after the full turn.
@@ -441,6 +459,81 @@ class Reference(unittest.TestCase):
         order.clear()
         s.bench({"settle": 0, "frames": 1})
         self.assertNotIn("light_switch", [o[0] for o in order if isinstance(o, tuple)])
+
+    def test_live_steps_set_the_display_state_and_wake_it_at_the_end(self):
+        # Coordinator, Nov 16: idle GPU power follows the display state; the proof is live steps at one held pose,
+        # awake / asleep / awake / asleep / awake, with no input sent while a step holds. Each step records what
+        # Windows reported before and after its hold; a launch that fails while asleep still wakes the displays.
+        for fail_at in (None, 2):
+            s = drive.Spot.__new__(drive.Spot)
+            s.ini, s.windows, calls = "x.ini", [], []
+            s.move = lambda *a: None
+            s.bench_window = lambda *a: None
+            s.dump = lambda tag: None
+            s.counters = lambda: {"telemetry": 0, "proxy": 0}
+            s.yaw = s.pitch = 0.0
+
+            def hold(seconds, until=None):
+                calls.append(("hold", seconds))
+                if fail_at and sum(c[0] == "hold" for c in calls) == fail_at + 1:
+                    raise RuntimeError("game gone")
+            s.hold = hold
+            fake = {"now": "on"}
+
+            def wake():
+                calls.append("wake"); fake["now"] = "on"; return {"asked": "awake", "display": "on"}
+
+            def sleep():
+                calls.append("sleep"); fake["now"] = "off"; return {"asked": "asleep", "display": "off"}
+            steps = [{"display": d} for d in ("awake", "asleep", "awake", "asleep", "awake")]
+            with mock.patch.object(drive.display, "wake", wake), mock.patch.object(drive.display, "sleep", sleep), \
+                    mock.patch.object(drive.display, "state", lambda: fake["now"]), \
+                    mock.patch.object(drive.display, "idle_seconds", lambda: 1.0), \
+                    mock.patch.object(drive, "set_ini", lambda *a: calls.append(("ini",) + a)):
+                if fail_at:
+                    with self.assertRaises(RuntimeError):
+                        s.bench({"settle": 0, "frames": 1, "liveSteps": steps, "liveStepSeconds": 45})
+                    self.assertEqual(calls[-1], "wake")   # woken after the failure in the second (asleep) step
+                    continue
+                s.bench({"settle": 0, "frames": 1, "liveSteps": steps, "liveStepSeconds": 45})
+            live = [w for w in s.windows if w["name"].startswith("live_step")]
+            self.assertEqual([(w["display"]["asked"], w["display"]["display"], w["display"]["after"]) for w in live],
+                             [("awake", "on", "on"), ("asleep", "off", "off")] * 2 + [("awake", "on", "on")])
+            self.assertEqual([w["liveRtx"] for w in live], [{}] * 5)   # "display" is not written to the ini
+            self.assertNotIn("ini", [c[0] for c in calls if isinstance(c, tuple)])
+            self.assertEqual([c for c in calls if c in ("wake", "sleep") or c == ("hold", 45.0)],
+                             ["wake", ("hold", 45.0), "sleep", ("hold", 45.0)] * 2 + ["wake", ("hold", 45.0), "wake"])
+
+    def test_switch_poses_run_before_the_spot_switches_and_return_sam(self):
+        # Worker B's must-stay lamp poses: the same on / off / on_again steps at two more poses in the probe launch,
+        # Sam still within each; pose A's wall may push Sam, so its fallback is tried; a pose whose teleports all
+        # fail is skipped (NOT MEASURED); Sam is back at the spot's teleport before the spot's own switches.
+        spawn, a, a2 = {"location": [0, 0, 0], "yaw": -90}, {"location": [1, 0, 0], "yaw": 170}, {"location": [2, 0, 0], "yaw": 175}
+        steps = [{"name": "on"}, {"name": "off", "ini": [["Lights", "FlareStandIns", "0"]]}, {"name": "on_again"}]
+        for blocked in ([], [a], [a, a2]):
+            s = drive.Spot.__new__(drive.Spot)
+            s.spot, order = {"name": "con_bright_hall", "teleport": spawn}, []
+            s.move = s.hold = lambda *a, **k: None
+            s.bench_window = lambda name, *a: None
+            s.window = lambda name, kind, body, **k: order.append((name, k.get("fallback"))) if kind == "teleport" else None
+
+            def teleport(tp):
+                if tp in blocked:
+                    raise RuntimeError("teleport did not hold")
+                order.append(("at", tp["yaw"])); return {}
+            s.teleport = teleport
+            s.switch_test = lambda: order.append((s.spot.get("switchView"), s.spot.get("switchFrames"),
+                                                  [v["name"] for v in s.spot["switches"]]))
+            s.bench({"settle": 0, "frames": 1, "switches": steps, "switchPoses": [
+                {"name": "lampsA", "teleport": a, "fallback": a2, "view": [0, 30], "frames": 60, "switches": steps},
+                {"name": "lampsB", "view": [225, 0], "frames": 60, "switches": steps}]})
+            poseA = ([("at", 170), ("lampsA_teleport", False)] if not blocked else
+                     [("at", 175), ("lampsA_teleport", True)] if len(blocked) == 1 else [("lampsA_teleport", None)])
+            if len(blocked) < 2:
+                poseA.append(([0, 30], 60, ["lampsA_on", "lampsA_off", "lampsA_on_again"]))
+            self.assertEqual(order, poseA + [
+                ("at", -90), ("lampsB_teleport", False), ([225, 0], 60, ["lampsB_on", "lampsB_off", "lampsB_on_again"]),
+                ("at", -90), (None, None, ["on", "off", "on_again"])], blocked)
 
     def test_switch_steps_take_their_own_debug_views_and_capture(self):
         # Worker B's see-through probe: every step grabs its debug views after its still, the view is 0 again before

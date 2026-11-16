@@ -30,6 +30,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import blmem  # noqa: E402
 import gate  # noqa: E402  (file helpers)
+import display  # noqa: E402  (display power state)
 
 FFMPEG = r"d:\ffmpeg\bin\ffmpeg.exe"
 CAP_W, CAP_H = 320, 180
@@ -874,9 +875,37 @@ class Spot:
         con_bright_hall_keys view so the original game's block pulse can be compared over several pulse cycles."""
         if not self.no_remix:
             return
+        moved = False
         for v in self.spot.get("referenceStills", []):
+            # v["teleport"] (worker B's must-stay lamp poses, Nov 16): Sam stands elsewhere for this still; yaw and
+            # pitch are then relative to the teleport's yaw. Sam goes back to the spot's teleport afterwards.
+            if v.get("teleport"):
+                moved = True
+                if not self.pose_teleport(v, self.spot["teleport"]):
+                    continue
+            elif moved:
+                self.teleport(self.spot["teleport"]); moved = False
             self.move(f"to_{v['name']}", float(v["yaw"]), float(v["pitch"]), 0.5)
             self.stop(v["name"], frames=int(v.get("frames", 20)))
+        if moved:
+            self.teleport(self.spot["teleport"])
+
+    def pose_teleport(self, p: dict, default: dict) -> bool:
+        """Teleports Sam for an extra pose p {"name", "teleport", "fallback"}: p["teleport"] (else `default`), then
+        p["fallback"] when that does not hold (worker B: pose A's nearest wall is 29 cm from Sam). Records the window
+        <name>_teleport; False when no teleport held, so the pose is skipped and NOT MEASURED."""
+        tries = [p.get("teleport", default)] + ([p["fallback"]] if p.get("fallback") else [])
+        errors = []
+        for i, tp in enumerate(tries):
+            try:
+                self.window(f"{p['name']}_teleport", "teleport", lambda: None, teleport=self.teleport(tp),
+                            fallback=bool(i), errors=errors)
+                return True
+            except RuntimeError as e:
+                errors.append(str(e))
+        self.window(f"{p['name']}_teleport", "teleport", lambda: None, errors=errors)
+        print(f"POSE SKIPPED {p['name']}: {errors}", flush=True)
+        return False
 
     def stop(self, name: str, outline: str | None = None, frames: int = 20) -> None:
         """One still stop. The camera direction is read from game memory before and after the capture; a stop more
@@ -1068,19 +1097,55 @@ class Spot:
         if cfg.get("liveSteps"):
             self.move("to_live", 0.0, 0.0, 1.0)
             seconds = float(cfg.get("liveStepSeconds", 60))
-            for i, keys in enumerate(cfg["liveSteps"]):
-                for k, v in keys.items():
-                    set_ini(self.ini, "RemixConfig", k, str(v))
-                self.window(f"live_step{i + 1}", "still", lambda: self.hold(seconds), liveRtx=keys)
-                # cfg["liveStepDump"] (worker C, Nov 16, picture cost at one held pose): final and game depth at the
-                # end of each step, as y0_p0 dumps them, so picture_cost.py can compare steps of one launch.
-                if cfg.get("liveStepDump"):
-                    tag = f"live_step{i + 1}"
-                    self.window(f"{tag}_dump", "dump", lambda: self.dump(tag), dump=tag)
+            slept = False
+            try:
+                for i, keys in enumerate(cfg["liveSteps"]):
+                    # "display": "awake" / "asleep" (coordinator, Nov 16: idle GPU power follows the display state): the
+                    # displays are woken by a 0-count mouse move or put to sleep (SC_MONITORPOWER 2) before the step,
+                    # and nothing sends input while it holds. Windows' display state is read before and after the hold.
+                    keys = dict(keys)
+                    want = keys.pop("display", None)
+                    for k, v in keys.items():
+                        set_ini(self.ini, "RemixConfig", k, str(v))
+                    shown = display.wake() if want == "awake" else display.sleep() if want == "asleep" else None
+                    slept = slept or want == "asleep"
+                    w = self.window(f"live_step{i + 1}", "still", lambda: self.hold(seconds), liveRtx=keys)
+                    if shown:
+                        w["display"] = {**shown, "after": display.state(), "idleSecondsAfter": display.idle_seconds()}
+                        print(f"live_step{i + 1}: display asked {want}, {shown['display']} at the start, "
+                              f"{w['display']['after']} at the end", flush=True)
+                    # cfg["liveStepDump"] (worker C, Nov 16, picture cost at one held pose): final and game depth at
+                    # the end of each step, as y0_p0 dumps them, so picture_cost.py can compare steps of one launch.
+                    if cfg.get("liveStepDump"):
+                        tag = f"live_step{i + 1}"
+                        self.window(f"{tag}_dump", "dump", lambda: self.dump(tag), dump=tag)
+            finally:
+                if slept:
+                    display.wake()
         # cfg["lightSwitch"] (worker B, Nov 16, fog fade sweep at con_custodial): after the lit-room bench window, the
         # light switch with its light dumps, so each variant launch also measures the fade (frames/light_switch.gray).
         if cfg.get("lightSwitch"):
             self.light_switch(cfg["lightSwitch"])
+        # cfg["switchPoses"] (worker B's must-stay lamp poses, Nov 16): before the switches at the spot's own pose, the
+        # same kind of switch steps at other poses, Sam standing still within each pose: [{"name", "teleport"
+        # (optional; else the spot's), "view" [yaw, pitch] relative to the teleport's yaw, "frames", "switches"}].
+        # Window names are switch_<pose>_<step>. A pose whose teleport does not hold is recorded and skipped.
+        # Sam goes back to the spot's teleport afterwards, so the switches below are at the same pose as without this.
+        if cfg.get("switchPoses"):
+            base = self.spot
+            try:
+                for p in cfg["switchPoses"]:
+                    if not self.pose_teleport(p, base["teleport"]):
+                        continue
+                    self.hold(settle)
+                    self.spot = {**base, "switchView": p.get("view", [0.0, 0.0]),
+                                 "switchFrames": int(p.get("frames", 30)),
+                                 "switches": [{**v, "name": f"{p['name']}_{v['name']}"} for v in p["switches"]]}
+                    self.switch_test()
+            finally:
+                self.spot = base
+            self.teleport(base["teleport"])
+            self.hold(settle)
         # cfg["switches"] (worker B, Nov 16): switch steps at the same stop once the fade has settled
         # (switchesAfter more seconds), in the one variant launch that lists them.
         if cfg.get("switches"):

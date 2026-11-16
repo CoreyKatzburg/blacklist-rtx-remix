@@ -1,0 +1,10 @@
+{
+ "about": "Coordinator, Nov 16 16:41: idle GPU power follows whether the displays are awake (77.4 W asleep, 81.5 W awake), the same step as worker C's 35 against 42 ms launches. One con_custodial launch on the staged build, holding y0_p0 after the bench window: live steps awake, asleep, awake, asleep, awake, 45 s each. 'asleep' is SC_MONITORPOWER 2 and nothing sends input during the step; 'awake' is a +1 then -1 count mouse move. Each live_stepN window records Windows' display state before and after its hold (window 'display'); frame time from proxy_frames.csv and GPU time from telemetry over the window's ranges. If frame time follows the display state both ways, the display explains the 35 against 42 ms split.",
+ "spot": "con_custodial",
+ "bench": {"settle": 5, "frames": 150},
+ "variants": [
+  {"name": "01_display_awake_asleep",
+   "bench": {"liveSteps": [{"display": "awake"}, {"display": "asleep"}, {"display": "awake"}, {"display": "asleep"}, {"display": "awake"}],
+             "liveStepSeconds": 45}}
+ ]
+}

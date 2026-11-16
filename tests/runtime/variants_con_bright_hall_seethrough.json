@@ -5,6 +5,20 @@
     "settle": 5,
     "frames": 30,
     "switchesAfter": 0,
+    "switchPosesWhy": "Worker B's must-stay lamp poses (Nov 16): the west-room ceiling lamps 276B3128, 276B1870, 2E9263E0, 2E9264E0. Before the probe steps, on / off / on_again 60-frame stills with gate depth and a light dump each, Sam standing still: lampsA from Sam at (-11300,-700,-493) yaw 170, pitch 30 (fallback (-11280,-760,-493) yaw 175 when the teleport does not hold), lampsB at the spawn facing y225_p0. Windows switch_lampsA_<step> / switch_lampsB_<step>; a pose whose teleports all fail is recorded as <pose>_teleport with its errors and is NOT MEASURED. Sam is back at the spawn before the probe steps.",
+    "switchPoses": [
+      {"name": "lampsA", "teleport": {"location": [-11300, -700, -493], "yaw": 170},
+       "fallback": {"location": [-11280, -760, -493], "yaw": 175}, "view": [0, 30], "frames": 60,
+       "switches": [
+         {"name": "on", "ini": [["Lights", "FlareStandIns", "1"]], "expectLog": {"reloaded": "flare stand-ins 1, trace", "count": 0, "timeout": 90}},
+         {"name": "off", "ini": [["Lights", "FlareStandIns", "0"]], "expectLog": {"reloaded": "flare stand-ins 0, trace", "count": 0, "timeout": 90}},
+         {"name": "on_again", "ini": [["Lights", "FlareStandIns", "1"]], "expectLog": {"reloaded": "flare stand-ins 1, trace", "count": 0, "timeout": 90}}]},
+      {"name": "lampsB", "view": [225, 0], "frames": 60,
+       "switches": [
+         {"name": "on", "ini": [["Lights", "FlareStandIns", "1"]], "expectLog": {"reloaded": "flare stand-ins 1, trace", "count": 0, "timeout": 90}},
+         {"name": "off", "ini": [["Lights", "FlareStandIns", "0"]], "expectLog": {"reloaded": "flare stand-ins 0, trace", "count": 0, "timeout": 90}},
+         {"name": "on_again", "ini": [["Lights", "FlareStandIns", "1"]], "expectLog": {"reloaded": "flare stand-ins 1, trace", "count": 0, "timeout": 90}}]}
+    ],
     "switches": [
       {"name": "on", "ini": [["Lights", "FlareStandIns", "1"]],
        "expectLog": {"reloaded": "flare stand-ins 1, trace", "count": 0, "timeout": 90},
