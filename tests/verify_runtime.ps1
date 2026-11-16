@@ -215,9 +215,40 @@ function Stop-Game {
     $t = [Diagnostics.Stopwatch]::StartNew()
     while ((Get-RunningGame) -and $t.Elapsed.TotalSeconds -lt 30) { Start-Sleep 1 }
     if ($script:PlayProcess) {
-        try { if (-not $script:PlayProcess.WaitForExit(120000)) { $script:PlayProcess.Kill() } } catch { Write-Step "Play script: $($_.Exception.Message)" }
+        try {
+            if (-not $script:PlayProcess.WaitForExit(120000)) {
+                $since = $script:PlayProcess.StartTime
+                $script:PlayProcess.Kill()
+                # A killed Play script never removes its GAME_IN_USE lock (Nov 16 08:51: the lock stayed and blocked
+                # the next run). Remove it only when this run's Play script wrote it.
+                if (Remove-OwnPlayLock $Lock $since) { Write-Step 'Play script killed; removed the GAME_IN_USE lock it wrote.' }
+            }
+        } catch { Write-Step "Play script: $($_.Exception.Message)" }
     }
     $script:PlayProcess = $null
+}
+
+# True after removing $path, when it is a Play-script lock ($LockTag) whose start time is not before $since (the start
+# of this run's own Play script). Corey's lock, or one written before this run's Play script started, stays.
+function Remove-OwnPlayLock([string]$path, [datetime]$since) {
+    $text = Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue
+    if (-not $text -or -not $text.StartsWith($LockTag) -or $text -notmatch '\(started (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) UTC') { return $false }
+    $started = [datetime]::SpecifyKind([datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', $null), 'Utc')
+    if ($started -lt $since.ToUniversalTime().AddSeconds(-1)) { return $false }
+    Remove-Item -LiteralPath $path
+    $true
+}
+
+# Ubisoft's launcher can close the first game exe and start it again (Nov 16 08:49: pid 42432 exited before the Remix
+# bridge started and pid 35200 replaced it; the gate called that a load failure and the next spot ran in 35200).
+# Returns a $name process other than $oldId started no earlier than $oldStart, waiting up to $seconds, else $null.
+function Wait-RestartedGame([int]$oldId, [datetime]$oldStart, [double]$seconds, [string]$name = 'Blacklist_game') {
+    $t = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $new = Get-Process $name -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $oldId -and $_.StartTime -ge $oldStart } | Select-Object -First 1
+        if ($new -or $t.Elapsed.TotalSeconds -ge $seconds) { return $new }
+        Start-Sleep 1
+    }
 }
 
 # A level is rendering in game process $id: with Remix, the proxy logged that ray tracing switched on in it; without
@@ -266,10 +297,18 @@ function Start-GameAtCheckpoint {
         }
         Start-Sleep 2
     }
+    $gameStart = $game.StartTime
     Start-Sleep 12; $k = 0
     while (-not (Test-LevelLive $game.Id)) {
         if ($t.Elapsed.TotalSeconds -gt 480) { throw 'The game did not reach the level within 8 minutes.' }
         if ($game.HasExited) {
+            $restarted = Wait-RestartedGame $game.Id $gameStart 120
+            if ($restarted) {
+                Write-Step "The launcher restarted the game: pid $($game.Id) exited, following pid $($restarted.Id)."
+                $game = $restarted; $gameStart = $game.StartTime
+                Start-Sleep 12
+                continue
+            }
             # The next launch overwrites the Remix and bridge logs: keep them (Nov 16 07:07, a launch died inside
             # CreateDevice and nothing showed why).
             $keep = Join-Path $runDir "load-failure-$($game.Id)"
