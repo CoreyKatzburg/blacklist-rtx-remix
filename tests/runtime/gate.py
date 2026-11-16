@@ -34,7 +34,14 @@ Checks (thresholds in THRESHOLDS):
   skip_other_share         worst scene window's share of draws skipped for any other reason
   material_share           share of scene draws that used a mod replacement material, in the worst spot
   textures_demoted         share of scene frames where the texture budget shrank textures (telemetry texturesDemoted)
-  clean_quit               no VK_ERROR_DEVICE_LOST in each spot's remix-dxvk.log (copied into the spot folder)
+  clean_quit               bridge32.log has "Sending Terminate command to server" (else NOT MEASURED), no
+                           VK_ERROR_DEVICE_LOST in remix-dxvk.log, and no proxy Present > 1000 ms in the last 10 s
+  present_stalls           d3d9_proxy_frames.csv col 3 (time inside Present) > 50 ms in any measured window, excluding
+                           loading-screen frames via is_proxy_loading
+  goggles_toggle_rebuilds  on the first rayTraced=true frame after rayTraced=false in any goggles window, telemetry
+                           staticBlasBuilds <= 40 (GUESS)
+  goggles_dark_frame       on that same first rayTraced=true frame, mean luma / mean luma 10 ray-traced frames later
+                           >= 0.4 (GUESS)
   pose                     the camera really went where it was told (proxy camera trace vs requested yaw/pitch)
   goggles                  each goggle mode toggled (proxy log) and looks the same with ray tracing on and off
                            (no missing geometry, no different picture)
@@ -76,6 +83,10 @@ THRESHOLDS = {
     "skip_share_other": 0.05,       # GUESS. Every other reason measured at most 0.24% of a window's draws.
     "min_replaced_share": 0.2,      # GUESS. Measured 81% and 90% with the mod loaded, 0% without it (Nov 14 bug).
     "max_demoted_share": 0.05,      # GUESS. Measured 0 scene frames with a texture shrunk by the budget.
+    "goggles_toggle_max_builds": 40,   # GUESS. First rayTraced=true after rayTraced=false in a goggles window.
+    "goggles_dark_min_ratio": 0.4,     # GUESS. Mean luma ratio vs 10 ray-traced frames later on toggle-off.
+    "present_stalls_max": 0,           # d3d9_proxy_frames.csv col 3 > 50 ms in measured windows (excl. loads).
+    "quit_present_max_ms": 1000.0,     # No proxy Present > 1000 ms in the last 10 s before Terminate.
     }
 TELEMETRY_FIELDS = ("frame", "frameTimeMs", "gpuTimeMs", "instances", "skinnedInstances", "staticBlasRebuilds",
                     "cameraCut", "textureMemoryMB", "vramUsedMB")
@@ -336,17 +347,20 @@ def camera_angles(row: list[str]) -> tuple[float, float] | None:
 
 
 def is_zero_or_empty_camera(row: list[str]) -> bool:
-    """True when a 7-column d3d9_proxy_frames.csv row has an empty camera column or only an all-zero (0, 0, 0)
-    camera (the loading-screen signature observed in d3d9_proxy_frames.csv). A short row (< 7 columns) is unknown
-    and returns False (never excuses a hitch)."""
+    """True when a 7-column d3d9_proxy_frames.csv row has a truly empty camera column or a complete all-zero
+    (0, 0, 0) unskipped camera. A short row (< 7 columns), cut-short camera text, or bad float is unknown and
+    returns False (never excuses a hitch)."""
     if len(row) < 7:
         return False
     if not row[6]:
         return True
     unskipped = [p for p in (pub.split(":") for pub in row[6].split("|")) if len(p) >= 9 and p[2] == "0"]
     if not unskipped:
-        return True
-    return all(abs(float(p[3])) < 1e-6 and abs(float(p[4])) < 1e-6 and abs(float(p[5])) < 1e-6 for p in unskipped)
+        return False
+    try:
+        return all(abs(float(p[3])) < 1e-6 and abs(float(p[4])) < 1e-6 and abs(float(p[5])) < 1e-6 for p in unskipped)
+    except ValueError:
+        return False
 
 
 def is_proxy_loading(spot: dict, pf: int, no_remix: bool = False) -> bool:
@@ -483,10 +497,11 @@ def recorder_checks(run: Run, pick, good: list[dict], tsrc: str) -> None:
     for s, w in scene:
         tel, prx = s["_data"]["telemetry"], s["_data"]["proxy"]
         tids, pids = frames_in(w, "telemetry"), frames_in(w, "proxy")
-        if not (pids and all(f in prx for f in pids) and all(isinstance(tel.get(f, {}).get("skips"), dict) for f in tids)):
+        if not (pids and all(f in prx and len(prx[f]) > 4 for f in pids)
+                and all(isinstance(tel.get(f, {}).get("skips"), dict) for f in tids)):
             missing += 1
             continue
-        draws = sum(float(prx[f][4]) for f in pids if len(prx[f]) > 4)
+        draws = sum(float(prx[f][4]) for f in pids)
         skips: dict[str, float] = {}
         for f in tids:
             for reason, n in tel[f]["skips"].items():
@@ -546,19 +561,88 @@ def recorder_checks(run: Run, pick, good: list[dict], tsrc: str) -> None:
         run.add("textures_demoted", NOT_MEASURED, None, f"<= {THRESHOLDS['max_demoted_share']:.0%} of scene frames",
                 f"telemetry has {have} of {len(recs)} scene frames with 'texturesDemoted'", tsrc)
 
-    # A lost Vulkan device ends a run without a clean quit. Each spot's remix-dxvk.log must be present and free of it.
-    logs = [os.path.join(s["_dir"], "remix-dxvk.log") for s in good]
-    have_logs = [p for p in logs if os.path.exists(p)]
-    if not good or len(have_logs) < len(logs):
-        detail = (f"{len(logs) - len(have_logs)} of {len(logs)} spots have no remix-dxvk.log" if good
-                  else "no spot ran far enough to judge")
-        run.add("clean_quit", NOT_MEASURED, None, "no VK_ERROR_DEVICE_LOST in any spot log", detail, "remix-dxvk.log")
-    else:
-        lost = [os.path.basename(os.path.dirname(p)) for p in have_logs
-                if any("VK_ERROR_DEVICE_LOST" in ln for ln in read_lines(p))]
-        run.add("clean_quit", PASS if not lost else FAIL, len(lost), "no VK_ERROR_DEVICE_LOST in any spot log",
-                f"VK_ERROR_DEVICE_LOST in: {', '.join(lost)}" if lost else f"no device loss in {len(have_logs)} spot logs",
-                "remix-dxvk.log")
+    st, val, detail = check_clean_quit_dirs(
+        [s["_dir"] for s in good],
+        run_dir=run.dir,
+        proxy_by_dir={s["_dir"]: s["_data"]["proxy"] for s in good},
+    )
+    run.add("clean_quit", st, val, "Terminate logged, no VK_ERROR_DEVICE_LOST, no Present > 1000 ms in last 10 s",
+            detail, "bridge32.log + remix-dxvk.log + d3d9_proxy_frames.csv")
+
+
+def find_session_log(folder: str, stem: str) -> str | None:
+    """Locate a Remix/bridge log by stem in a spot or saved session folder."""
+    for rel in (f"{stem}.log", f"rtx-remix_logs_{stem}.log", os.path.join("rtx-remix", "logs", f"{stem}.log")):
+        p = os.path.join(folder, rel)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def check_clean_quit_dirs(dirs: list[str], run_dir: str | None = None,
+                          proxy_by_dir: dict[str, dict[int, list[str]]] | None = None) -> tuple[str, int | None, str]:
+    """Extended clean_quit check across spot/session dirs (and optional run_dir):
+    1) bridge32.log must contain 'Sending Terminate command to server' (else NOT_MEASURED).
+    2) remix-dxvk.log must exist for every dir and have no VK_ERROR_DEVICE_LOST.
+    3) No proxy Present > 1000 ms in the last 10 s before Terminate.
+    Counts (without judging) 'were not disposed of' and bridge64 'objects discovered in'."""
+    if not dirs:
+        return NOT_MEASURED, None, "no spot ran far enough to judge"
+    dxvk_logs = [find_session_log(d, "remix-dxvk") for d in dirs]
+    if any(p is None for p in dxvk_logs):
+        missing_n = sum(1 for p in dxvk_logs if p is None)
+        return NOT_MEASURED, None, f"{missing_n} of {len(dirs)} spots have no remix-dxvk.log"
+
+    search_dirs = list(dirs) + ([run_dir] if run_dir and run_dir not in dirs else [])
+    b32_logs = [p for d in search_dirs if (p := find_session_log(d, "bridge32")) is not None]
+    term_dirs = [d for d in search_dirs
+                 if (p := find_session_log(d, "bridge32")) and any("Sending Terminate command to server" in ln for ln in read_lines(p))]
+    if not b32_logs or not term_dirs:
+        return NOT_MEASURED, None, "bridge32.log has no 'Sending Terminate command to server' (game did not quit cleanly)"
+
+    lost = [os.path.basename(d) for d, p in zip(dirs, dxvk_logs)
+            if p and any("VK_ERROR_DEVICE_LOST" in ln for ln in read_lines(p))]
+    not_disposed = sum(1 for p in dxvk_logs if p for ln in read_lines(p) if "were not disposed of" in ln)
+    b64_leaks = sum(1 for d in search_dirs if (p := find_session_log(d, "bridge64"))
+                    for ln in read_lines(p) if "objects discovered in" in ln)
+
+    quit_stalls: list[tuple[str, int, float]] = []
+    for d in term_dirs:
+        prx = (proxy_by_dir or {}).get(d)
+        if prx is None:
+            for cand in ("proxy_frames.csv", "d3d9_proxy_frames.csv"):
+                cp = os.path.join(d, cand)
+                if os.path.exists(cp):
+                    prx = read_csv_frames(cp, 7)
+                    break
+        if not prx:
+            continue
+        timed = []
+        for f, r in prx.items():
+            if len(r) >= 4:
+                try:
+                    timed.append((f, float(r[1]), float(r[3])))
+                except ValueError:
+                    continue
+        if not timed:
+            continue
+        max_clk = max(c for _, c, _ in timed)
+        for f, c, pms in timed:
+            if c >= max_clk - 10000.0 and pms > THRESHOLDS["quit_present_max_ms"]:
+                quit_stalls.append((os.path.basename(d), f, pms))
+
+    problems = len(lost) + len(quit_stalls)
+    parts = []
+    if lost:
+        parts.append(f"VK_ERROR_DEVICE_LOST in: {', '.join(lost)}")
+    if quit_stalls:
+        worst = max(quit_stalls, key=lambda x: x[2])
+        parts.append(f"{len(quit_stalls)} proxy Present > {THRESHOLDS['quit_present_max_ms']:g} ms in last 10 s "
+                     f"(worst {worst[2]:.1f} ms at frame {worst[1]})")
+    if not parts:
+        parts.append(f"clean Terminate in {len(term_dirs)} log(s), no device loss, no quit Present > 1000 ms")
+    parts.append(f"info: {not_disposed} not-disposed, {b64_leaks} bridge64-map lines")
+    return (PASS if problems == 0 else FAIL), problems, "; ".join(parts)
 
 
 def load_other_run(folder: str | None) -> dict[str, dict] | None:
@@ -717,6 +801,36 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
                 f" ({excluded_load} loading-screen frames excluded)" if excluded_load else "")
             run.add("frames_over_50ms", PASS if over_nonload <= THRESHOLDS["frames_over_50ms"] else FAIL,
                     over_nonload, "0", detail, tsrc)
+
+    # present_stalls: d3d9_proxy_frames.csv column 3 (Present duration ms) > 50 ms in measured windows, excl. loads.
+    if not measured_pairs:
+        run.add("present_stalls", NOT_MEASURED, None, "0", "no windows of this kind were run", "d3d9_proxy_frames.csv")
+    else:
+        want_p, prows_p = coverage(measured_pairs, "proxy", "proxy")
+        have_p = sum(1 for r in prows_p if len(r) >= 4)
+        if want_p == 0 or have_p < want_p:
+            run.add("present_stalls", NOT_MEASURED, None, "0",
+                    f"proxy trace has {have_p} of {want_p} frames with Present ms", "d3d9_proxy_frames.csv")
+        else:
+            stalls, excluded_p, worst_ms, worst_f = 0, 0, -1.0, 0
+            for s, w in measured_pairs:
+                prx = s["_data"]["proxy"]
+                for pf in frames_in(w, "proxy"):
+                    try:
+                        pms = float(prx[pf][3])
+                    except (IndexError, ValueError):
+                        continue
+                    if pms > 50.0 and is_proxy_loading(s, pf, no_remix=no_remix):
+                        excluded_p += 1
+                        continue
+                    if pms > worst_ms:
+                        worst_ms, worst_f = pms, pf
+                    if pms > 50.0:
+                        stalls += 1
+            detail = f"{stalls} of {want_p} frames with Present > 50 ms (worst {worst_ms:.1f} ms at frame {worst_f})" + (
+                f" ({excluded_p} loading-screen frames excluded)" if excluded_p else "")
+            run.add("present_stalls", PASS if stalls <= THRESHOLDS["present_stalls_max"] else FAIL,
+                    stalls, "0", detail, "d3d9_proxy_frames.csv")
     telemetry_check("skinned_min", pick(SCENE), "skinnedInstances",
                     lambda v: (min(v), min(v) >= THRESHOLDS["skinned_min"]),
                     ">= 1 every frame", lambda v, n: f"fewest character meshes in {n} frames: {v}")
@@ -736,15 +850,24 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
                 return s
         return f"{raw:.4f}"
 
-    def judge_fps(vals: list[float]) -> tuple[float, bool]:
-        raw = 1000.0 / max(float(np.median(vals)), 1e-3)
-        return round(raw, 2), raw >= THRESHOLDS["min_median_fps"]
-
-    telemetry_check("min_median_fps", pick(SCENE), "frameTimeMs", judge_fps,
-                    f">= {THRESHOLDS['min_median_fps']:g} FPS (goal, WARN below)",
-                    lambda v, n: f"median {fmt_fps(v, THRESHOLDS['min_median_fps'])} FPS, "
-                                 f"target is at or above {THRESHOLDS['min_median_fps']:g} FPS ({n} scene frames)",
-                    bad=WARN)
+    fps_pairs = pick(SCENE)
+    fps_target = THRESHOLDS["min_median_fps"]
+    fps_thresh = f">= {fps_target:g} FPS (goal, WARN below)"
+    if not fps_pairs:
+        run.add("min_median_fps", NOT_MEASURED, None, fps_thresh, "no windows of this kind were run", tsrc)
+    else:
+        want_fps, recs_fps = coverage(fps_pairs, "telemetry", "telemetry")
+        vals_fps = [r["frameTimeMs"] for r in recs_fps if isinstance(r.get("frameTimeMs"), (int, float))]
+        if want_fps == 0 or len(vals_fps) < want_fps:
+            run.add("min_median_fps", NOT_MEASURED, None, fps_thresh,
+                    f"telemetry has {len(vals_fps)} of {want_fps} frames with 'frameTimeMs'", tsrc)
+        else:
+            raw_fps = 1000.0 / max(float(np.median(vals_fps)), 1e-3)
+            ok_fps = raw_fps >= fps_target
+            val_fps = float(fmt_fps(raw_fps, fps_target))
+            run.add("min_median_fps", PASS if ok_fps else WARN, val_fps, fps_thresh,
+                    f"median {fmt_fps(raw_fps, fps_target)} FPS, target is at or above {fps_target:g} FPS "
+                    f"({want_fps} scene frames)", tsrc)
     fps_regression_check(run, good, prev_spots)
 
     # Latency checks & Top 10 Latency Contributors breakdown
@@ -777,6 +900,82 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
                 f"worst frame {worst:.4%} of character triangles inward", tsrc)
 
     recorder_checks(run, pick, good, tsrc)
+
+    # goggles_toggle_rebuilds & goggles_dark_frame: first rayTraced=true frame after rayTraced=false in goggles windows.
+    goggles_pairs = pick(("goggles",))
+    if not goggles_pairs:
+        run.add("goggles_toggle_rebuilds", NOT_MEASURED, None,
+                f"<= {THRESHOLDS['goggles_toggle_max_builds']} (GUESS)", "no goggles windows were run", tsrc)
+        run.add("goggles_dark_frame", NOT_MEASURED, None,
+                f">= {THRESHOLDS['goggles_dark_min_ratio']:g} (GUESS)", "no goggles windows were run", tsrc)
+    else:
+        want_g, recs_g = coverage(goggles_pairs, "telemetry", "telemetry")
+        have_g = sum(1 for r in recs_g if isinstance(r.get("rayTraced"), bool)
+                     and isinstance(r.get("staticBlasBuilds"), (int, float)))
+        if want_g == 0 or have_g < want_g:
+            msg = f"telemetry has {have_g} of {want_g} goggles frames with 'rayTraced' and 'staticBlasBuilds'"
+            run.add("goggles_toggle_rebuilds", NOT_MEASURED, None,
+                    f"<= {THRESHOLDS['goggles_toggle_max_builds']} (GUESS)", msg, tsrc)
+            run.add("goggles_dark_frame", NOT_MEASURED, None,
+                    f">= {THRESHOLDS['goggles_dark_min_ratio']:g} (GUESS)", msg, tsrc)
+        else:
+            builds_list, ratios_list = [], []
+            for s, w in goggles_pairs:
+                tel = s["_data"]["telemetry"]
+                tids = frames_in(w, "telemetry")
+                cap_frames = None
+                seen_off = False
+                for idx, tf in enumerate(tids):
+                    rt = tel[tf]["rayTraced"]
+                    if not rt:
+                        seen_off = True
+                        continue
+                    if seen_off:
+                        seen_off = False
+                        builds_list.append((int(tel[tf]["staticBlasBuilds"]), s["name"], w["name"], tf))
+                        # Find the frame 10 ray-traced frames later (within window or continuing in telemetry).
+                        rt_after = [tids[j] for j in range(idx, len(tids)) if tel[tids[j]].get("rayTraced")]
+                        tf10 = rt_after[10] if len(rt_after) > 10 else None
+                        l0 = l10 = None
+                        th0 = tel[tf].get("lumaThumb")
+                        th10 = tel.get(tf10, {}).get("lumaThumb") if tf10 is not None else None
+                        if th0 and th10:
+                            l0 = float(np.frombuffer(base64.b64decode(th0), np.uint8).mean())
+                            l10 = float(np.frombuffer(base64.b64decode(th10), np.uint8).mean())
+                        else:
+                            if cap_frames is None:
+                                p = spot_path(s, w.get("frames") or w.get("goggles", {}).get("shot"))
+                                if p and os.path.exists(p):
+                                    cw, ch = w.get("frameSize") or w.get("goggles", {}).get("frameSize", (0, 0))
+                                    if cw and ch:
+                                        cap_frames = read_gray(p, cw, ch)
+                            if cap_frames is not None and idx + 10 < len(cap_frames):
+                                l0 = float(cap_frames[idx].mean())
+                                l10 = float(cap_frames[idx + 10].mean())
+                        if l0 is not None and l10 is not None and l10 > 1e-6:
+                            ratios_list.append((l0 / l10, s["name"], w["name"], tf))
+            if not builds_list:
+                run.add("goggles_toggle_rebuilds", NOT_MEASURED, None,
+                        f"<= {THRESHOLDS['goggles_toggle_max_builds']} (GUESS)",
+                        "no rayTraced=false -> rayTraced=true transition in goggles windows", tsrc)
+            else:
+                worst_b = max(builds_list, key=lambda x: x[0])
+                run.add("goggles_toggle_rebuilds",
+                        PASS if worst_b[0] <= THRESHOLDS["goggles_toggle_max_builds"] else FAIL,
+                        worst_b[0], f"<= {THRESHOLDS['goggles_toggle_max_builds']} (GUESS)",
+                        f"worst {worst_b[0]} staticBlasBuilds at {worst_b[1]}/{worst_b[2]} frame {worst_b[3]} "
+                        f"({len(builds_list)} toggle(s))", tsrc)
+            if not ratios_list:
+                run.add("goggles_dark_frame", NOT_MEASURED, None,
+                        f">= {THRESHOLDS['goggles_dark_min_ratio']:g} (GUESS)",
+                        "no toggle with 10 subsequent ray-traced frames and luma data", tsrc)
+            else:
+                worst_r = min(ratios_list, key=lambda x: x[0])
+                run.add("goggles_dark_frame",
+                        PASS if worst_r[0] >= THRESHOLDS["goggles_dark_min_ratio"] else FAIL,
+                        round(worst_r[0], 3), f">= {THRESHOLDS['goggles_dark_min_ratio']:g} (GUESS)",
+                        f"worst luma ratio {worst_r[0]:.3f} at {worst_r[1]}/{worst_r[2]} frame {worst_r[3]} "
+                        f"({len(ratios_list)} toggle(s))", tsrc)
 
     # raster fallback: proxy gate CSV frame,sceneDraws,skinnedSceneDraws,handoffs,goggles,rtActive
     want, rows = coverage(pick(SCENE), "proxy", "pgate")

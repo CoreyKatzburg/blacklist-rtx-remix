@@ -50,7 +50,8 @@ def view(yaw: float, pitch: float, rng) -> np.ndarray:
 # case -> (frame time ms, GPU time ms) for every frame. Healthy runs are 10 ms and 8 ms: 100 FPS, CPU wait 2 ms.
 FRAME_TIMES = {
     "low_fps": (14.0, 12.0),           # 71 FPS: WARN under the 90 target, the gate still passes
-    "near_target_fps": (1000.0 / 89.96, 8.0),  # 89.96 FPS: WARN, must print "89.96 FPS" not "90.0 FPS"
+    "near_target_fps": (1000.0 / 89.96, 8.0),    # 89.96 FPS: WARN, must print "89.96 FPS" not "90.0 FPS"
+    "near_target_89_996": (1000.0 / 89.996, 8.0), # 89.996 FPS: WARN, must print "89.996 FPS" not "90.00 FPS"
     "high_latency": (17.5, 9.0),       # 57 FPS, CPU wait 8.5 ms -> fails latency_overhead_ms
     "fps_regression": (11.8, 8.0),     # 84.7 FPS: 15% below the 100 FPS previous run: FAIL
     "fps_drop_9pct": (10.98, 8.0),     # 91 FPS: 9% below the previous run: passes
@@ -75,7 +76,9 @@ class Builder:
         self.tframe += 1; self.pframe += 1
         img = view(self.yaw, self.pitch, self.rng)
         rec = {"frame": self.tframe, "frameTimeMs": 10.0, "gpuTimeMs": 8.0, "instances": 900, "skinnedInstances": 3,
-               "staticBlasRebuilds": 0, "cameraCut": False, "textureMemoryMB": 1800, "vramUsedMB": 6100,
+               "staticBlasRebuilds": 0, "staticBlasBuilds": 0,
+               "rayTraced": not (goggles and wname.endswith("_rtoff") and i < 3),
+               "cameraCut": False, "textureMemoryMB": 1800, "vramUsedMB": 6100,
                "skinnedTriangles": 60000, "inwardSkinnedTriangles": 12, "thumbNonFinite": 0}
         # recorder fields (gate.recorder_checks): healthy values, with one fault per case below
         rec.update({"replacedMaterialDraws": 354, "legacyMaterialDraws": 25, "texturesDemoted": 0,
@@ -84,8 +87,10 @@ class Builder:
                                "InjectRTX/Ray Reconstruction/Prepare DLSS": [0.3, 0.02, 1]}})
         c = self.case
         if c == "nan_frame" and kind == "still" and i == 3: rec["thumbNonFinite"] = 40
+        if c == "goggles_toggle_rebuilds" and wname == "goggles1_rtoff" and i == 3: rec["staticBlasBuilds"] = 300
+        if c == "goggles_dark_frame" and wname == "goggles1_rtoff" and i == 3: img = img * 0.2
         if c in ("slow_frame", "noremix_scenedraws0") and kind == "pan" and i == 30: rec["frameTimeMs"] = 120.0 if c == "noremix_scenedraws0" else 61.0
-        if c == "missing_cam_col" and wname == "to_y45_p0" and i == 2: rec["frameTimeMs"] = 120.0
+        if c in ("missing_cam_col", "cut_short_cam_col") and wname == "to_y45_p0" and i == 2: rec["frameTimeMs"] = 120.0
         if c == "load_count_mismatch" and wname == "to_y45_p0" and i in (0, 1): rec["frameTimeMs"] = 120.0
         if c == "slow_beside_nonload" and wname == "to_y45_p0" and i == 0: rec["frameTimeMs"] = 120.0
         loading = ((c == "loading_in_window" and wname == "to_y45_p0" and i in (2, 3))
@@ -128,9 +133,17 @@ class Builder:
         elif c == "missing_cam_col" and wname == "to_y45_p0" and i == 2:
             self.proxy.append(f"{self.pframe},1.0,14.0,0.5,1500,1")  # 6 columns: no camera column -> unknown
             self.pgate.append(f"{self.pframe},1400,40,1,{1 if goggles else 0},1")
+        elif c == "cut_short_cam_col" and wname == "to_y45_p0" and i == 2:
+            self.proxy.append(f"{self.pframe},1.0,14.0,0.5,1500,1,G:0:0:1.")  # cut short in camera column -> unknown
+            self.pgate.append(f"{self.pframe},1400,40,1,{1 if goggles else 0},1")
+        elif c == "short_row_in_window" and wname == "to_y45_p0" and i == 2:
+            self.proxy.append(f"{self.pframe},1.0,14.0")  # cut-short 3-col row inside scene window -> NOT MEASURED
+            self.pgate.append(f"{self.pframe},1400,40,1,{1 if goggles else 0},1")
         else:
             fx, fy, fz = math.cos(cp) * math.cos(cy), math.cos(cp) * math.sin(cy), math.sin(cp)
-            self.proxy.append(f"{self.pframe},1.0,14.0,0.5,1500,1,P:22:0:1.0:2.0:3.0:{fx:.5f}:{fy:.5f}:{fz:.5f}:0.0")
+            pms = 120.0 if (c == "present_stall" and kind == "pan" and i == 30) else 0.5
+            clk = 1000.0 + self.pframe * 10.0
+            self.proxy.append(f"{self.pframe},{clk:.3f},14.0,{pms},1500,1,P:22:0:1.0:2.0:3.0:{fx:.5f}:{fy:.5f}:{fz:.5f}:0.0")
             handoff = 0 if (c == "raster_flash" and kind == "pan" and i == 70) else 1
             sdraws = 0 if c == "noremix_scenedraws0" else 1400
             self.pgate.append(f"{self.pframe},{sdraws},40,{handoff},{1 if goggles else 0},1")
@@ -223,7 +236,7 @@ class Builder:
         for mode in (1, 2, 3):
             for rt in ("on", "off"):
                 rel = f"frames/goggles{mode}_{rt}.gray"
-                w, imgs = self.window(f"goggles{mode}_rt{rt}", "goggles", 6, goggles=True,
+                w, imgs = self.window(f"goggles{mode}_rt{rt}", "goggles", 15, goggles=True,
                                       extra={"goggles": {"mode": mode, "rt": rt, "shot": rel, "frameSize": [CAP_W, CAP_H],
                                                          "toggled": not (self.case == "goggles_untoggled" and mode == 2)}})
                 tint = [im * 0.5 + 60 for im in imgs]          # goggles: darker and shifted, same for RT on and off
@@ -249,12 +262,19 @@ class Builder:
                 r.pop("lumaThumb", None)
         if self.case == "cut_short_proxy":
             self.proxy.append(f"{self.pframe + 1},1.0,14.0")
+        if self.case == "quit_present_stall":
+            clk = 1000.0 + (self.pframe + 1) * 10.0
+            self.proxy.append(f"{self.pframe + 1},{clk:.3f},14.0,1500.0,1500,1,P:22:0:1.0:2.0:3.0:1.0:0.0:0.0:0.0")
         gate.save_text(os.path.join(self.dir, "telemetry.jsonl"), "".join(json.dumps(r) + "\n" for r in self.telemetry))
         gate.save_text(os.path.join(self.dir, "proxy_frames.csv"), "\n".join(self.proxy) + "\n")
         gate.save_text(os.path.join(self.dir, "proxy_gate.csv"), "\n".join(self.pgate) + "\n")
         if self.case != "no_quit_log":
             lost = "[error] vkQueueSubmit: VK_ERROR_DEVICE_LOST\n" if self.case == "device_lost" else ""
             gate.save_text(os.path.join(self.dir, "remix-dxvk.log"), "[info] Remix shutdown\n" + lost)
+            b32 = "[00:01:00.000] info:  Bridge client started\n"
+            if self.case != "no_terminate":
+                b32 += "[00:02:00.000] info:  Sending Terminate command to server...\n"
+            gate.save_text(os.path.join(self.dir, "bridge32.log"), b32)
         gate.save_json(os.path.join(self.dir, "spot.json"), spot)
 
 
@@ -279,12 +299,15 @@ CASES = {
     "slow_frame": (("frames_over_50ms",), ()),
     "loading_in_window": ((), ()),                        # >50 ms frames during a loading screen are excluded: passes
     "missing_cam_col": (("frames_over_50ms",), ()),       # 6-column proxy row (no camera column) is unknown -> fails
+    "cut_short_cam_col": (("frames_over_50ms",), ()),     # cut-short camera column text is unknown -> fails
+    "short_row_in_window": ((), ("skip_occlusion_share", "skip_other_share", "present_stalls")),
     "cut_short_proxy": ((), ()),                          # last proxy row cut short mid-write: finishes and passes
     "load_count_mismatch": (("frames_over_50ms",), ()),   # 7 tel vs 6 proxy: 1 loading frame excuses only t0, t1 fails
     "slow_beside_nonload": (("frames_over_50ms",), ()),   # 6 tel vs 7 proxy: t0 maps to [load, nonload] -> fails
     "noremix_scenedraws0": (("frames_over_50ms",), ()),   # noRemix=True: sceneDraws=0 ignored, real camera + 120ms -> fails
     "low_fps": ((), ()),                                # WARN min_median_fps (WARNS); the gate passes
     "near_target_fps": ((), ()),                        # 89.96 FPS: WARN, must print 89.96 FPS not 90.0 FPS
+    "near_target_89_996": ((), ()),                     # 89.996 FPS: WARN, must print 89.996 FPS not 90.00 FPS
     "high_latency": (("latency_overhead_ms",), ()),
     "lag_within_margin": ((), ()),                      # +5 ms over the reference: the margin's edge still passes
     "lag_over_margin": (("input_latency_ms",), ()),     # +5.5 ms over the reference
@@ -298,23 +321,29 @@ CASES = {
     "pan_short": (("pose",), ()),
     "goggles_missing": (("goggles",), ()),
     "goggles_untoggled": ((), ("goggles",)),
+    "goggles_toggle_rebuilds": (("goggles_toggle_rebuilds",), ()),
+    "goggles_dark_frame": (("goggles_dark_frame",), ()),
+    "present_stall": (("present_stalls",), ()),
+    "quit_present_stall": (("clean_quit",), ()),
+    "no_terminate": ((), ("clean_quit",)),
     "no_telemetry": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms",
                           "skinned_min", "static_blas_rebuilds", "inward_fraction", "nonfinite_thumb_pixels",
-                          *RECORDER)),
+                          "goggles_toggle_rebuilds", "goggles_dark_frame", *RECORDER)),
     # Remix writing only every 15th frame: per-frame checks can't pass; flashes fall back to the screen captures
     "sparse_telemetry": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms",
                               "skinned_min", "static_blas_rebuilds", "inward_fraction", "nonfinite_thumb_pixels",
-                              *RECORDER)),
+                              "goggles_toggle_rebuilds", "goggles_dark_frame", *RECORDER)),
     "renamed_fields": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms")),
     "no_dumps": ((), ("nan_pixels", "neon_fraction", "brightness_floor", "angled_sharpness", "outline_overlap")),
     "no_proxy_gate": ((), ("raster_fallback_frames",)),
     "no_thumbs": ((), ()),                       # still measurable from the screen captures (pan at full rate)
     "half_rate_capture": ((), ("flashes",)),     # screen capture saw half the game frames of the pan
-    "spot_error": (("s1: setup",), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms", "input_latency_ms",
-                                    "skinned_min", "static_blas_rebuilds", "inward_fraction", "nonfinite_thumb_pixels",
-                                    "raster_fallback_frames", "flashes", "still_flicker", "nan_pixels", "neon_fraction",
-                                    "brightness_floor", "angled_sharpness", "outline_overlap", "pose", "goggles",
-                                    *RECORDER, "clean_quit")),
+    "spot_error": (("s1: setup",), ("frames_over_50ms", "present_stalls", "min_median_fps", "latency_overhead_ms",
+                                    "input_latency_ms", "skinned_min", "static_blas_rebuilds", "inward_fraction",
+                                    "nonfinite_thumb_pixels", "raster_fallback_frames", "flashes", "still_flicker",
+                                    "nan_pixels", "neon_fraction", "brightness_floor", "angled_sharpness",
+                                    "outline_overlap", "pose", "goggles", "goggles_toggle_rebuilds",
+                                    "goggles_dark_frame", *RECORDER, "clean_quit")),
     "untimed_steps": (("step_timing",), ()),          # every 5th still frame: a step with no timing
     "child_over_parent": (("step_timing",), ()),      # a nested step 1.0 ms longer than its parent
     "child_timer_jitter": ((), ()),                   # 0.4 ms over its parent: inside the tolerance
@@ -330,6 +359,7 @@ CASES = {
 
 # case -> checks that must WARN (shown in the result; the gate still passes)
 WARNS = {"low_fps": ("min_median_fps",), "near_target_fps": ("min_median_fps",),
+         "near_target_89_996": ("min_median_fps",),
          "high_latency": ("min_median_fps",), "fps_regression": ("min_median_fps",)}
 PREVIOUS = {"fps_regression", "fps_drop_9pct"}    # judged against a previous run: the healthy 100 FPS run
 NO_REFERENCE = {"no_reference"}                  # run without --reference

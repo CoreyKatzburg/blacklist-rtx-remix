@@ -125,11 +125,14 @@ class MathTest(unittest.TestCase):
     def test_is_zero_or_empty_camera(self):
         self.assertFalse(gate.is_zero_or_empty_camera(["0", "1.0", "1.6", "0.5", "3", "0"]))  # 6 cols -> unknown
         self.assertFalse(gate.is_zero_or_empty_camera(["0", "1.0"]))                            # cut-short -> unknown
+        self.assertFalse(gate.is_zero_or_empty_camera(["0", "1.0", "14.0", "0.5", "1500", "1", "G:0:0:1."]))
+        self.assertFalse(gate.is_zero_or_empty_camera(["0", "1.0", "14.0", "0.5", "1500", "1",
+                                                       "G:0:0:-:0.0:0.0:1.0:0.0:0.0:0.0"]))
         self.assertTrue(gate.is_zero_or_empty_camera(["0", "1.0", "1.6", "0.5", "3", "0", ""]))
         self.assertTrue(gate.is_zero_or_empty_camera(["545", "1.0", "1.6", "0.5", "29", "3",
                                                       "G:0:0:-0.000:-0.000:-0.000:1.0:0.0:0.0:0.0"]))
-        self.assertTrue(gate.is_zero_or_empty_camera(["10", "1.0", "1.6", "0.5", "29", "3",
-                                                      "G:0:1:10.0:20.0:30.0:1.0:0.0:0.0:0.0"]))
+        self.assertFalse(gate.is_zero_or_empty_camera(["10", "1.0", "1.6", "0.5", "29", "3",
+                                                       "G:0:1:10.0:20.0:30.0:1.0:0.0:0.0:0.0"]))
         self.assertFalse(gate.is_zero_or_empty_camera(["3050", "1.0", "16.0", "1.0", "1428", "8",
                                                        "G:0:0:3769.8:3085.6:225.2:0.14:0.08:-0.98:0.0"]))
 
@@ -178,6 +181,9 @@ class FakeRunTest(unittest.TestCase):
                     if case == "near_target_fps":
                         fps_check = next(c for c in result["checks"] if c["check"] == "min_median_fps")
                         self.assertIn("89.96 FPS", fps_check["detail"])
+                    if case == "near_target_89_996":
+                        fps_check = next(c for c in result["checks"] if c["check"] == "min_median_fps")
+                        self.assertIn("89.996 FPS", fps_check["detail"])
                     if case == "load_count_mismatch":
                         hitch = next(c for c in result["checks"] if c["check"] == "frames_over_50ms")
                         self.assertEqual(hitch["value"], 1)
@@ -195,6 +201,18 @@ class FakeRunTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             gate.save_json(os.path.join(t, "manifest.json"), {"spots": []})
             self.assertEqual(gate.evaluate(t)["status"], gate.FAIL)
+
+    def test_clean_quit_real_sessions(self):
+        fail_dir = r"D:\BlacklistOverhaul\experiments\playtest-evidence\steam-session-20261114-1855"
+        pass_dir = r"D:\BlacklistOverhaul\experiments\playtest-evidence\play-setup-logs\before-20261113-212037"
+        if os.path.isdir(fail_dir):
+            st, val, detail = gate.check_clean_quit_dirs([fail_dir])
+            self.assertEqual(st, gate.FAIL, detail)
+            self.assertIn("VK_ERROR_DEVICE_LOST", detail)
+        if os.path.isdir(pass_dir):
+            st, val, detail = gate.check_clean_quit_dirs([pass_dir])
+            self.assertEqual(st, gate.PASS, detail)
+            self.assertIn("not-disposed", detail)
 
 
 class DriveHelpersTest(unittest.TestCase):
