@@ -687,17 +687,19 @@ class Spot:
     OFF_POSE_DEG = 1.0   # a stop further than this from the asked view (yaw or pitch) is off-pose
     POSE_TRIES = 3
 
-    def pose_trace(self, body) -> list[list[float]]:
-        """Runs body() while reading the camera direction from game memory every 50 ms; returns the readings."""
+    def pose_trace(self, body) -> tuple[list[list[float]], int]:
+        """Runs body() while reading the camera direction from game memory every 50 ms; returns the readings and
+        how many reads failed (a stop is off-pose when none succeeded: nothing shows the camera held still)."""
         seen: list[list[float]] = []
+        failed = [0]
         done = threading.Event()
 
         def sample():
             while not done.is_set():
                 try:
                     seen.append(self.rel_pose())
-                except Exception:
-                    pass
+                except Exception:   # noqa: BLE001 - counted; the stop reports it
+                    failed[0] += 1
                 done.wait(0.05)
         t = threading.Thread(target=sample, daemon=True)
         t.start()
@@ -705,7 +707,7 @@ class Spot:
             body()
         finally:
             done.set(); t.join(1.0)
-        return seen
+        return seen, failed[0]
 
     def pose_error(self, poses: list[list[float]]) -> float:
         """Largest yaw or pitch distance, in degrees, of the game-memory poses from the stop's asked view."""
@@ -733,7 +735,9 @@ class Spot:
             else:
                 grab, got = (lambda: self.dump(name)), {"dump": name}
             trace: list = []
-            w = self.window(name, "still", lambda: trace.extend(self.pose_trace(lambda: (self.capture(rel, 20), grab()))),
+            failed: list = []
+            w = self.window(name, "still", lambda: (lambda r: (trace.extend(r[0]), failed.append(r[1])))(
+                                self.pose_trace(lambda: (self.capture(rel, 20), grab()))),
                             frames=rel, frameSize=[CAP_W, CAP_H], **({"outline": outline} if outline else {}))
             w.update(got)
             w["gamePose"] = [before, self.rel_pose()]   # [yaw, pitch] from game memory at the start and end
@@ -742,9 +746,13 @@ class Spot:
             if snapped is not None:
                 w["poseWrites"] = snapped
             w["offPoseDeg"] = self.pose_error(w["gamePose"] + trace)
+            w["poseTraceFailedReads"] = failed[0] if failed else 0
+            if not trace:   # no reading during the capture: the start and end alone cannot show it held still
+                w["poseTraceEmpty"] = True
+            off = w["offPoseDeg"] > self.OFF_POSE_DEG or not trace
             print(f"stop {name} try {attempt}: {w['offPoseDeg']} degrees off, poseWrites {snapped}, "
                   f"start {before} end {w['gamePose'][1]}", flush=True)
-            if w["offPoseDeg"] <= self.OFF_POSE_DEG or attempt == self.POSE_TRIES:
+            if not off or attempt == self.POSE_TRIES:
                 break
             for x in (settle, w):   # kept for the record under another name; no check reads kind "off_pose"
                 x["name"], x["kind"] = f"{x['name']}_offpose{attempt}", "off_pose"
@@ -752,7 +760,7 @@ class Spot:
         w["poseTries"] = attempt
         if missed:
             w["offPoseTries"] = missed
-        if w["offPoseDeg"] > self.OFF_POSE_DEG:
+        if off:
             w["offPose"] = True
             print(f"OFF POSE {name}: {w['offPoseDeg']} degrees from the asked view after {attempt} tries")
         w["samMoved"] = self.sam_moved(name)

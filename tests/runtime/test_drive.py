@@ -145,7 +145,7 @@ class Steering(unittest.TestCase):
             seq = iter([p for pair in poses_per_try for p in pair])
             s.rel_pose = lambda: next(seq)
             during = iter(traces or [])
-            s.pose_trace = lambda body: (body(), next(during, []))[1]   # the camera during each capture
+            s.pose_trace = lambda body: (body(), next(during, ([on], 0)))[1]   # (the camera during each capture, failed reads)
             saved = []
             s.save_partial = lambda: saved.append(len(s.windows))
             moves = []
@@ -178,9 +178,14 @@ class Steering(unittest.TestCase):
         s, moves = run([[on, [90.9, -29.1]]], no_remix=False)   # 0.9 degrees: on pose, one try
         self.assertEqual((s.windows[-1]["poseTries"], moves), (1, []))
         # on pose at the start and end, but the camera swung away during the capture: still off-pose
-        s, moves = run([[on, on], [on, on]], traces=[[on, [96.0, -30.0], on], [on, on]])
+        s, moves = run([[on, on], [on, on]], traces=[([on, [96.0, -30.0], on], 0), ([on, on], 0)])
         self.assertEqual(s.windows[-1]["poseTries"], 2)
         self.assertEqual(s.windows[-1]["offPoseTries"][0]["offPoseDeg"], 6.0)
+        # every read during the capture failed: on pose at the start and end, but nothing shows it held, so off-pose
+        s, moves = run([[on, on]] * 3, traces=[([], 12)] * 3)
+        kept = s.windows[-1]
+        self.assertEqual((kept["poseTries"], kept["offPose"], kept["poseTraceEmpty"], kept["poseTraceFailedReads"]),
+                         (3, True, True, 12))
 
     def test_stop_waits_out_a_stall_before_capturing(self):
         # Paladin, Nov 15: frames of 0.5 to 1.6 s for several seconds after the full turn.
