@@ -129,6 +129,7 @@ static void testTelemetry(const std::string& dir) {
   t.vramFreeMB = 1185.4;
   t.thumbNonFinite = 5;
   t.thumbClipped = 9;
+  t.remixShaderCompiles = 7;
   t.skips[size_t(RtxSkip::ZeroPrimitives)] = 4;
   t.skips[size_t(RtxSkip::NoTextureHash)] = 17;
   t.passes.push_back(RtxPassTime { "InjectRTX", 28.5, 3.25, 1 });
@@ -181,6 +182,7 @@ static void testTelemetry(const std::string& dir) {
   CHECK(std::strstr(line, "\"rayTraced\":true,\"telemetryCpuMs\":0.250,\"replacedMaterialDraws\":800,\"legacyMaterialDraws\":31,"
                           "\"texturesDemoted\":2,\"textureBudgetMB\":3072.0,\"vramFreeMB\":1185.4,\"thumbNonFinite\":5,\"thumbClipped\":9,") != nullptr,
         "recorder, material, texture and bad-pixel fields printed: %s", line);
+  CHECK(std::strstr(line, "9,\"remixShaderCompiles\":7,\"skips\":{") != nullptr, "remixShaderCompiles printed after thumbClipped: %s", line);
   CHECK(std::strstr(line, "\"skips\":{\"zeroPrimitives\":4,\"noTextureHash\":17},") != nullptr, "only non-zero skip reasons printed: %s", line);
   CHECK(std::strstr(line, "\"passMs\":{\"InjectRTX\":[28.500,3.250,1],\"InjectRTX/Gate Telemetry\":[-1.000,0.125,2]},") != nullptr,
         "step times printed as [gpuMs,cpuMs,count]: %s", line);

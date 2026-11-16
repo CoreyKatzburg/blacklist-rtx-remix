@@ -32,6 +32,7 @@ REQUIRED = {
     "textureBudgetMB": (int, float),
     "thumbNonFinite": int,
     "thumbClipped": int,
+    "remixShaderCompiles": int,   # Remix pipelines queued or compiling at frame end; ray tracing waits while > 0
     "skips": dict,
     "passMs": dict,
 }
@@ -135,7 +136,7 @@ def check(path):
             errors += [f"line {number}: {p}" for p in check_maps(obj)]
             errors += [f"line {number}: {p}" for p in check_normal_gate(obj)]
             for key in ("frameTimeMs", "gpuTimeMs", "textureMemoryMB", "vramUsedMB", "telemetryCpuMs", "textureBudgetMB",
-                        "vramFreeMB"):
+                        "vramFreeMB", "remixShaderCompiles"):
                 if isinstance(obj.get(key), (int, float)) and not isinstance(obj.get(key), bool) and obj[key] < 0:
                     errors.append(f"line {number}: {key} negative")
             if len(errors) > 20:
