@@ -35,6 +35,8 @@ REQUIRED = {
     "thumbClipped": int,
     "remixShaderCompiles": int,   # Remix pipelines queued or compiling at frame end; ray tracing waits while > 0
     "skips": dict,
+    "instancedSharedSlotDraws": int,  # instanced captured draws whose copies shared slots (one copy survived)
+    "instancedCapturedDraws": int,    # instanced captured draws with every copy kept
     "passMs": dict,
 }
 # Keep in step with kRtxSkipNames in rtx_telemetry.h.
@@ -154,7 +156,7 @@ def check(path):
             errors += [f"line {number}: {p}" for p in check_normal_gate(obj)]
             errors += [f"line {number}: {p}" for p in check_exposure(obj)]
             for key in ("frameTimeMs", "gpuTimeMs", "textureMemoryMB", "vramUsedMB", "telemetryCpuMs", "textureBudgetMB",
-                        "vramFreeMB", "remixShaderCompiles"):
+                        "vramFreeMB", "remixShaderCompiles", "instancedSharedSlotDraws", "instancedCapturedDraws"):
                 if isinstance(obj.get(key), (int, float)) and not isinstance(obj.get(key), bool) and obj[key] < 0:
                     errors.append(f"line {number}: {key} negative")
             if len(errors) > 20:

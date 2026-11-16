@@ -136,6 +136,8 @@ static void testTelemetry(const std::string& dir) {
   t.effectiveExposure = 1.5f;
   t.skips[size_t(RtxSkip::ZeroPrimitives)] = 4;
   t.skips[size_t(RtxSkip::NoTextureHash)] = 17;
+  t.instancedSharedSlotDraws = 22;
+  t.instancedCapturedDraws = 3;
   t.passes.push_back(RtxPassTime { "InjectRTX", 28.5, 3.25, 1 });
   t.passes.push_back(RtxPassTime { "InjectRTX/Gate Telemetry", -1.0, 0.125, 2 });
   t.newLegacyMaterials = { 0x0123456789ABCDEFull, 0x1ull };
@@ -196,7 +198,20 @@ static void testTelemetry(const std::string& dir) {
     formatTelemetryLine(badLine, sizeof(badLine), bad);
     CHECK(std::strstr(badLine, "\"autoExposure\":null,\"effectiveExposure\":null,") != nullptr, "non-finite exposure printed as null: %s", badLine);
   }
-  CHECK(std::strstr(line, "\"skips\":{\"zeroPrimitives\":4,\"noTextureHash\":17},") != nullptr, "only non-zero skip reasons printed: %s", line);
+  CHECK(std::strstr(line, "\"skips\":{\"zeroPrimitives\":4,\"noTextureHash\":17},\"instancedSharedSlotDraws\":22,"
+                          "\"instancedCapturedDraws\":3,\"passMs\":{") != nullptr,
+        "only non-zero skip reasons printed, then the two instanced counts, shared slots first: %s", line);
+  {
+    // The draw thread's counts reach the frame record by slot: shared-slot draws must not land in the kept count.
+    for (uint32_t i = 0; i < 5; ++i) {
+      countInstancedCapture(true);
+    }
+    countInstancedCapture(false);
+    const uint32_t kept = g_instancedCaptures[0].exchange(0);
+    const uint32_t shared = g_instancedCaptures[1].exchange(0);
+    CHECK(shared == 5 && kept == 1, "countInstancedCapture(true) counts shared slots, (false) every copy kept: %u shared %u kept",
+          shared, kept);
+  }
   CHECK(std::strstr(line, "\"passMs\":{\"InjectRTX\":[28.500,3.250,1],\"InjectRTX/Gate Telemetry\":[-1.000,0.125,2]},") != nullptr,
         "step times printed as [gpuMs,cpuMs,count]: %s", line);
   CHECK(std::strstr(line, "\"newLegacyMaterials\":[\"0123456789ABCDEF\",\"0000000000000001\"],\"rgbThumb\":\"BBBB\",") != nullptr,
@@ -206,7 +221,8 @@ static void testTelemetry(const std::string& dir) {
         "a buffer one byte short fails and an exact fit succeeds");
   char emptyLine[1024];
   formatTelemetryLine(emptyLine, sizeof(emptyLine), RtxFrameTelemetry());
-  CHECK(std::strstr(emptyLine, "\"skips\":{},\"passMs\":{}}\n") != nullptr, "empty maps and absent optional fields: %s", emptyLine);
+  CHECK(std::strstr(emptyLine, "\"skips\":{},\"instancedSharedSlotDraws\":0,\"instancedCapturedDraws\":0,\"passMs\":{}}\n") != nullptr,
+        "empty maps, zero instanced counts and absent optional fields: %s", emptyLine);
   CHECK(std::strstr(emptyLine, "\"autoExposure\":null,\"effectiveExposure\":null,") != nullptr, "no exposure read back prints null: %s", emptyLine);
 
   const std::string path = dir + "\\telemetry_sample.jsonl";
