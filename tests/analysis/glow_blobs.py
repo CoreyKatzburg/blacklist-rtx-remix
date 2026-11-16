@@ -52,6 +52,16 @@ lamp glow the original shows goes missing):
   3 in Remix areas above 191 luma); unedited stills count 1 lost, a lamp reflection in a wet-floor stain that
   Remix does not draw (y180_p-30, x 305 y 104).
 
+Fourth count, dimmed lamps (a must-stay check for a change that removes something, such as the stand-in balls;
+coordinator, Nov 16). The lost count misses a lamp whose Remix glow sits on a wall Remix lights brightly, so this
+count compares Remix with itself before and after the change, at the lamps the original shows:
+  9. Inputs: the original still and three Remix stills at the same pose: on (before the change), changed, on_again
+     (change undone). For each strong original glow (rule 7 with contrast >= STRONG_STEPS), Remix's glow in each
+     still is its highest contrast within MATCH_PX of the original's peak. The lamp is DIMMED when Remix shows it
+     before the change (glow on >= ORIG_STEPS) and on - changed > max(DROP_MIN, 3 x |on - on_again|), so a drop
+     inside the run's own on/on_again noise does not count. PASS when at most ALLOWED lamps are dimmed.
+  Usage: --dimmed CHANGED --again ON_AGAIN with --remix-spot, --orig-spot and --still ON (window names).
+
 HUD: with --orig-spot, pixels that stand out (contrast >= ORIG_STEPS) at the same screen place in at least half of
 the original spot's stills, although the camera turned between them, are the HUD; the mask is that set grown by 2 px
 with enclosed holes (the radar disc) filled. Blobs, puffs and glows whose peak lies on the HUD are skipped in all
@@ -79,7 +89,7 @@ BLOB_STEPS, ORIG_STEPS, BLOB_MAX_PX, MATCH_PX, BORDER_PX, ALLOWED = 24.0, 12.0, 
 GAIN_MAX, RING_BRIGHT_MAX = 6.0, 0.2
 POSE_CM, POSE_DEG = 25.0, 1.5
 CELL, CELL_WIN, PUFF_STEPS = 4, 15, 24.0
-KEEP_FRAC, STRONG_STEPS = 0.75, 100.0
+KEEP_FRAC, STRONG_STEPS, DROP_MIN = 0.75, 100.0, 12.0
 HUD_MIN_STILLS = 8
 
 
@@ -313,6 +323,34 @@ def report_lost(rows, skipped, out=print) -> bool:
     return ok
 
 
+def dimmed_lamps(orig, on, changed, on_again, hud=None):
+    """Rule 9: rows for every strong original glow, with "dimmed" set when the change takes Remix's glow there away."""
+    co, bo = contrast(orig)
+    skipped = {"big": 0, "border": 0, "hud": 0, "area edge": 0}
+    near = lambda y, x: np.hypot(YY - y, XX - x) <= MATCH_PX
+    cs = [contrast(img)[0] for img in (on, changed, on_again)]
+    rows = []
+    for area, y, x, peak, d in small_blobs(orig, co, bo, hud, skipped):
+        if peak < STRONG_STEPS:
+            continue
+        a, b, c = (float(ci[near(y, x)].max()) for ci in cs)
+        noise = abs(a - c)
+        rows.append({"x": x, "y": y, "peak": peak, "on": a, "changed": b, "on_again": c,
+                     "shown": a >= ORIG_STEPS, "dimmed": a >= ORIG_STEPS and a - b > max(DROP_MIN, 3 * noise)})
+    return rows, skipped
+
+
+def report_dimmed(rows, out=print) -> bool:
+    bad = [r for r in rows if r["dimmed"]]
+    ok = len(bad) <= ALLOWED
+    out(f"glow_blobs: dimmed {len(bad)} of {len(rows)} lamps the original shows ({sum(r['shown'] for r in rows)} shown "
+        f"by Remix before the change; drop > max({DROP_MIN:g}, 3 x |on - on_again|)): {'PASS' if ok else 'FAIL'}")
+    for r in rows:
+        out(f"  lamp at x {r['x']} y {r['y']}: original contrast {r['peak']:.0f}, Remix glow on {r['on']:.0f}, "
+            f"changed {r['changed']:.0f}, on_again {r['on_again']:.0f}{'  DIMMED' if r['dimmed'] else ''}")
+    return ok
+
+
 def check_all(remix, orig, hud, out=print):
     """All three counts; returns (verdict, (orbs unmatched, puffs, lost)). The verdict is orbs and lost glows only."""
     out(f"glow_blobs: hud mask {'none' if hud is None else f'{int(hud.sum())} px'}")
@@ -432,6 +470,21 @@ def self_test() -> int:
     lost_case("an original-only glow on the HUD mask is not lost", base, lamp, 0, hud)
     lost_case("no glow lost: Remix and original agree", base, orig, 0)
 
+    # Dimmed lamps (rule 9).
+    def dim_case(name, on, changed, on_again, want):
+        rows, _ = dimmed_lamps(lamp.astype(np.float32), on.astype(np.float32), changed.astype(np.float32),
+                               on_again.astype(np.float32))
+        lines = []
+        report_dimmed(rows, out=lines.append)
+        tally(name, sum(r["dimmed"] for r in rows) == want, lines[0])
+
+    shown = _dot(base, 100, 60, amp=80)
+    dim_case("the change takes away Remix's glow at a lamp the original shows: dimmed", shown, base, shown, 1)
+    dim_case("the change keeps the glow: not dimmed", shown, shown, shown, 0)
+    dim_case("the change halves the glow (80 to 40): dimmed", shown, _dot(base, 100, 60, amp=40), shown, 1)
+    dim_case("the drop is inside the run's own on / on_again difference: not dimmed", shown, base, base, 0)
+    dim_case("Remix never showed the lamp (the lost count's job): not dimmed", base, base, base, 0)
+
     # Real pictures (coordinator, Nov 16): run 20261115-142638 con_bright_hall against the original game's picture in
     # reference-20261116-000454 at the same pose. Missing data fails the self-test rather than skipping it.
     global STRONG_STEPS
@@ -482,6 +535,40 @@ def self_test() -> int:
                  "y0_p0", (False, 12, None, 0), edit=erase(37, 8))
         finally:
             STRONG_STEPS = saved
+
+        # Dimmed lamps on real pictures: the original's ceiling lamp at x 214 y 57 in y225_p0 sits on a wall Remix
+        # lights above the lost count's need, so erasing Remix's glow there is missed by the lost count.
+        og_225 = spot_still(og_spot, "y225_p0")
+        rx_225, _ = spot_still(rx_spot, "y225_p0")
+        gone = erase(214, 57)(rx_225)
+        n_lost = sum(r["lost"] for r in lost_glows(gone, og_225[0], og_hud)[0])
+        tally("142638 y225_p0 with Remix's lamp glow at x 214 y 57 erased: the lost count misses it (lost 0)",
+              n_lost == 0, f"lost {n_lost}")
+        for name, ch, ag, want in (("unedited (changed = on = on_again): dimmed 0", rx_225, rx_225, 0),
+                                   ("that lamp erased in the changed step: dimmed 1", gone, rx_225, 1),
+                                   ("erased in on_again too, so the drop is inside the noise: dimmed 0", gone, gone, 0)):
+            rows, _ = dimmed_lamps(og_225[0], rx_225, ch, ag, og_hud)
+            lines = []
+            report_dimmed(rows, out=lines.append)
+            n = sum(r["dimmed"] for r in rows)
+            hit = any(r["dimmed"] and abs(r["x"] - 214) <= 3 and abs(r["y"] - 57) <= 3 for r in rows)
+            tally("142638 y225_p0 " + name, n == want and (want == 0 or hit), lines[0])
+        sweep = [r for r in dimmed_lamps(og_225[0], rx_225, rx_225, rx_225, og_hud)[0] if r["shown"]]
+        caught = sum(any(q["dimmed"] and q["x"] == r["x"] and q["y"] == r["y"] for q in
+                         dimmed_lamps(og_225[0], rx_225, erase(r["x"], r["y"])(rx_225), rx_225, og_hud)[0])
+                     for r in sweep)
+        tally("142638 y225_p0 erase sweep: every lamp Remix shows is caught when erased", caught == len(sweep) > 0,
+              f"{caught} of {len(sweep)}")
+        # Real change: the balls-off switch step at y0_p0. No lamp there is close, so 0 here does not prove the
+        # balls are unneeded; it only shows the count does not fire on a real change that keeps the lamps.
+        on, _ = spot_still(rx_spot, "switch_base")
+        off, _ = spot_still(rx_spot, "switch_flare_balls_off")
+        again, _ = spot_still(rx_spot, "switch_base_again")
+        rows, _ = dimmed_lamps(og_y0, on, off, again, og_hud)
+        lines = []
+        report_dimmed(rows, out=lines.append)
+        tally("142638 balls off at y0_p0 dims no lamp the original shows (no close lamp in this view)",
+              sum(r["dimmed"] for r in rows) == 0 and len(rows) > 0, lines[0])
     except (OSError, SystemExit) as e:
         tally("real-picture cases", False, f"data missing ({e})")
     print("self-test:", "all passed" if not fails else f"FAILED {fails}")
@@ -500,8 +587,25 @@ def main():
     ap.add_argument("--still")
     ap.add_argument("--orig-still")
     ap.add_argument("--crops", type=pathlib.Path)
+    ap.add_argument("--dimmed", help="window name of the changed Remix step (fourth count only)")
+    ap.add_argument("--again", help="window name of the Remix step with the change undone")
     a = ap.parse_args()
     pose, hud = a.pose, None
+    if a.dimmed:
+        if not (a.remix_spot and a.orig_spot and a.still and a.again):
+            ap.error("--dimmed needs --remix-spot, --orig-spot, --still and --again")
+        on, rpose = spot_still(a.remix_spot, a.still)
+        orig, opose = spot_still(a.orig_spot, a.orig_still or a.still)
+        changed, cpose = spot_still(a.remix_spot, a.dimmed)
+        again, apose = spot_still(a.remix_spot, a.again)
+        for name, p in (("original", opose), ("changed", cpose), ("on_again", apose)):
+            ok, dist, dyaw, dpitch = pose_ok((rpose, p))
+            if not ok:
+                print(f"glow_blobs: NOT MEASURED, {name} pose differs from on by {dist:.0f} cm, yaw {dyaw:.2f}, "
+                      f"pitch {dpitch:.2f} deg")
+                sys.exit(2)
+        rows, _ = dimmed_lamps(orig, on, changed, again, spot_hud(a.orig_spot))
+        sys.exit(0 if report_dimmed(rows) else 1)
     if a.remix_spot and a.orig_spot and a.still:
         remix, rpose = spot_still(a.remix_spot, a.still)
         orig, opose = spot_still(a.orig_spot, a.orig_still or a.still)
