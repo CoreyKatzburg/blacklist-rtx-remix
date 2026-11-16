@@ -45,8 +45,9 @@ Checks (thresholds in THRESHOLDS):
   skip_other_share         worst scene window's share of draws skipped for any other reason
   material_share           share of scene draws that used a mod replacement material, in the worst spot
   textures_demoted         share of scene frames where the texture budget shrank textures (telemetry texturesDemoted)
-  clean_quit               bridge32.log has "Sending Terminate command to server" (else NOT MEASURED), no
-                           VK_ERROR_DEVICE_LOST in remix-dxvk.log, and no proxy Present > 1000 ms in the last 10 s
+  clean_quit               no VK_ERROR_DEVICE_LOST in remix-dxvk.log and no non-zero exit code in drive.log's QUIT
+                           record (either fails); then bridge32.log has "Sending Terminate command to server" (else
+                           NOT MEASURED), and no proxy Present > 1000 ms in the last 10 s
   present_stalls           d3d9_proxy_frames.csv col 3 (time inside Present) > 50 ms in any measured window, excluding
                            loading-screen frames via is_proxy_loading
   goggles_toggle_rebuilds  on the first rayTraced=true frame after rayTraced=false in any goggles window, telemetry
@@ -612,8 +613,8 @@ def recorder_checks(run: Run, pick, good: list[dict], tsrc: str) -> None:
         run_dir=run.dir,
         proxy_by_dir={s["_dir"]: s["_data"]["proxy"] for s in good},
     )
-    run.add("clean_quit", st, val, "Terminate logged, no VK_ERROR_DEVICE_LOST, no Present > 1000 ms in last 10 s",
-            detail, "bridge32.log + remix-dxvk.log + d3d9_proxy_frames.csv")
+    run.add("clean_quit", st, val, "no VK_ERROR_DEVICE_LOST, exit code 0, Terminate logged, no Present > 1000 ms in last 10 s",
+            detail, "remix-dxvk.log + drive.log + bridge32.log + d3d9_proxy_frames.csv")
 
 
 def find_session_log(folder: str, stem: str) -> str | None:
@@ -628,8 +629,9 @@ def find_session_log(folder: str, stem: str) -> str | None:
 def check_clean_quit_dirs(dirs: list[str], run_dir: str | None = None,
                           proxy_by_dir: dict[str, dict[int, list[str]]] | None = None) -> tuple[str, int | None, str]:
     """Extended clean_quit check across spot/session dirs (and optional run_dir):
-    1) bridge32.log must contain 'Sending Terminate command to server' (else NOT_MEASURED).
-    2) remix-dxvk.log must exist for every dir and have no VK_ERROR_DEVICE_LOST.
+    1) remix-dxvk.log must exist for every dir and have no VK_ERROR_DEVICE_LOST, and a drive.log QUIT record must
+       not show a non-zero exit code; either fails at once, even without Terminate (a crash never logs it).
+    2) bridge32.log must contain 'Sending Terminate command to server' (else NOT_MEASURED).
     3) No proxy Present > 1000 ms in the last 10 s before Terminate.
     Counts (without judging) 'were not disposed of' and bridge64 'objects discovered in'."""
     if not dirs:
@@ -640,14 +642,32 @@ def check_clean_quit_dirs(dirs: list[str], run_dir: str | None = None,
         return NOT_MEASURED, None, f"{missing_n} of {len(dirs)} spots have no remix-dxvk.log"
 
     search_dirs = list(dirs) + ([run_dir] if run_dir and run_dir not in dirs else [])
+    lost = [os.path.basename(d) for d, p in zip(dirs, dxvk_logs)
+            if p and any("VK_ERROR_DEVICE_LOST" in ln for ln in read_lines(p))]
+    # A quit spot's drive.log ends with 'QUIT {json}' holding the game's exit code once it exited.
+    bad_exit = []
+    for d in dirs:
+        dp = os.path.join(d, "drive.log")
+        for ln in (read_lines(dp) if os.path.exists(dp) else []):
+            if ln.startswith("QUIT "):
+                try:
+                    q = json.loads(ln[5:])
+                except ValueError:
+                    continue
+                if q.get("exited") and q.get("exitCode") not in (None, 0):
+                    bad_exit.append(f"{os.path.basename(d)} exit 0x{int(q['exitCode']) & 0xFFFFFFFF:08X}")
+    # Device loss or a crash exit fails the spot even when the crash kept bridge32 from logging Terminate.
+    if lost or bad_exit:
+        parts = ([f"VK_ERROR_DEVICE_LOST in: {', '.join(lost)}"] if lost else []) + \
+                ([f"non-zero exit: {', '.join(bad_exit)}"] if bad_exit else [])
+        return FAIL, len(lost) + len(bad_exit), "; ".join(parts)
+
     b32_logs = [p for d in search_dirs if (p := find_session_log(d, "bridge32")) is not None]
     term_dirs = [d for d in search_dirs
                  if (p := find_session_log(d, "bridge32")) and any("Sending Terminate command to server" in ln for ln in read_lines(p))]
     if not b32_logs or not term_dirs:
         return NOT_MEASURED, None, "bridge32.log has no 'Sending Terminate command to server' (game did not quit cleanly)"
 
-    lost = [os.path.basename(d) for d, p in zip(dirs, dxvk_logs)
-            if p and any("VK_ERROR_DEVICE_LOST" in ln for ln in read_lines(p))]
     not_disposed = sum(1 for p in dxvk_logs if p for ln in read_lines(p) if "were not disposed of" in ln)
     b64_leaks = sum(1 for d in search_dirs if (p := find_session_log(d, "bridge64"))
                     for ln in read_lines(p) if "objects discovered in" in ln)

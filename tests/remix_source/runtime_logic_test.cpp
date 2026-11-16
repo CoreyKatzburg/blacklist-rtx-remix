@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -130,6 +131,9 @@ static void testTelemetry(const std::string& dir) {
   t.thumbNonFinite = 5;
   t.thumbClipped = 9;
   t.remixShaderCompiles = 7;
+  t.hasExposure = true;
+  t.autoExposure = 0.75f;
+  t.effectiveExposure = 1.5f;
   t.skips[size_t(RtxSkip::ZeroPrimitives)] = 4;
   t.skips[size_t(RtxSkip::NoTextureHash)] = 17;
   t.passes.push_back(RtxPassTime { "InjectRTX", 28.5, 3.25, 1 });
@@ -182,7 +186,16 @@ static void testTelemetry(const std::string& dir) {
   CHECK(std::strstr(line, "\"rayTraced\":true,\"telemetryCpuMs\":0.250,\"replacedMaterialDraws\":800,\"legacyMaterialDraws\":31,"
                           "\"texturesDemoted\":2,\"textureBudgetMB\":3072.0,\"vramFreeMB\":1185.4,\"thumbNonFinite\":5,\"thumbClipped\":9,") != nullptr,
         "recorder, material, texture and bad-pixel fields printed: %s", line);
-  CHECK(std::strstr(line, "9,\"remixShaderCompiles\":7,\"skips\":{") != nullptr, "remixShaderCompiles printed after thumbClipped: %s", line);
+  CHECK(std::strstr(line, "9,\"remixShaderCompiles\":7,\"autoExposure\":0.75,\"effectiveExposure\":1.5,\"skips\":{") != nullptr,
+        "remixShaderCompiles then the exposure pair printed after thumbClipped: %s", line);
+  {
+    // A texel that read back as NaN must not reach the file as a number; null makes the contract fail the frame.
+    RtxFrameTelemetry bad = t;
+    bad.autoExposure = std::numeric_limits<float>::quiet_NaN();
+    char badLine[2048];
+    formatTelemetryLine(badLine, sizeof(badLine), bad);
+    CHECK(std::strstr(badLine, "\"autoExposure\":null,\"effectiveExposure\":null,") != nullptr, "non-finite exposure printed as null: %s", badLine);
+  }
   CHECK(std::strstr(line, "\"skips\":{\"zeroPrimitives\":4,\"noTextureHash\":17},") != nullptr, "only non-zero skip reasons printed: %s", line);
   CHECK(std::strstr(line, "\"passMs\":{\"InjectRTX\":[28.500,3.250,1],\"InjectRTX/Gate Telemetry\":[-1.000,0.125,2]},") != nullptr,
         "step times printed as [gpuMs,cpuMs,count]: %s", line);
@@ -194,6 +207,7 @@ static void testTelemetry(const std::string& dir) {
   char emptyLine[1024];
   formatTelemetryLine(emptyLine, sizeof(emptyLine), RtxFrameTelemetry());
   CHECK(std::strstr(emptyLine, "\"skips\":{},\"passMs\":{}}\n") != nullptr, "empty maps and absent optional fields: %s", emptyLine);
+  CHECK(std::strstr(emptyLine, "\"autoExposure\":null,\"effectiveExposure\":null,") != nullptr, "no exposure read back prints null: %s", emptyLine);
 
   const std::string path = dir + "\\telemetry_sample.jsonl";
   {
@@ -215,6 +229,11 @@ static void testTelemetry(const std::string& dir) {
       f.instances = 1500 + i % 13;
       f.cameraCut = (i % 1000) == 0;
       f.rayTraced = (i % 4) != 0;
+      if (f.rayTraced) {   // exposure only exists on ray-traced frames; the contract wants null on the others
+        f.hasExposure = true;
+        f.autoExposure = 0.25f + 0.25f * float(i % 5);
+        f.effectiveExposure = 2.0f * f.autoExposure;
+      }
       f.skips[i % size_t(RtxSkip::Count)] = 1 + i % 3;   // every reason name reaches the contract check
       f.passes.push_back(RtxPassTime { "InjectRTX", (i % 50) == 0 ? -1.0 : 28.5, 3.0, 1 });
       const auto start = std::chrono::steady_clock::now();

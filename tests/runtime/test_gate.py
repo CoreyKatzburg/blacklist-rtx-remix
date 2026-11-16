@@ -243,6 +243,30 @@ class FakeRunTest(unittest.TestCase):
             self.assertEqual(st, gate.PASS, detail)
             self.assertIn("not-disposed", detail)
 
+    def test_clean_quit_20261116_082350(self):
+        # quit_menu: ray tracing on, the minimize lost the device and the game exited 0xC0000005 without Terminate.
+        # quit_altf4: ray tracing on, closed by SC_CLOSE, exit 0, no device loss.
+        base = r"D:\BlacklistOverhaul\experiments\remix-gate\20261116-082350"
+        if not os.path.isdir(base):
+            return
+        st, val, detail = gate.check_clean_quit_dirs([os.path.join(base, "quit_menu")])
+        self.assertEqual(st, gate.FAIL, detail)
+        self.assertIn("VK_ERROR_DEVICE_LOST", detail)
+        self.assertIn("0xC0000005", detail)
+        st, val, detail = gate.check_clean_quit_dirs([os.path.join(base, "quit_altf4")])
+        self.assertEqual(st, gate.PASS, detail)
+
+    def test_clean_quit_crash_exit_without_device_loss(self):
+        # A crash exit fails even when remix-dxvk.log is clean and Terminate was never logged.
+        with tempfile.TemporaryDirectory() as t:
+            with open(os.path.join(t, "remix-dxvk.log"), "w") as f:
+                f.write("[08:00:00.000] info:  nothing wrong here\n")
+            with open(os.path.join(t, "drive.log"), "w") as f:
+                f.write('QUIT {"exited": true, "exitCode": 3221225477}\n')
+            st, val, detail = gate.check_clean_quit_dirs([t])
+            self.assertEqual(st, gate.FAIL, detail)
+            self.assertIn("non-zero exit", detail)
+
     def test_ray_tracing_checks_on_20261116_063147(self):
         base = r"D:\BlacklistOverhaul\experiments\remix-gate\20261116-063147"
         if not os.path.isdir(base):

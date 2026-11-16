@@ -4,6 +4,7 @@ Usage: python check_telemetry_contract.py <file.jsonl>   (exit code 0 = every li
 Works on the sample written by runtime_logic_test.exe and on the file the game run produces.
 """
 import json
+import math
 import sys
 
 REQUIRED = {
@@ -99,6 +100,22 @@ def check_normal_gate(obj):
     return problems
 
 
+def check_exposure(obj):
+    """Problems in one record's exposure pair. Both keys are always present: positive finite numbers on
+    ray-traced frames (the multiplier the tone mapper used that frame), null on frames with rayTraced false."""
+    problems = []
+    if "autoExposure" not in obj or "effectiveExposure" not in obj:
+        return ["missing autoExposure or effectiveExposure"]
+    for key in ("autoExposure", "effectiveExposure"):
+        value = obj[key]
+        if obj.get("rayTraced") is True:
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                problems.append(f"{key} = {value!r} on a ray-traced frame, expected a positive number")
+        elif obj.get("rayTraced") is False and value is not None:
+            problems.append(f"{key} = {value!r} on a frame that was not ray traced, expected null")
+    return problems
+
+
 def check(path):
     errors = []
     previous = None
@@ -135,6 +152,7 @@ def check(path):
                     previous_qpc = qpc
             errors += [f"line {number}: {p}" for p in check_maps(obj)]
             errors += [f"line {number}: {p}" for p in check_normal_gate(obj)]
+            errors += [f"line {number}: {p}" for p in check_exposure(obj)]
             for key in ("frameTimeMs", "gpuTimeMs", "textureMemoryMB", "vramUsedMB", "telemetryCpuMs", "textureBudgetMB",
                         "vramFreeMB", "remixShaderCompiles"):
                 if isinstance(obj.get(key), (int, float)) and not isinstance(obj.get(key), bool) and obj[key] < 0:
