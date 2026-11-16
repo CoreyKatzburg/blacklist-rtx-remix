@@ -801,7 +801,7 @@ class Reference(unittest.TestCase):
         self.assertNotIn("error", ok)
         self.assertEqual(len(ok["samples_ms"]), 20)
         self.assertLess(ok["captureFps"], 240)
-        self.assertIsNotNone(gate.spot_mouse_lag({"mouse_lag": ok}))
+        self.assertIsNotNone(gate.spot_screen_lag({"mouse_lag": ok}))
 
         always = self._lag_with_fake_grab("always")
         self.assertIsNone(always["samples_ms"])
@@ -815,7 +815,7 @@ class Reference(unittest.TestCase):
         self.assertGreater(late["captureFps"], 240)
         self.assertIsNone(late["samples_ms"])
         self.assertIn("over the whole measurement", late["error"])
-        self.assertIsNone(gate.spot_mouse_lag({"mouse_lag": late}))
+        self.assertIsNone(gate.spot_screen_lag({"mouse_lag": late}))
 
     def test_renderer_must_match_the_run(self):
         log = ("2026-11-15 21:42:24.180 [pid 25472] chained RTX Remix DLL: D:\\Steam\\x\\SYSTEM\\d3d9_remix.dll\r\n"
