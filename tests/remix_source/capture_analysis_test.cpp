@@ -270,6 +270,7 @@ static void testGameShaders(const std::string& path, const char* dumpPath) {
   const std::set<std::string> camera = { "gWorldToProj", "gViewportOffset", "gViewportSB", "cViewPos_VS", "cProjSkinMesh" };
   const std::set<std::string> worldRotation = { "gLocalToWorld", "gBones", "gDrawScale", "gForces" };
   size_t valid = 0, world = 0, worldWithNormalInput = 0, normalsFound = 0, withRanges = 0, zeroNormalShadersSeen = 0;
+  size_t capturedNormalOff = 0, capturedNormalOn = 0;
   std::map<std::string, int> normalSemantics;
 
   for (const auto& sh : shaders) {
@@ -346,6 +347,13 @@ static void testGameShaders(const std::string& path, const char* dumpPath) {
           }
           std::printf("\n");
         }
+        // d3d9_rtx.cpp binds the captured normal buffer only when usesCapturedNormal() says so:
+        // off keeps the stock rule (normal output only), on adds the synthesized normals.
+        CHECK(usesCapturedNormal(a, false) == a.hasNormalOutput, "0x%zx: option off must keep the normal-output rule", sh.offset);
+        CHECK(usesCapturedNormal(a, true) == (a.hasNormalOutput || a.hasSynthesizedNormal),
+              "0x%zx: option on must also use the synthesized normal (has=%d synth=%d)", sh.offset, a.hasNormalOutput, a.hasSynthesizedNormal);
+        capturedNormalOff += usesCapturedNormal(a, false);
+        capturedNormalOn += usesCapturedNormal(a, true);
         if (a.hasNormalOutput) {
           normalsFound++;
           normalSemantics[(a.normalOutputUsage == 5 ? "TEXCOORD" : std::to_string(a.normalOutputUsage)) + std::to_string(a.normalOutputIndex)]++;
@@ -392,6 +400,9 @@ static void testGameShaders(const std::string& path, const char* dumpPath) {
     { "TEXCOORD1", 5 }, { "TEXCOORD2", 21 }, { "TEXCOORD3", 3 }, { "TEXCOORD4", 69 }
   };
   CHECK(shaders.size() == 263 && world == 198 && worldWithNormalInput == 172 && zeroNormalShadersSeen == 6, "game shader inventory changed");
+  // Normal buffer bound: 98 world shaders with the option off, all 172 with it on (74 synthesized).
+  CHECK(capturedNormalOff == 98 && capturedNormalOn == 172,
+        "captured normal buffer use changed (off %zu, on %zu)", capturedNormalOff, capturedNormalOn);
   CHECK(normalsFound == worldWithNormalInput && normalSemantics == expected,
         "normal output detection changed (found %zu of %zu)", normalsFound, worldWithNormalInput);
 }
