@@ -51,6 +51,43 @@ class Span(unittest.TestCase):
         self.assertEqual(cinematic.camera_row("540,1663.1,1.6,1,1,1,G:0:0:0.000:-0.000:0.000:1:0:0:0")[2], None)
         self.assertIsNone(cinematic.camera_row("frame,ms"))
 
+    def test_draw_dump_takes_only_new_files_and_turns_the_capture_off(self):
+        # Worker F's mid-cutscene dump: a fake proxy writes f5000_draws.tsv and a new shader when CaptureDraws=1.
+        # A dump of the same name from an earlier launch, and an older shader, must not count; the ini ends at 0.
+        import re, tempfile, threading, time
+        with tempfile.TemporaryDirectory() as root:
+            system, out = os.path.join(root, "SYSTEM"), os.path.join(root, "out")
+            for f in ("framedump", "psdump", "vsdump"):
+                os.makedirs(os.path.join(system, f))
+            old = os.path.join(system, "framedump", "f5000_draws.tsv")
+            for p in (old, os.path.join(system, "psdump", "ps_old.bin")):
+                open(p, "w").close(); os.utime(p, (1, 1))
+            ini = os.path.join(system, "d3d9_proxy.ini")
+            with open(ini, "w", newline="") as f:
+                f.write("[Proxy]\r\nCaptureDraws=0\r\n")
+            def proxy():
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if re.search(r"CaptureDraws=1", open(ini).read()):
+                        time.sleep(0.3)
+                        with open(old, "w") as f:
+                            f.write("rewritten")
+                        open(os.path.join(system, "psdump", "ps_new.bin"), "w").close()
+                        return
+                    time.sleep(0.05)
+            t = threading.Thread(target=proxy); t.start()
+            rec = cinematic.draw_dump(ini, system, out, timeout=4.0)
+            t.join()
+            self.assertEqual(rec.get("frame"), 5000)
+            self.assertEqual(sorted(rec["files"]), [os.path.join("framedump", "f5000_draws.tsv"),
+                                                    os.path.join("psdump", "ps_new.bin")])
+            self.assertIn("CaptureDraws=0", open(ini).read())
+            self.assertFalse(os.path.exists(os.path.join(out, "drawdump", "psdump", "ps_old.bin")))
+            # Nothing written: an error, not a quiet success, and the capture still ends at 0.
+            rec = cinematic.draw_dump(ini, system, out, timeout=0.5)
+            self.assertIn("error", rec)
+            self.assertIn("CaptureDraws=0", open(ini).read())
+
 
 if __name__ == "__main__":
     unittest.main()

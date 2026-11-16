@@ -1,0 +1,18 @@
+{
+ "about": "worker C, Nov 16: swapchain recreate fix, ray tracing on: minimize 5 s, restore, hold 10 s, then the menu quit. Fix off first (rtx.swapchainRecreateWaitIdle = False, expected VK_ERROR_DEVICE_LOST as in 082350), then fix on (True, the default, set explicitly so remix-dxvk.log proves it was read). Each recreate logs [RTX Swapchain] recreate: extent, pendingSubmissions, waitIdle on|off, waited ms. Read with tests/analysis/quit_crash.py.",
+ "spot": "quit_minimize_menu",
+ "variants": [
+  {
+   "name": "01_fix_off",
+   "rtx": {
+    "rtx.swapchainRecreateWaitIdle": "False"
+   }
+  },
+  {
+   "name": "02_fix_on",
+   "rtx": {
+    "rtx.swapchainRecreateWaitIdle": "True"
+   }
+  }
+ ]
+}

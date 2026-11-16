@@ -521,7 +521,9 @@ try {
                 Start-Process $Py -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $spotDir 'cinematic.log') `
                     -RedirectStandardError (Join-Path $spotDir 'cinematic.err') -ArgumentList (@((Join-Path $Runtime 'cinematic.py'),
                     '--log', "$S\d3d9_proxy.log", '--frames', "$S\d3d9_proxy_frames.csv", '--out', (Join-Path $spotDir 'cinematic')) +
-                    @(if ($NoRemix) { '--signal', 'camera' }) |
+                    @(if ($NoRemix) { '--signal', 'camera' }) +
+                    # "cinematicDrawDumpAt": one proxy draw dump that many seconds into the cutscene (worker F, Nov 16).
+                    @(if ($spot.cinematicDrawDumpAt) { '--dump-at', [string]$spot.cinematicDrawDumpAt, '--ini', "$S\d3d9_proxy.ini", '--system', $S }) |
                     ForEach-Object { '"' + $_ + '"' }) }
             # GPU clocks, temperature, power, clock-limit reasons and memory once a second for the whole launch
             # (worker C, Nov 16: what puts a launch in the slow Ray Reconstruction mode).

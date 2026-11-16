@@ -17,6 +17,7 @@ import csv
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -25,7 +26,7 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from drive import FFMPEG, user32  # noqa: E402
+from drive import FFMPEG, files_under, set_ini, user32, written_since  # noqa: E402
 
 W, H, FPS = 640, 360, 30
 NEAR_BLACK, NEAR_WHITE, FULL_WHITE = 8, 230, 250   # of 255; near-black and full-white as in switch_report.py
@@ -97,6 +98,38 @@ def letterbox(frames: np.ndarray) -> tuple[int, int]:
     return top, bottom
 
 
+def draw_dump(ini: str, system: str, out: str, timeout: float = 8.0) -> dict:
+    """One proxy draw dump in the middle of the cutscene (worker F, Nov 16): [Proxy] CaptureDraws=1 until a new
+    framedump\\f<frame>_draws.tsv is written, then 0. The new draw and light dumps, and any new shaders in psdump and
+    vsdump, are copied to out\\drawdump. Files are found by write time: frame numbers repeat between launches."""
+    folders = ("framedump", "psdump", "vsdump")
+    before = {f: files_under(os.path.join(system, f)) for f in folders}
+    rec = {"askedMs": round(time.perf_counter() * 1000.0, 1), "askedAt": time.strftime("%H:%M:%S")}
+    try:
+        set_ini(ini, "Proxy", "CaptureDraws", "1")
+        t = time.perf_counter()
+        draws = []
+        while time.perf_counter() - t < timeout and not draws:
+            time.sleep(0.1)
+            draws = [n for n in written_since(os.path.join(system, "framedump"), before["framedump"])
+                     if n.endswith("_draws.tsv")]
+    finally:
+        set_ini(ini, "Proxy", "CaptureDraws", "0")
+    time.sleep(1.0)   # let the proxy finish the file and the shaders it dumps with it
+    if not draws:
+        rec["error"] = f"no new _draws.tsv within {timeout:.0f} s"
+        return rec
+    rec["frame"] = int(draws[0].split("_")[0].lstrip("f"))
+    rec["files"] = []
+    for f in folders:
+        for n in written_since(os.path.join(system, f), before[f]):
+            dest = os.path.join(out, "drawdump", f, n)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.copy2(os.path.join(system, f, n), dest)
+            rec["files"].append(os.path.join(f, n))
+    return rec
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--pid", type=int, default=0, help="the game; 0 = whichever game logs the line first (one game "
@@ -108,6 +141,9 @@ def main() -> int:
     ap.add_argument("--wait", type=float, default=480.0, help="seconds to wait for the level to start")
     ap.add_argument("--seconds", type=float, default=60.0, help="longest recording")
     ap.add_argument("--settle", type=float, default=1.0)
+    ap.add_argument("--dump-at", type=float, default=0.0, help="seconds after the cutscene starts for one proxy draw "
+                                                                 "dump (0 = none); needs --ini and --system")
+    ap.add_argument("--ini", help="the game's d3d9_proxy.ini"); ap.add_argument("--system", help="the game's SYSTEM folder")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     log, frames = Growing(a.log), Growing(a.frames)
@@ -154,12 +190,21 @@ def main() -> int:
     th.start()
     t0 = time.perf_counter()
     end = None
+    dump: dict = {}
+    dumper = None
     while time.perf_counter() - t0 < a.seconds:
         time.sleep(0.1)
         rows += [r for r in map(camera_row, frames.lines()) if r]
-        _, end = find_span(rows, a.settle, signal_ms)
+        first, end = find_span(rows, a.settle, signal_ms)
+        # The draw dump runs beside the grab, so the screen record has no gap around the dumped frame.
+        if a.dump_at > 0 and dumper is None and first and time.perf_counter() * 1000.0 >= first[1] + a.dump_at * 1000:
+            dump["cutsceneStartFrame"] = first[0]
+            dumper = threading.Thread(target=lambda: dump.update(draw_dump(a.ini, a.system, a.out)), daemon=True)
+            dumper.start()
         if end is not None and time.perf_counter() * 1000.0 > end[1] + a.settle * 1000 + 1000:
             break
+    if dumper:
+        dumper.join(15.0)
     proc.kill(); proc.wait(); th.join(2.0); raw.close()
     rows += [r for r in map(camera_row, frames.lines()) if r]
     start, end = find_span(rows, a.settle, signal_ms)
@@ -210,8 +255,20 @@ def main() -> int:
             v = np.array([r[k] for r in inside])
             summary[k] = {"mean": round(float(v.mean()), 4), "median": round(float(np.median(v)), 4),
                           "max": round(float(v.max()), 4), "min": round(float(v.min()), 4)}
+    if a.dump_at > 0:
+        # Where the dumped frame fell: inside the cutscene or not, and the screen shots logged on that game frame.
+        if "frame" in dump:
+            on = [r for r in out_rows if r["gameFrame"] == dump["frame"]]
+            dump["inCutscene"] = bool(start and end and start[0] <= dump["frame"] < end[0])
+            dump["shots"] = [r["shot"] for r in on]
+            dump["shotBrightness"] = [r["brightness"] for r in on]
+        elif not dump:
+            dump["error"] = "the cutscene never started, so no dump was asked"
+        summary["drawDump"] = dump
     with open(os.path.join(a.out, "cinematic.json"), "w") as fh:
         json.dump(summary, fh, indent=1)
+    if a.dump_at > 0:
+        print("DRAWDUMP", json.dumps({k: v for k, v in dump.items() if k != "files"}), flush=True)
     ok = bool(start and end and inside)
     print("CINEMATIC", "ok" if ok else "ERROR no cutscene found", json.dumps({k: summary[k] for k in
           ("startGameFrame", "endGameFrame", "seconds", "shotsInCutscene")}))
