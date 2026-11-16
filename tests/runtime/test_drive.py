@@ -410,6 +410,45 @@ class Reference(unittest.TestCase):
         s.bench({"settle": 0, "frames": 1})
         self.assertNotIn("light_switch", [o[0] for o in order if isinstance(o, tuple)])
 
+    def test_bench_extra_stops_debug_views_targets_then_capture(self):
+        # Worker E2's rtx.captureAllInstances run: every variant measures the same windows in the same order, and
+        # the USD capture (only in the "on" launch) comes last, after the custodial target, so it cannot disturb
+        # what the other variants are compared on. A debug view is always set back to 0, even when its grab fails.
+        s = drive.Spot.__new__(drive.Spot)
+        order, ini = [], []
+        s.spot = {"name": "con_boiler", "teleport": {"location": [1, 2, 3], "yaw": -154}}
+        s.ini = "ini"
+        s.move = lambda *a: None
+        s.hold = lambda *a, **k: None
+        s.bench_window = lambda name, *a: order.append(name)
+        s.stop = lambda name, *a, **k: order.append(name)
+        s.teleport = lambda tp: order.append(("teleport", tp["yaw"])) or {}
+        s._try_raster = lambda tag, label: {}
+        s.usd_capture = lambda c: order.append(("usd", c["teleport"]["yaw"])) or {"name": c["name"]}
+
+        def window(name, kind, body, **k):
+            if name.endswith("_screen") and k.get("debugViewIdx") == 23 and fail_grab:
+                raise RuntimeError("grab failed")
+            order.append(name)
+        s.window = window
+        cfg = {"settle": 0, "frames": 1, "stops": [[0, -30]], "debugViews": {"albedo": 23},
+               "targets": [{"name": "con_custodial", "teleport": {"location": [4, 5, 6], "yaw": -67}}]}
+        with mock.patch.object(drive, "set_ini", lambda path, sec, key, val: ini.append((key, val))):
+            fail_grab = False
+            self.assertEqual(s.bench(cfg), {})
+            self.assertEqual(order, ["bench_y0_p0", "y0_p0", "y0_p-30", "y0_p0_albedo_screen", ("teleport", -67),
+                                     "con_custodial_teleport", "con_custodial_bench_y0_p0", "con_custodial_y0_p0"])
+            self.assertEqual(ini, [("rtx.debugView.debugViewIdx", "23"), ("rtx.debugView.debugViewIdx", "0")])
+            order.clear()
+            got = s.bench({**cfg, "usdCapture": True})
+            self.assertEqual(order[-1], ("usd", -154))   # back at the boiler, after the custodial target
+            self.assertEqual(got, {"captures": [{"name": "con_boiler"}]})
+            ini.clear()
+            fail_grab = True
+            with self.assertRaises(RuntimeError):
+                s.bench(cfg)
+            self.assertEqual(ini[-1], ("rtx.debugView.debugViewIdx", "0"))
+
     def test_quit_keys_and_exit_wait(self):
         # Worker C's quit test: Alt+F4 must be a chord (Alt held while F4 goes down and up), and the arrows must be
         # the arrow block (extended), or the menu sees numpad keys.
@@ -451,6 +490,47 @@ class Reference(unittest.TestCase):
             self.assertEqual(drive.wait_exit(n.pid, 10), 0)
         finally:
             n.kill(); n.wait()
+
+    def test_minimize_restore_does_not_wait_for_a_frozen_window(self):
+        # 20261116-093307 01_fix_off: the device was lost while minimized, the game window stopped taking messages,
+        # and the restore held the driver for 6 minutes. A window whose thread sleeps without reading messages
+        # stands in for the frozen game. The restore came 2 s after the loss, before Windows marks a window frozen
+        # (5 s; after that it shows a stand-in window and even a plain ShowWindow returns), so the first call is made
+        # at once: it must not wait. The second, once Windows has marked it, must say the window was frozen.
+        import ctypes, subprocess, sys
+        child = ("import ctypes, sys, time\n"
+                 "u = ctypes.WinDLL('user32')\n"
+                 "u.CreateWindowExW.restype = ctypes.c_void_p\n"
+                 "h = u.CreateWindowExW(0, 'STATIC', 'frozen', 0x10CF0000, 100, 100, 300, 200, None, None, None, None)\n"
+                 "m = ctypes.create_string_buffer(64)\n"
+                 "while u.PeekMessageW(m, None, 0, 0, 1): u.DispatchMessageW(m)\n"
+                 "print(h, flush=True)\n"
+                 "t = time.monotonic()\n"   # read messages for 1 s, so the minimize happens, then freeze
+                 "while time.monotonic() - t < 1.0:\n"
+                 "    while u.PeekMessageW(m, None, 0, 0, 1): u.DispatchMessageW(m)\n"
+                 "    time.sleep(0.01)\n"
+                 "time.sleep(60)\n")
+        p = subprocess.Popen([sys.executable, "-I", "-c", child], stdout=subprocess.PIPE, text=True)
+        try:
+            hwnd = int(p.stdout.readline())
+
+            def restore(seconds):
+                result = {}
+                t = threading.Thread(target=lambda: result.update(drive.minimize_restore(hwnd, seconds)), daemon=True)
+                t.start(); t.join(seconds + 3)
+                self.assertFalse(t.is_alive(), "minimize_restore waited for the frozen window")
+                return result
+            first = restore(1.5)   # minimized while it still reads messages, restored after it froze
+            self.assertEqual((first["minimized"], first["hungAtRestore"]), (True, False))
+            # Windows calls a window frozen after 5 s without reading messages; a posted message makes it notice.
+            drive.user32.PostMessageW(ctypes.c_void_p(hwnd), 0, 0, 0)
+            deadline = time.monotonic() + 15
+            while not drive.user32.IsHungAppWindow(ctypes.c_void_p(hwnd)) and time.monotonic() < deadline:
+                time.sleep(0.5)
+            self.assertTrue(drive.user32.IsHungAppWindow(ctypes.c_void_p(hwnd)), "the stand-in window never froze")
+            self.assertTrue(restore(0.2)["hungAtRestore"])
+        finally:
+            p.kill(); p.wait()
 
     def test_usd_capture_keeps_only_its_own_files_and_puts_the_settings_back(self):
         # Worker E's capture: the draw dump and the Remix capture asked together, copied out, the new capture files

@@ -1,0 +1,54 @@
+{
+ "about": "Worker E2, Nov 16 (coordinator cleared): rtx.captureAllInstances False / True / False on dxvk-remix 0c13881, one launch each, set explicitly so remix-dxvk.log proves Remix read it. Each launch: con_boiler bench window (frame time, Remix VRAM), y0_p0 and y0_p-30 stills and rasters, the albedo debug view (debugViewIdx 23) as a screen grab, then con_custodial's bench window, y0_p0 still and raster. 02_on adds the draw dump and USD capture at con_boiler y0_p0, last.",
+ "spot": "instances_boiler",
+ "bench": {
+  "settle": 5,
+  "frames": 150,
+  "screenRaster": true,
+  "stops": [
+   [
+    0,
+    -30
+   ]
+  ],
+  "debugViews": {
+   "albedo": 23
+  },
+  "targets": [
+   {
+    "name": "con_custodial",
+    "teleport": {
+     "location": [
+      -10723,
+      -553,
+      -447
+     ],
+     "yaw": -67
+    }
+   }
+  ]
+ },
+ "variants": [
+  {
+   "name": "01_off",
+   "rtx": {
+    "rtx.captureAllInstances": "False"
+   }
+  },
+  {
+   "name": "02_on",
+   "rtx": {
+    "rtx.captureAllInstances": "True"
+   },
+   "bench": {
+    "usdCapture": true
+   }
+  },
+  {
+   "name": "03_off_again",
+   "rtx": {
+    "rtx.captureAllInstances": "False"
+   }
+  }
+ ]
+}

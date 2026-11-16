@@ -165,9 +165,11 @@ def front(hwnd: int) -> bool:
     fg = user32.GetForegroundWindow()
     if fg == hwnd:
         return True
+    if user32.IsHungAppWindow(ctypes.c_void_p(hwnd)):
+        return False   # ShowWindow on a frozen window waits for its thread (20261116-093307 01_fix_off: 6 min)
     a = user32.GetWindowThreadProcessId(ctypes.c_void_p(fg), None)
     me = ctypes.windll.kernel32.GetCurrentThreadId()
-    user32.AttachThreadInput(me, a, True); user32.ShowWindow(ctypes.c_void_p(hwnd), 9)
+    user32.AttachThreadInput(me, a, True); user32.ShowWindowAsync(ctypes.c_void_p(hwnd), 9)
     user32.SetForegroundWindow(ctypes.c_void_p(hwnd)); user32.AttachThreadInput(me, a, False)
     time.sleep(0.3)
     return user32.GetForegroundWindow() == hwnd
@@ -240,14 +242,19 @@ def clock() -> str:
 
 def minimize_restore(hwnd: int, seconds: float) -> dict:
     """Minimize the window, wait, restore it and bring it to the front (worker C, Nov 16: the swapchain is recreated
-    on both). Returns the wall-clock times and whether Windows reported the window minimized each time."""
+    on both). Returns the wall-clock times and whether Windows reported the window minimized each time.
+    The Async calls do not wait for the game's window thread: in 20261116-093307 01_fix_off the device was lost while
+    minimized, the window froze, and the plain ShowWindow restore held the driver for 6 minutes until the game was
+    killed. "hungAtRestore" records a window Windows already called frozen (no messages for 5 s) at the restore."""
     h = ctypes.c_void_p(hwnd)
     out = {"minimizedAt": clock()}
-    user32.ShowWindow(h, 6)   # SW_MINIMIZE
+    user32.ShowWindowAsync(h, 6)   # SW_MINIMIZE
     time.sleep(seconds)
     out["minimized"] = bool(user32.IsIconic(h))
     out["restoredAt"] = clock()
-    user32.ShowWindow(h, 9)   # SW_RESTORE
+    out["hungAtRestore"] = bool(user32.IsHungAppWindow(h))
+    user32.ShowWindowAsync(h, 9)   # SW_RESTORE
+    time.sleep(0.3)
     out["front"] = front(hwnd)
     out["restored"] = not user32.IsIconic(h)
     return out
@@ -998,6 +1005,45 @@ class Spot:
         # showed the view), so a debug view is read from a full-size colour grab of the screen, y0_p0_screen_raster.pfm.
         if cfg.get("screenRaster"):
             self.window("y0_p0_screen", "raster", lambda: None, **self._try_raster("y0_p0_screen", "screen, Remix on"))
+        extra: dict = {}
+        # Worker E2, Nov 16 (rtx.captureAllInstances off / on / off): more stops at this spot, Remix debug views at
+        # y0_p0, more spots after a teleport with their own bench window, and E's same-second draw dump and USD capture
+        # last, so the targets before it are measured the same way in every variant.
+        # cfg["stops"] [[yaw, pitch], ...]: stills (final.pfm; the ray-tracing-off raster when in rasterStops).
+        for yaw, pitch in cfg.get("stops", []):
+            self.move(f"to_y{yaw:g}_p{pitch:g}", float(yaw), float(pitch), 1.0)
+            self.stop(f"y{yaw:g}_p{pitch:g}")
+        # cfg["debugViews"] {"albedo": 23, ...}: each view at y0_p0 from a screen grab (final.pfm does not hold a
+        # debug view), then debugViewIdx 0 again (removing the key would not undo it).
+        if cfg.get("debugViews"):
+            self.move("to_debug_views", 0.0, 0.0, 1.0)
+            try:
+                for label, idx in cfg["debugViews"].items():
+                    set_ini(self.ini, "RemixConfig", "rtx.debugView.debugViewIdx", str(idx))
+                    self.hold(3.0)
+                    tag = f"y0_p0_{label}_screen"
+                    self.window(tag, "raster", lambda: None, debugViewIdx=idx,
+                                **self._try_raster(tag, f"screen, Remix debug view {idx}"))
+            finally:
+                set_ini(self.ini, "RemixConfig", "rtx.debugView.debugViewIdx", "0")
+                self.hold(3.0)
+        # cfg["targets"] [{"name", "teleport"}]: per target its own bench window and y0_p0 stop (<name>_y0_p0).
+        for t in cfg.get("targets", []):
+            name = t["name"]
+            self.window(f"{name}_teleport", "teleport", lambda: None, teleport=self.teleport(t["teleport"]))
+            self.move(f"to_{name}_bench", 0.0, 0.0, 1.0)
+            self.hold(settle)
+            self.bench_window(f"{name}_bench_y0_p0", want, f"bench_{name}", f"gpu_mem_{name}.csv")
+            self.stop(f"{name}_y0_p0")
+        # cfg["usdCapture"]: draw dump and Remix USD capture at this spot's y0_p0 (usd_capture teleports back).
+        if cfg.get("usdCapture"):
+            c = {"name": self.spot["name"], "teleport": self.spot["teleport"]}
+            try:
+                rec = self.usd_capture(c)
+            except Exception as e:   # noqa: BLE001  (recorded; the launch's other windows still count)
+                rec = {"name": c["name"], "error": f"{type(e).__name__}: {e}"}
+            print("CAPTURE", json.dumps(rec)[:2000], flush=True)
+            extra["captures"] = [rec]
         if cfg.get("revisit"):
             n = int(self.spot.get("yawStops", 8))
             for i in range(1, n):
@@ -1026,6 +1072,7 @@ class Spot:
             self.hold(float(cfg.get("switchesAfter", 0)))
             self.spot = {**self.spot, "switches": cfg["switches"]}
             self.switch_test()
+        return extra
 
     def bench_window(self, name: str, want: int, tag: str, smi_file: str) -> dict:
         """One still window of at least `want` game frames with nvidia-smi sampling into `smi_file`."""
@@ -1401,6 +1448,7 @@ class Spot:
             out["minimize"] = minimize_restore(hwnd, float(m.get("seconds", 5)))
             time.sleep(float(m.get("after", 10)))
             out["minimize"]["aliveAfter"] = wait_exit(self.a.pid, 0) is None
+            out["minimize"]["hungAfter"] = bool(user32.IsHungAppWindow(ctypes.c_void_p(hwnd)))
             # telemetry lines are about 25 KB (lumaThumb, rgbThumb): read enough tail for the whole window
             tail = int((float(m.get("seconds", 5)) + float(m.get("after", 10))) * 40 * 30_000)
             rows = [r for r in (recent_telemetry(self.telemetry.path, before, tail) if self.telemetry.path else [])
@@ -1411,6 +1459,10 @@ class Spot:
             print("MINIMIZE", json.dumps(out["minimize"]), flush=True)
             if not out["minimize"]["aliveAfter"]:
                 out["exited"], out["exitCode"] = True, wait_exit(self.a.pid, 1)
+                return out
+            if out["minimize"]["hungAfter"]:
+                # A frozen game takes no keys; the gate stops the game it started after the spot.
+                out["exited"], out["exitCode"] = False, None
                 return out
         last = recent_telemetry(self.telemetry.path, 0)[-10:] if self.telemetry.path else []
         out["rayTracedBeforeQuit"] = [bool(r.get("rayTraced")) for r in last]
@@ -1543,7 +1595,10 @@ def main() -> int:
                 raise RuntimeError("no game window to bring to the front for the benchmark")
             front(hwnd)
             s._calibrate_mouse()
-            s.bench(spot["bench"])   # one pose per launch: nothing else
+            result.update(s.bench(spot["bench"]))   # one pose per launch: nothing else
+            bad = [f"{c['name']}: {c['error']}" for c in result.get("captures", []) if c.get("error")]
+            if bad:
+                result["error"] = "; ".join(bad)
         else:
             if not a.no_remix:
                 result["rayTracingAtStart"] = s.rt_is_on()
