@@ -66,6 +66,32 @@ function Get-RunSpots($folder) {
     $m = Join-Path $folder 'manifest.json'
     if (Test-Path $m) { @((Get-Content $m -Raw | ConvertFrom-Json).spots | Sort-Object) } else { @() }
 }
+# The no-Remix reference, per spot: the newest earlier reference-* run that finished (has result.json) and holds that
+# spot without an error (coordinator review, Nov 16: a newer broken reference hid an older good one). When the spots
+# come from different runs, <run>\reference-chosen holds a junction per spot and a manifest naming each source.
+function Select-Reference($folder, $stamp) {
+    $refs = @(Get-ChildItem $ResultsRoot -Directory -Filter 'reference-*' | Where-Object {
+        ($_.Name -replace '^reference-', '') -lt $stamp -and (Test-Path (Join-Path $_.FullName 'result.json')) } | Sort-Object Name -Descending)
+    $chosen = [ordered]@{}
+    foreach ($spot in Get-RunSpots $folder) {
+        $hit = $refs | Where-Object {
+            $sj = Join-Path $_.FullName "$spot\spot.json"
+            (Get-RunSpots $_.FullName) -contains $spot -and (Test-Path $sj) -and -not (Get-Content $sj -Raw | ConvertFrom-Json).error
+        } | Select-Object -First 1
+        if ($hit) { $chosen[$spot] = $hit.FullName }
+    }
+    $sources = @($chosen.Values | Select-Object -Unique)
+    if (-not $sources.Count) { return $null }
+    if ($sources.Count -eq 1) { return $sources[0] }
+    $merged = Join-Path $folder 'reference-chosen'
+    if (Test-Path $merged) {   # a Gate rerun: delete only the links (a non-recursive delete never touches a target)
+        Get-ChildItem $merged -Directory | ForEach-Object { [IO.Directory]::Delete($_.FullName, $false) }
+    }
+    New-Item -ItemType Directory -Force $merged | Out-Null
+    foreach ($spot in $chosen.Keys) { New-Item -ItemType Junction -Path (Join-Path $merged $spot) -Target (Join-Path $chosen[$spot] $spot) | Out-Null }
+    @{ spots = @($chosen.Keys); chosenFrom = $chosen } | ConvertTo-Json | Set-Content (Join-Path $merged 'manifest.json')
+    $merged
+}
 function Gate($folder) {
     $name = Split-Path $folder -Leaf
     $stamp = $name -replace '^reference-', ''
@@ -76,9 +102,7 @@ function Gate($folder) {
         Get-ChildItem $ResultsRoot -Directory | Where-Object { $_.Name -match $kind -and ($_.Name -replace '^reference-', '') -lt $stamp -and
             (Test-Path (Join-Path $_.FullName 'result.json')) -and ((Get-RunSpots $_.FullName) -join ',') -eq $spotsHere } |
             Sort-Object Name | Select-Object -Last 1 -ExpandProperty FullName }
-    $ref = if ($Reference) { $Reference } elseif ($name -like 'reference-*') { $null } else {
-        Get-ChildItem $ResultsRoot -Directory -Filter 'reference-*' | Where-Object { ($_.Name -replace '^reference-', '') -lt $stamp } |
-            Sort-Object Name | Select-Object -Last 1 -ExpandProperty FullName }
+    $ref = if ($Reference) { $Reference } elseif ($name -like 'reference-*') { $null } else { Select-Reference $folder $stamp }
     $gateArgs = @((Join-Path $Runtime 'gate.py'), $folder)
     if ($prev) { $gateArgs += @('--previous', $prev) }
     if ($ref) { $gateArgs += @('--reference', $ref) }
