@@ -46,8 +46,13 @@ import numpy as np
 THRESHOLDS = {
     "nan_pixels": 0, "neon_fraction": 0.001, "skinned_min": 1, "outline_overlap": 0.85, "inward_fraction": 0.005,
     "raster_fallback_frames": 0, "flashes": 0, "still_block_jitter": 4.0, "still_luma_drift": 6.0,
-    "static_blas_rebuilds": 0, "frames_over_50ms": 0,
-    "min_median_fps": 55.0, "max_wait_overhead_ms": 5.0, "max_input_latency_ms": 25.0,
+    "static_blas_rebuilds": 0,
+    # Zero hitches (Corey, Nov 15: none outside loading screens). Loading screens are NOT excluded: nothing in
+    # drive.py ends a window when a level load starts, so a load during a move, pan, combat or goggles window counts
+    # as a hitch here. Not verified whether the game ever loads inside one; the teleport hold is outside every window.
+    "frames_over_50ms": 0,
+    "min_median_fps": 90.0,  # Corey's target, Nov 15. Median frame rate over the SCENE windows (goggles excluded).
+    "max_wait_overhead_ms": 5.0, "max_input_latency_ms": 25.0,
     "min_scene_luma": 0.03, "min_raster_luma_ratio": 0.75, "min_angled_sharpness": 0.02,
     "pose_error_deg": 3.0, "pan_degrees": 350.0, "goggles_corr": 0.8, "goggles_mean_gap": 0.06,
     "goggles_missing_blocks": 0.02, "still_frames": 15, "pan_coverage": 0.9,

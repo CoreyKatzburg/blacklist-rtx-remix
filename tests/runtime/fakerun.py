@@ -64,7 +64,7 @@ class Builder:
     def frame(self, kind: str, wname: str, i: int, goggles: bool = False) -> None:
         self.tframe += 1; self.pframe += 1
         img = view(self.yaw, self.pitch, self.rng)
-        rec = {"frame": self.tframe, "frameTimeMs": 14.0, "gpuTimeMs": 11.0, "instances": 900, "skinnedInstances": 3,
+        rec = {"frame": self.tframe, "frameTimeMs": 10.0, "gpuTimeMs": 8.0, "instances": 900, "skinnedInstances": 3,
                "staticBlasRebuilds": 0, "cameraCut": False, "textureMemoryMB": 1800, "vramUsedMB": 6100,
                "skinnedTriangles": 60000, "inwardSkinnedTriangles": 12, "thumbNonFinite": 0}
         # recorder fields (gate.recorder_checks): healthy values, with one fault per case below
@@ -75,8 +75,8 @@ class Builder:
         c = self.case
         if c == "nan_frame" and kind == "still" and i == 3: rec["thumbNonFinite"] = 40
         if c == "slow_frame" and kind == "pan" and i == 30: rec["frameTimeMs"] = 61.0
-        if c == "low_fps": rec["frameTimeMs"], rec["gpuTimeMs"] = 22.0, 19.5
-        if c == "high_latency": rec["frameTimeMs"], rec["gpuTimeMs"] = 17.5, 9.0
+        if c == "low_fps": rec["frameTimeMs"], rec["gpuTimeMs"] = 14.0, 12.0   # 71 FPS: passes 55, fails 90
+        if c == "high_latency": rec["frameTimeMs"], rec["gpuTimeMs"] = 17.5, 9.0   # 57 FPS: also fails the 90 target
         if c == "no_skinned" and kind == "still" and i == 3: rec["skinnedInstances"] = 0
         if c == "blas_rebuild" and kind == "pan" and i == 50: rec["staticBlasRebuilds"] = 1
         if c == "inward" and kind == "move" and i == 2: rec["inwardSkinnedTriangles"] = 900
@@ -240,7 +240,8 @@ CASES = {
     "blas_rebuild": (("static_blas_rebuilds",), ()),
     "slow_frame": (("frames_over_50ms",), ()),
     "low_fps": (("min_median_fps",), ()),
-    "high_latency": (("latency_overhead_ms", "input_latency_ms"), ()),
+    # Input latency is 2 x frame - GPU, so it can only pass 25 ms at a frame time above 11.1 ms (below 90 FPS).
+    "high_latency": (("latency_overhead_ms", "input_latency_ms", "min_median_fps"), ()),
     "too_dark": (("brightness_floor",), ()),
     "blurry_angles": (("angled_sharpness",), ()),
     "pose_off": (("pose",), ()),
