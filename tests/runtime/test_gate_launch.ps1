@@ -5,7 +5,8 @@ param([string]$Gate = (Join-Path (Split-Path $PSScriptRoot) 'verify_runtime.ps1'
       [string]$Common = (Join-Path $PSScriptRoot '..\..\play-setup\RemixPlayCommon.ps1'))
 $ErrorActionPreference = 'Stop'
 $ast = [Management.Automation.Language.Parser]::ParseFile($Gate, [ref]$null, [ref]$null)
-foreach ($n in 'Remove-OwnPlayLock', 'Wait-RestartedGame', 'Get-DisplayProblem', 'Test-LaunchDead', 'Get-CSpaceProblem', 'Get-MemoryProblem') {
+foreach ($n in 'Remove-OwnPlayLock', 'Wait-RestartedGame', 'Get-DisplayProblem', 'Test-LaunchDead', 'Get-CSpaceProblem', 'Get-MemoryProblem',
+           'Get-DisplayAwakeProblem', 'Get-DisplayDuring') {
     $f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true) | Select-Object -First 1
     if (-not $f) { throw "missing $n" }
     . ([scriptblock]::Create($f.Extent.Text))
@@ -78,6 +79,29 @@ Check 'memory as at the 12:33:46 launch start: allowed' ($null -eq (Get-MemoryPr
 Check 'memory: C: too full for the page file to grow: refused' ([bool](Get-MemoryProblem (Machine 47445 26496 2000) $need))
 Check 'memory: page file at its 65,536 MB maximum, C: has room: refused' ([bool](Get-MemoryProblem (Machine 84000 64000 100000) $need))
 
+# Displays (coordinator, Nov 16 16:41: idle GPU power 77.4 W asleep against 81.5 W awake; Corey plays with them awake).
+# A launch starts only when the wake left them on; one that falls asleep halfway is marked. Each rule is then removed
+# from a copy of the function, and its case must fail.
+function DisplayCases {
+    @{ 'displays on after the wake: allowed' = ($null -eq (Get-DisplayAwakeProblem ([pscustomobject]@{ display = 'on' })))
+       'displays still off after the wake: refused' = [bool](Get-DisplayAwakeProblem ([pscustomobject]@{ display = 'off' }))
+       'wake did not run: refused' = [bool](Get-DisplayAwakeProblem $null) }
+}
+foreach ($c in (DisplayCases).GetEnumerator()) { Check $c.Key $c.Value }
+$ddir = Join-Path $env:TEMP "displaycheck-$PID"; New-Item -ItemType Directory -Force $ddir | Out-Null
+$csv = Join-Path $ddir 'display.csv'
+Set-Content $csv "time,display,idleSeconds`r`n17:00:00,on,3.0`r`n17:00:02,on,5.0"
+$d = Get-DisplayDuring $csv
+Check 'display log all on: awake throughout' ($d.awakeThroughout -and $d.samples -eq 2 -and $d.maxIdleSeconds -eq 5)
+Add-Content $csv "17:00:04,off,1801.0`r`n17:00:06,on,0.5"
+$d = Get-DisplayDuring $csv
+Check 'display log asleep once: not awake throughout, first 17:00:04' (-not $d.awakeThroughout -and $d.notAwake -eq 1 -and $d.firstNotAwake -eq '17:00:04 off' -and $d.maxIdleSeconds -eq 1801)
+Check 'no display log: not awake throughout' (-not (Get-DisplayDuring (Join-Path $ddir 'none.csv')).awakeThroughout)
+$awakeText = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq 'Get-DisplayAwakeProblem' }, $true)[0].Extent.Text
+. ([scriptblock]::Create($awakeText.Replace("`$wake.display -eq 'on'", '$true')))
+Check 'rule removed (any wake result accepted): the off case fails' (-not (DisplayCases)['displays still off after the wake: refused'])
+. ([scriptblock]::Create($awakeText))
+Remove-Item $ddir -Recurse -Force
 # Play script lock rules (Corey, Nov 16): a running test refuses his launch, the gate's own launch goes through, a lock
 # left by a crashed test is cleared after its settings are put back, a clean state is untouched. Each rule is then
 # removed from a copy of the functions, and its case must fail.

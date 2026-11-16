@@ -276,6 +276,55 @@ function Get-MemoryProblem($s, [int]$needMB) {
     if ($room -ge $needMB) { return $null }
     "Memory: $($s.commitMB) MB is committed and RAM ($($s.ramMB) MB) plus the largest the page file can become ($grow MB) leaves $room MB, below the $needMB MB a launch can add. Close programs, then run again."
 }
+# Which monitors are on and the GPU's idle power just before a launch (coordinator, Nov 16: launches up to 10:24 ran
+# about 35 ms and launches from 11:31 about 42 ms whatever the build, with idle GPU power about 6 W higher; the guess is
+# that the monitors were switched on in between). A monitor that is on is listed Present (see Get-DisplayProblem).
+# Five nvidia-smi readings 0.4 s apart; idleGpuPowerW is their median.
+# Present only says a monitor is plugged in and switched on, not awake (16:46: 2 present while Windows had them asleep).
+# The coordinator measured at 16:41 that idle GPU power follows whether the displays are awake (77.4 W asleep, 81.5 W
+# awake, both ways twice), and Corey plays with them awake, so before every launch runtime\display.py wakes them (a
+# mouse move of 0 counts) and reads Windows' console display state; a launch starts only when it reads "on".
+function Get-MachineState {
+    $wake = try { & $Py -I (Join-Path $Runtime 'display.py') wake 2>$null | Select-Object -Last 1 | ConvertFrom-Json } catch { $null }
+    Start-Sleep -Seconds 3   # the idle power below is read with the displays settled awake
+    $on = @(Get-PnpDevice -Class Monitor -ErrorAction SilentlyContinue | Where-Object Present | ForEach-Object InstanceId)
+    $rows = @(foreach ($i in 1..5) {
+        & nvidia-smi --query-gpu=power.draw,clocks.gr,clocks.mem,pstate,utilization.gpu,temperature.gpu,memory.used --format=csv,noheader,nounits 2>$null | Select-Object -First 1
+        Start-Sleep -Milliseconds 400 })
+    $w = @($rows | ForEach-Object { $v = 0.0; if ([double]::TryParse(($_ -split ',')[0].Trim(), [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$v)) { $v } } | Sort-Object)
+    [ordered]@{ time = (Get-Date -Format 'HH:mm:ss'); display = $wake.display; displayWake = $wake
+                monitorsOn = $on.Count; monitors = $on
+                idleGpuPowerW = $(if ($w.Count) { $w[[int][math]::Floor($w.Count / 2)] } else { $null })
+                gpuSamples = 'power.draw W, clocks.gr MHz, clocks.mem MHz, pstate, utilization.gpu %, temperature.gpu C, memory.used MiB'
+                gpu = $rows }
+}
+# Records Get-MachineState in <launch>\machine_before.json and under machineBefore.<launch> in the run's manifest.json.
+function Add-MachineState([string]$runDir, [string]$launch, [string]$spotDir) {
+    $m = Get-MachineState
+    $m | ConvertTo-Json | Set-Content (Join-Path $spotDir 'machine_before.json')
+    $path = Join-Path $runDir 'manifest.json'
+    $man = Get-Content $path -Raw | ConvertFrom-Json
+    if (-not $man.PSObject.Properties['machineBefore']) { $man | Add-Member machineBefore ([pscustomobject]@{}) }
+    $man.machineBefore | Add-Member $launch ([pscustomobject]$m) -Force
+    $man | ConvertTo-Json -Depth 6 | Set-Content $path
+    Write-Step "$launch`: displays $($m.display), $($m.monitorsOn) monitor(s) present, idle GPU power $($m.idleGpuPowerW) W"
+    $why = Get-DisplayAwakeProblem $m.displayWake
+    if ($why) { throw $why }
+}
+# $wake: display.py wake's record, $null when it did not run.
+function Get-DisplayAwakeProblem($wake) {
+    if ($wake -and $wake.display -eq 'on') { return $null }
+    "The displays did not wake (Windows reports '$($wake.display)' after a mouse move). Only launches with the displays awake count (idle GPU power and frame time follow the display state); wake them, then run again."
+}
+# display.csv (display.py watch, every 2 s through a launch): whether the displays stayed awake the whole launch, and
+# the longest time without keyboard or mouse input (Windows turns them off after 1,800 s of it).
+function Get-DisplayDuring([string]$csv) {
+    $rows = @(if (Test-Path -LiteralPath $csv) { Import-Csv -LiteralPath $csv })
+    $off = @($rows | Where-Object display -ne 'on')
+    [ordered]@{ samples = $rows.Count; awakeThroughout = ($rows.Count -gt 0 -and $off.Count -eq 0); notAwake = $off.Count
+                firstNotAwake = $(if ($off) { "$($off[0].time) $($off[0].display)" } else { $null })
+                maxIdleSeconds = $(if ($rows) { ($rows | ForEach-Object { [double]$_.idleSeconds } | Measure-Object -Maximum).Maximum } else { $null }) }
+}
 function Get-LaunchProblem($s) {
     $why = @((Get-CSpaceProblem $s.freeMB $MinCFreeMB), (Get-MemoryProblem $s $MinCommitRoomMB)) | Where-Object { $_ }
     if ($why) { $why -join ' ' }
@@ -572,7 +621,7 @@ try {
     foreach ($run in $runs) {
         $spot = $run.spot
         $spotDir = Join-Path $runDir $run.dir
-        $smi = $null; $mem = $null; $hitchList = "$S\d3d9_proxy_hitches.txt"
+        $smi = $null; $mem = $null; $disp = $null; $hitchList = "$S\d3d9_proxy_hitches.txt"
         $cp = Join-Path $Library $(if ($spot.checkpoint) { $spot.checkpoint } else { $spot.name })
         New-Item -ItemType Directory -Force $spotDir | Out-Null
         if (-not (Test-Path (Join-Path $cp 'checkpoint.json')) -or -not (Get-ChildItem $cp -Filter '*.save' -ErrorAction SilentlyContinue)) {
@@ -614,11 +663,16 @@ try {
             # Memory, page file and C: every 2 s for the whole launch (coordinator, Nov 16: lined up against freezes).
             $mem = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
                 '-File', ('"' + (Join-Path $Runtime 'mem_sampler.ps1') + '"'), '-Out', ('"' + (Join-Path $spotDir 'memory.csv') + '"'))
+            # Display state and time since the last input every 2 s (coordinator, Nov 16: a launch whose displays fall
+            # asleep halfway must be marked; manifest displayDuring.<launch>).
+            $disp = Start-Process $Py -WindowStyle Hidden -PassThru -ArgumentList @('-I', ('"' + (Join-Path $Runtime 'display.py') + '"'),
+                'watch', '--out', ('"' + (Join-Path $spotDir 'display.csv') + '"'))
             # The proxy appends its hitch list across launches (worker C, Nov 16): each launch starts it empty, and one
             # left from outside this run is kept beside this launch.
             if (Test-Path -LiteralPath $hitchList) { Move-Item -LiteralPath $hitchList (Join-Path $spotDir 'proxy_hitches_before_launch.txt') -Force }
             $cSpace = Get-LaunchProblem (Add-CDriveSample $runDir $run.dir 'before')
             if ($cSpace) { throw $cSpace }
+            Add-MachineState $runDir $run.dir $spotDir
             $game = Start-GameAtCheckpoint
             # Other programs holding the GPU (Windows reports their names; per-process memory reads N/A).
             & nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv 2>&1 | Set-Content (Join-Path $spotDir 'gpu_apps.csv')
@@ -679,7 +733,16 @@ try {
                 @{ name = $spot.name; error = $_.Exception.Message; windows = @() } | ConvertTo-Json | Set-Content (Join-Path $spotDir 'spot.json')
             }
         } finally {
-            foreach ($p in $smi, $mem) { if ($p) { try { if (-not $p.HasExited) { $p.Kill() } } catch { } } }; $smi = $null; $mem = $null
+            foreach ($p in $smi, $mem, $disp) { if ($p) { try { if (-not $p.HasExited) { $p.Kill() } } catch { } } }
+            if ($disp) { try {
+                $d = Get-DisplayDuring (Join-Path $spotDir 'display.csv')
+                $path = Join-Path $runDir 'manifest.json'; $man = Get-Content $path -Raw | ConvertFrom-Json
+                if (-not $man.PSObject.Properties['displayDuring']) { $man | Add-Member displayDuring ([pscustomobject]@{}) }
+                $man.displayDuring | Add-Member $run.dir ([pscustomobject]$d) -Force
+                $man | ConvertTo-Json -Depth 6 | Set-Content $path
+                Write-Step "$($run.dir): displays awake throughout: $($d.awakeThroughout) ($($d.samples) samples, $($d.notAwake) not awake$(if ($d.firstNotAwake) { ', first ' + $d.firstNotAwake }), longest without input $($d.maxIdleSeconds) s)"
+            } catch { Write-Step "$($run.dir): display log not read: $($_.Exception.Message)" } }
+            $smi = $null; $mem = $null; $disp = $null
             if ($run.variant) {   # back to the baseline before the next variant (the game is closed by now)
                 Stop-Game
                 foreach ($p in $rtxPaths) { [IO.File]::WriteAllText($p, $rtxBackup) }
