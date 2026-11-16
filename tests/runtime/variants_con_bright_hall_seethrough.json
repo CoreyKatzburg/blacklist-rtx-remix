@@ -1,0 +1,24 @@
+{
+  "about": "Worker B's see-through probe (coordinator approved Nov 16; spec: artifact 'Worker B: see-through balls, Remix paths and probe spec', Step 2). One launch at con_bright_hall, the 20261115-142638 switch pose (the spot's y0_p0, Sam still), on the staged build. [Proxy] TexHashLog=1 for the whole launch: the proxy reads it only at start and hashes each texture as the game uploads it, so it cannot be turned on for the capture second alone. Steps on / off ([Lights] FlareStandIns=0) / on_again, each set explicitly and proven by its 'settings reloaded' line; each step takes its switch still and gate depth, the light dump, then the 19 Remix debug views from a screen grab (3 s hold each, debugViewIdx 0 again after). The draw dump and Remix USD capture run at the end of on_again (the same state as on) instead of in on, because the capture turns replacement assets off and on again, which would change the scene before the off step; after on_again nothing else is measured. B scores it.",
+  "spot": "con_bright_hall",
+  "bench": {
+    "settle": 5,
+    "frames": 30,
+    "switchesAfter": 0,
+    "switches": [
+      {"name": "on", "ini": [["Lights", "FlareStandIns", "1"]],
+       "expectLog": {"reloaded": "flare stand-ins 1, trace", "count": 0, "timeout": 90},
+       "debugViews": {"v5_is_opaque": 5, "v7_is_emissive_blend": 7, "v22_material_type": 22, "v29_opacity": 29, "v36_virtual_hit_distance": 36, "v64_primary_unordered": 64, "v80_psr_mask": 80, "v88_primary_decal_albedo": 88, "v181_is_particle": 181, "v277_geometry_hash": 277, "v800_is_thin_opaque": 800, "v801_is_sss": 801, "v100_direct_diffuse": 100, "v101_direct_specular": 101, "v106_indirect_diffuse": 106, "v107_indirect_specular": 107, "v157_noisy_primary_radiance": 157, "v200_pre_tonemap": 200, "v202_composite": 202}},
+      {"name": "off", "ini": [["Lights", "FlareStandIns", "0"]],
+       "expectLog": {"reloaded": "flare stand-ins 0, trace", "count": 0, "timeout": 90},
+       "debugViews": {"v5_is_opaque": 5, "v7_is_emissive_blend": 7, "v22_material_type": 22, "v29_opacity": 29, "v36_virtual_hit_distance": 36, "v64_primary_unordered": 64, "v80_psr_mask": 80, "v88_primary_decal_albedo": 88, "v181_is_particle": 181, "v277_geometry_hash": 277, "v800_is_thin_opaque": 800, "v801_is_sss": 801, "v100_direct_diffuse": 100, "v101_direct_specular": 101, "v106_indirect_diffuse": 106, "v107_indirect_specular": 107, "v157_noisy_primary_radiance": 157, "v200_pre_tonemap": 200, "v202_composite": 202}},
+      {"name": "on_again", "ini": [["Lights", "FlareStandIns", "1"]],
+       "expectLog": {"reloaded": "flare stand-ins 1, trace", "count": 0, "timeout": 90},
+       "debugViews": {"v5_is_opaque": 5, "v7_is_emissive_blend": 7, "v22_material_type": 22, "v29_opacity": 29, "v36_virtual_hit_distance": 36, "v64_primary_unordered": 64, "v80_psr_mask": 80, "v88_primary_decal_albedo": 88, "v181_is_particle": 181, "v277_geometry_hash": 277, "v800_is_thin_opaque": 800, "v801_is_sss": 801, "v100_direct_diffuse": 100, "v101_direct_specular": 101, "v106_indirect_diffuse": 106, "v107_indirect_specular": 107, "v157_noisy_primary_radiance": 157, "v200_pre_tonemap": 200, "v202_composite": 202},
+       "usdCapture": true}
+    ]
+  },
+  "variants": [
+    {"name": "01_probe", "proxy": {"TexHashLog": "1"}}
+  ]
+}
