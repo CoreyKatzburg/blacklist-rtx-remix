@@ -130,6 +130,81 @@ function Test-OwnLock {
     $text -and $text.StartsWith($LockTag)
 }
 
+# A test that holds the game (verify_runtime.ps1, worker G's runner) writes AGENT_GAME_LOCK.txt with a line
+# "pid <n> started <UTC start time, ISO>" naming its own process, so a lock whose test still runs can be told apart
+# from one left by a test that crashed (Corey, Nov 16: a crashed test must never lock him out).
+$AgentLock = Join-Path $Setup 'AGENT_GAME_LOCK.txt'
+. (Join-Path $RemixDir 'tests\runtime\run_files.ps1')
+
+# Sorts the test locks among $paths that exist (the Play script's own PLAY-SETUP lock is skipped). kind:
+#   gate      its test runs and started this script ($parentPid): the gate's own launch
+#   live      its test runs: refuse
+#   leftover  it records a pid whose process is gone, or is another process (a different start time)
+#   unknown   it records no pid (older tests, the autopilot probes): ask, as before
+function Get-TestLocks($paths, [int]$parentPid) {
+    foreach ($path in @($paths)) {
+        $text = Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue
+        if (-not $text -or $text.StartsWith($LockTag)) { continue }
+        $first = ($text -split "`r?`n")[0]
+        $kind = 'unknown'
+        if ($text -match '(?m)^pid (\d+)(?: started (\S+))?') {
+            $id = [int]$Matches[1]; $started = $Matches[2]
+            $proc = Get-Process -Id $id -ErrorAction SilentlyContinue
+            $kind = if ($proc) { 'live' } else { 'leftover' }
+            if ($proc -and $started) {
+                $at = [datetime]::Parse($started, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal)
+                # StartTime can be unreadable for another user's process; the lock then counts as live.
+                try { if ([math]::Abs(($proc.StartTime.ToUniversalTime() - $at).TotalSeconds) -gt 2) { $kind = 'leftover' } } catch { }
+            }
+            if ($kind -eq 'live' -and $id -eq $parentPid) { $kind = 'gate' }
+        }
+        [pscustomobject]@{ path = $path; first = $first; text = $text; kind = $kind }
+    }
+}
+
+# After a crashed test: puts back the files of every run a leftover lock ("run <folder>" on its first line) or a
+# marker line in $iniPaths names (tests\runtime\run_files.ps1 records them in <run>\file-backup\restore.json), then
+# removes the leftover locks. Returns @{ restored = <lines>; failed = <lines> }; on any failure the locks stay.
+function Restore-LeftOverTests($leftovers, $iniPaths) {
+    $runs = [ordered]@{}
+    foreach ($l in @($leftovers)) { if ($l.first -match '\brun (\S+)\s*$') { $runs[$Matches[1]] = $l.first } }
+    foreach ($p in @($iniPaths)) {
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        foreach ($m in @(Select-String -LiteralPath $p -SimpleMatch $RunMarkerText)) {
+            $runs[$m.Line.Substring($m.Line.IndexOf($RunMarkerText) + $RunMarkerText.Length).Trim()] = "marker line in $p"
+        }
+    }
+    $restored = @(); $failed = @()
+    foreach ($run in $runs.Keys) {
+        $recFile = Join-Path $run 'file-backup\restore.json'
+        $rec = if (Test-Path -LiteralPath $recFile) { Get-Content -LiteralPath $recFile -Raw | ConvertFrom-Json }
+        $bad = @(Restore-RunFiles $run)
+        if ($bad.Count) { $failed += $bad; continue }
+        $restored += "Put back the files test run $run changed: " +
+            ((@($rec.files.PSObject.Properties | ForEach-Object Name) + @(if ($rec.saves) { "saves in $($rec.saves.dir)" })) -join ', ')
+    }
+    if (-not $failed.Count) {
+        foreach ($l in @($leftovers)) { Remove-Item -LiteralPath $l.path; $restored += "Removed a lock left by a test that is no longer running: $($l.first)" }
+    }
+    @{ restored = $restored; failed = $failed }
+}
+
+# The Play script's lock rules. $askUnknown gets each lock that records no pid and returns $true to start anyway.
+# Returns @{ refuse = <why not to start, or $null>; restored = <lines> }.
+function Resolve-TestLocks($paths, [int]$parentPid, $iniPaths, [scriptblock]$askUnknown) {
+    $locks = @(Get-TestLocks $paths $parentPid)
+    $live = @($locks | Where-Object kind -eq 'live')
+    if ($live.Count) { return @{ refuse = "Not starting: a test is running and has the game.`n  " + (($live | ForEach-Object first) -join "`n  "); restored = @() } }
+    foreach ($l in @($locks | Where-Object kind -eq 'unknown')) {
+        if (-not (& $askUnknown $l)) { return @{ refuse = 'Not starting (game folder in use).'; restored = @() } }
+    }
+    # The gate's own launch: its marker line and changed files are this launch's settings, not leftovers.
+    if (@($locks | Where-Object kind -eq 'gate').Count) { return @{ refuse = $null; restored = @() } }
+    $put = Restore-LeftOverTests @($locks | Where-Object kind -eq 'leftover') $iniPaths
+    $why = if ($put.failed.Count) { "A crashed test's settings could not all be put back:`n  " + ($put.failed -join "`n  ") }
+    @{ refuse = $why; restored = $put.restored }
+}
+
 # Short label for a managed path in backups and messages.
 function Get-Label($path) {
     if ($path.StartsWith("$S\")) { return $path.Substring($S.Length + 1) }

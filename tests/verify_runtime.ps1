@@ -236,6 +236,51 @@ function Get-DisplayProblem($monitors) {
     "No monitor is switched on (Windows lists $(@($monitors).Count) monitors, none present). The original game draws a black picture without a display: turn a monitor on, then run again."
 }
 
+# Free space on C: (coordinator, Nov 16: it hit 0 at 09:39 and moved by GBs within minutes during a sweep). Sampled
+# every 2 s from 12:14 to 12:30 over five launches: it follows the page file (c:\pagefile.sys, set to 8 GB growing to
+# 64 GB), which grows with the memory all programs hold (54 GB committed on 32.6 GB of RAM with the game running; the
+# Remix bridge holds 8.3 GB of it) and shrinks after the game quits. The largest fall in one launch was 8,801 MB
+# (12:22:49 to 12:25:01; the page file grew 8,275 MB of it), and the largest change the page file did not explain was
+# 1,548 MB. Each launch records C: before it and at its end in <run>\cdrive.csv, and none starts below $MinCFreeMB.
+$MinCFreeMB = 10500
+# Memory: Windows keeps the commit limit about 6 GB above what is committed by growing the page file, so what runs
+# out is the page file's room to grow: RAM + the smaller of its maximum (registry PagingFiles) and its size + C: free,
+# less what is committed. The largest rise in committed memory during one launch was 12,652 MB (12:31:07 to
+# 12:32:35, nine launches sampled 12:14 to 12:37); $MinCommitRoomMB adds the same 1,548 MB margin as the disk limit.
+$MinCommitRoomMB = 14200
+function Get-CDriveSample {
+    $pf = @(Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue | Where-Object Name -like 'c:*')
+    $os = Get-CimInstance Win32_OperatingSystem
+    $setting = [string](Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management').PagingFiles
+    [ordered]@{ time = (Get-Date -Format 'HH:mm:ss'); freeMB = [int]((Get-PSDrive C).Free / 1MB)
+                pagefileMB = [int](($pf | Measure-Object AllocatedBaseSize -Sum).Sum)
+                pagefileMaxMB = $(if ($setting -match '^c:\\pagefile\.sys \d+ (\d+)') { [int]$Matches[1] } else { 0 })
+                ramMB = [int]($os.TotalVisibleMemorySize / 1KB)
+                commitMB = [int](($os.TotalVirtualMemorySize - $os.FreeVirtualMemory) / 1KB) }
+}
+function Add-CDriveSample([string]$runDir, [string]$launch, [string]$when) {
+    $s = Get-CDriveSample
+    $csv = Join-Path $runDir 'cdrive.csv'
+    if (-not (Test-Path $csv)) { Set-Content $csv 'launch,when,time,freeMB,pagefileMB,pagefileMaxMB,ramMB,commitMB' }
+    Add-Content $csv "$launch,$when,$($s.time),$($s.freeMB),$($s.pagefileMB),$($s.pagefileMaxMB),$($s.ramMB),$($s.commitMB)"
+    $s
+}
+function Get-CSpaceProblem([int]$freeMB, [int]$limitMB) {
+    if ($freeMB -ge $limitMB) { return $null }
+    "C: has $freeMB MB free, below $limitMB MB: a launch can take that much (the page file on C: grows with the memory the game and the Remix bridge hold). Free space on C: (or close programs), then run again."
+}
+# $s: a Get-CDriveSample. A page file maximum of 0 (system managed, or not read) is taken as room up to C:'s free space.
+function Get-MemoryProblem($s, [int]$needMB) {
+    $grow = if ($s.pagefileMaxMB) { [math]::Min($s.pagefileMaxMB, $s.pagefileMB + $s.freeMB) } else { $s.pagefileMB + $s.freeMB }
+    $room = $s.ramMB + $grow - $s.commitMB
+    if ($room -ge $needMB) { return $null }
+    "Memory: $($s.commitMB) MB is committed and RAM ($($s.ramMB) MB) plus the largest the page file can become ($grow MB) leaves $room MB, below the $needMB MB a launch can add. Close programs, then run again."
+}
+function Get-LaunchProblem($s) {
+    $why = @((Get-CSpaceProblem $s.freeMB $MinCFreeMB), (Get-MemoryProblem $s $MinCommitRoomMB)) | Where-Object { $_ }
+    if ($why) { $why -join ' ' }
+}
+
 # True after removing $path, when it is a Play-script lock ($LockTag) whose start time is not before $since (the start
 # of this run's own Play script). Corey's lock, or one written before this run's Play script started, stays.
 function Remove-OwnPlayLock([string]$path, [datetime]$since) {
@@ -441,6 +486,7 @@ $otherLock = 'D:\BlacklistOverhaul\experiments\GAME_IN_USE.txt'
 if (Test-Path $otherLock) { throw "Someone else has the game: $(Get-Content $otherLock -Raw)" }
 if (Test-Path $GameLock) { throw "Someone else has the game: $(Get-Content $GameLock -Raw)" }
 if ($NoRemix) { $displayProblem = Get-DisplayProblem @(Get-PnpDevice -Class Monitor -ErrorAction SilentlyContinue); if ($displayProblem) { throw $displayProblem } }
+$cSpace = Get-LaunchProblem (Get-CDriveSample); if ($cSpace) { throw $cSpace }
 # A killed run leaves its marker line in the setup ini (its finally block never ran): its "before" files are in its
 # file-backup folder, and this run would otherwise take the changed ini as its own "before".
 $leftOver = @(Get-LeftOverRuns @((Join-Path $Setup 'd3d9_proxy.ini'), "$S\d3d9_proxy.ini"))
@@ -465,7 +511,10 @@ $build = [ordered]@{ remixCommit = $remixCommit; remixRuntimeSha256 = $runtimeHa
    variants = @(if ($sweep) { $runs | ForEach-Object dir }) } | ConvertTo-Json | Set-Content (Join-Path $runDir 'manifest.json')
 Write-Step "Builds: dxvk-remix $remixCommit, proxy $($build.proxySha256.Substring(0, 12))"
 
-try { New-Item -ItemType File -Path $GameLock -Value "verify_runtime.ps1 runtime gate $([DateTime]::UtcNow.ToString('u')) run $runDir" | Out-Null }
+# The pid line tells the Play script this run is alive (it refuses Corey's launch) and that the Play script this run
+# starts is its own (it goes through); a lock whose process is gone counts as left by a crash.
+$lockOwner = "pid $PID started $((Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o'))"
+try { New-Item -ItemType File -Path $GameLock -Value "verify_runtime.ps1 runtime gate $([DateTime]::UtcNow.ToString('u')) run $runDir`r`n$lockOwner" | Out-Null }
 catch { throw "Someone else has the game: $(Get-Content $GameLock -Raw)" }
 $saveBackup = Join-Path $runDir 'save-backup'
 $iniBackup = $null; $inputBackup = $null; $setupIniBackup = $null; $setupIniPath = Join-Path $Setup 'd3d9_proxy.ini'
@@ -523,7 +572,7 @@ try {
     foreach ($run in $runs) {
         $spot = $run.spot
         $spotDir = Join-Path $runDir $run.dir
-        $smi = $null
+        $smi = $null; $mem = $null; $hitchList = "$S\d3d9_proxy_hitches.txt"
         $cp = Join-Path $Library $(if ($spot.checkpoint) { $spot.checkpoint } else { $spot.name })
         New-Item -ItemType Directory -Force $spotDir | Out-Null
         if (-not (Test-Path (Join-Path $cp 'checkpoint.json')) -or -not (Get-ChildItem $cp -Filter '*.save' -ErrorAction SilentlyContinue)) {
@@ -562,6 +611,14 @@ try {
             $smi = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
                 '-File', ('"' + (Join-Path $Runtime 'gpu_sampler.ps1') + '"'), '-Out', ('"' + (Join-Path $spotDir 'gpu_run.csv') + '"'),
                 '-Query', 'timestamp,clocks.gr,clocks.mem,clocks.sm,temperature.gpu,power.draw,power.limit,clocks_throttle_reasons.active,memory.used,memory.total,pstate')
+            # Memory, page file and C: every 2 s for the whole launch (coordinator, Nov 16: lined up against freezes).
+            $mem = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
+                '-File', ('"' + (Join-Path $Runtime 'mem_sampler.ps1') + '"'), '-Out', ('"' + (Join-Path $spotDir 'memory.csv') + '"'))
+            # The proxy appends its hitch list across launches (worker C, Nov 16): each launch starts it empty, and one
+            # left from outside this run is kept beside this launch.
+            if (Test-Path -LiteralPath $hitchList) { Move-Item -LiteralPath $hitchList (Join-Path $spotDir 'proxy_hitches_before_launch.txt') -Force }
+            $cSpace = Get-LaunchProblem (Add-CDriveSample $runDir $run.dir 'before')
+            if ($cSpace) { throw $cSpace }
             $game = Start-GameAtCheckpoint
             # Other programs holding the GPU (Windows reports their names; per-process memory reads N/A).
             & nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv 2>&1 | Set-Content (Join-Path $spotDir 'gpu_apps.csv')
@@ -577,8 +634,10 @@ try {
                 -RedirectStandardOutput (Join-Path $spotDir 'drive.log') -RedirectStandardError (Join-Path $spotDir 'drive.err')
             if (-not $drive.WaitForExit(40 * 60 * 1000)) { $drive.Kill(); Write-Step "$($spot.name): drive.py timed out (40 min)" }
             Write-Step "$($spot.name): $((Get-Content (Join-Path $spotDir 'drive.log') -Tail 1))"
+            Add-CDriveSample $runDir $run.dir 'end' | Out-Null   # the game still runs: the page file is at its largest
             Stop-Game   # the next launch starts remix-dxvk.log over; gate.py's clean_quit reads this spot's copy
             Copy-Item -LiteralPath "$S\rtx-remix\logs\remix-dxvk.log" $spotDir -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $hitchList) { Move-Item -LiteralPath $hitchList (Join-Path $spotDir 'proxy_hitches.txt') -Force }
             # A quit spot (worker C): bridge32.log and bridge64.log show the window focus and the Terminate command.
             if ($spot.quit) { Copy-Item "$S\rtx-remix\logs\*.log" $spotDir -ErrorAction SilentlyContinue }
             if ($run.variant) {
@@ -615,11 +674,12 @@ try {
         } catch {
             if ($cine -and -not $cine.HasExited) { $cine.Kill() }
             Write-Step "$($spot.name): $($_.Exception.Message)"
+            try { Add-CDriveSample $runDir $run.dir 'end' | Out-Null } catch { }
             if (-not (Test-Path (Join-Path $spotDir 'spot.json'))) {
                 @{ name = $spot.name; error = $_.Exception.Message; windows = @() } | ConvertTo-Json | Set-Content (Join-Path $spotDir 'spot.json')
             }
         } finally {
-            if ($smi) { try { if (-not $smi.HasExited) { $smi.Kill() } } catch { }; $smi = $null }
+            foreach ($p in $smi, $mem) { if ($p) { try { if (-not $p.HasExited) { $p.Kill() } } catch { } } }; $smi = $null; $mem = $null
             if ($run.variant) {   # back to the baseline before the next variant (the game is closed by now)
                 Stop-Game
                 foreach ($p in $rtxPaths) { [IO.File]::WriteAllText($p, $rtxBackup) }

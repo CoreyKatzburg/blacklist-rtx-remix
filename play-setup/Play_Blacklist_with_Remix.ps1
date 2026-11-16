@@ -31,15 +31,19 @@ try {
     $restored = Restore-LauncherApi
     if ($restored) { Write-Step "Put back the launcher setting left from last time: $restored" }
 
-    $lockText = Get-LockText
-    if ($lockText -and -not (Test-OwnLock)) {
+    # Test locks: a running test refuses this launch, unless that test started this script (the gate's own launch);
+    # a lock left by a crashed test is cleared after the settings the test changed are put back.
+    $parent = [int](Get-CimInstance Win32_Process -Filter "ProcessId=$PID").ParentProcessId
+    $locks = Resolve-TestLocks @($AgentLock, $Lock) $parent @("$Setup\d3d9_proxy.ini", "$S\d3d9_proxy.ini") {
+        param($l)
         Write-Host ''
         Write-Host 'Another test says it is using the game folder:' -ForegroundColor Yellow
-        Write-Host $lockText
-        if ($NoPause) { Stop-WithMessage 'Not starting (game folder in use).' }
-        $answer = Read-Host 'Start anyway? Type Y and Enter to continue, anything else to stop'
-        if ($answer -ne 'Y' -and $answer -ne 'y') { Stop-WithMessage 'Not starting.' }
+        Write-Host $l.text
+        if ($NoPause) { return $false }
+        (Read-Host 'Start anyway? Type Y and Enter to continue, anything else to stop') -in 'Y', 'y'
     }
+    foreach ($line in $locks.restored) { Write-Step $line }
+    if ($locks.refuse) { Stop-WithMessage $locks.refuse }
 
     if ($GameExeHashes -notcontains (Get-Hash "$S\Blacklist_game.exe")) {
         Stop-WithMessage 'Blacklist_game.exe has changed (game update or Steam repair?). The camera proxy is matched to the old exe, so not starting with Remix.'

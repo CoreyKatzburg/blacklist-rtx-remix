@@ -1,10 +1,11 @@
 # Fake cases for verify_runtime.ps1's launch recovery (Nov 16 08:49 run 084921): a game exe the launcher restarts is
 # followed, and a lock left by a killed Play script is removed only when this run's Play script wrote it.
 # Run: pwsh -File test_gate_launch.ps1 ; exit code 1 on any failure.
-param([string]$Gate = (Join-Path (Split-Path $PSScriptRoot) 'verify_runtime.ps1'))
+param([string]$Gate = (Join-Path (Split-Path $PSScriptRoot) 'verify_runtime.ps1'),
+      [string]$Common = (Join-Path $PSScriptRoot '..\..\play-setup\RemixPlayCommon.ps1'))
 $ErrorActionPreference = 'Stop'
 $ast = [Management.Automation.Language.Parser]::ParseFile($Gate, [ref]$null, [ref]$null)
-foreach ($n in 'Remove-OwnPlayLock', 'Wait-RestartedGame', 'Get-DisplayProblem', 'Test-LaunchDead') {
+foreach ($n in 'Remove-OwnPlayLock', 'Wait-RestartedGame', 'Get-DisplayProblem', 'Test-LaunchDead', 'Get-CSpaceProblem', 'Get-MemoryProblem') {
     $f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true) | Select-Object -First 1
     if (-not $f) { throw "missing $n" }
     . ([scriptblock]::Create($f.Extent.Text))
@@ -61,6 +62,95 @@ Check 'starter exits at 11 s: dead 20 s later, not sooner' ((FirstDead (0..10) 1
 Check 'starter runs until the game: never dead' ((FirstDead (0..120) 120) -eq 0)
 Check 'starter not seen yet (slow Steam): never dead' ((FirstDead @() 120) -eq 0)
 Check 'starter back after a gap: the gap is forgotten' ((FirstDead (@(0..10) + @(20..24)) 120) -eq 45)
+# C: space (Nov 16 12:22:49): a launch that started with 17,100 MB free fell to 8,299 MB. Started with less than the
+# 8,801 MB it took, it would have run C: out; the gate's limit must refuse that, and allow the 17,100 MB start.
+$limit = [int]((Select-String -LiteralPath $Gate -Pattern '^\$MinCFreeMB = (\d+)').Matches[0].Groups[1].Value)
+Check 'C: limit covers the largest measured fall in one launch (8,801 MB)' ($limit -gt 8801)
+Check 'C: below the limit: refused' ([bool](Get-CSpaceProblem 8000 $limit))
+Check 'C: as at the start of the 12:22 launch (17,100 MB): allowed' ($null -eq (Get-CSpaceProblem 17100 $limit))
+# Memory room (Nov 16): the largest rise in committed memory during one launch was 12,652 MB. The machine as at the
+# start of the 12:33:46 launch (32,621 MB RAM, 26,496 MB page file of 65,536 at most, 16,719 MB free on C:, 47,445
+# committed) has room; the same with 2,000 MB free on C:, or with the page file at its maximum, does not.
+$need = [int]((Select-String -LiteralPath $Gate -Pattern '^\$MinCommitRoomMB = (\d+)').Matches[0].Groups[1].Value)
+function Machine($commit, $pagefile, $cFree) { [ordered]@{ ramMB = 32621; pagefileMB = $pagefile; pagefileMaxMB = 65536; freeMB = $cFree; commitMB = $commit } }
+Check 'memory limit covers the largest measured rise in one launch (12,652 MB)' ($need -gt 12652)
+Check 'memory as at the 12:33:46 launch start: allowed' ($null -eq (Get-MemoryProblem (Machine 47445 26496 16719) $need))
+Check 'memory: C: too full for the page file to grow: refused' ([bool](Get-MemoryProblem (Machine 47445 26496 2000) $need))
+Check 'memory: page file at its 65,536 MB maximum, C: has room: refused' ([bool](Get-MemoryProblem (Machine 84000 64000 100000) $need))
+
+# Play script lock rules (Corey, Nov 16): a running test refuses his launch, the gate's own launch goes through, a lock
+# left by a crashed test is cleared after its settings are put back, a clean state is untouched. Each rule is then
+# removed from a copy of the functions, and its case must fail.
+. (Join-Path $PSScriptRoot 'run_files.ps1')
+$commonAst = [Management.Automation.Language.Parser]::ParseFile((Resolve-Path $Common), [ref]$null, [ref]$null)
+$lockFns = foreach ($n in 'Get-TestLocks', 'Restore-LeftOverTests', 'Resolve-TestLocks') {
+    $f = $commonAst.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true) | Select-Object -First 1
+    if (-not $f) { throw "missing $n in $Common" }
+    $f.Extent.Text
+}
+$live = Start-Process ping -ArgumentList '-n', '600', '127.0.0.1' -PassThru -WindowStyle Hidden
+$dead = Start-Process ping -ArgumentList '-n', '1', '127.0.0.1' -PassThru -WindowStyle Hidden; $dead.WaitForExit()
+$corey = "[Proxy]`r`nEnable=1`r`n"
+function Owner($p, [double]$shift = 0) { "pid $($p.Id) started $($p.StartTime.ToUniversalTime().AddSeconds($shift).ToString('o'))" }
+# One fake setup: an ini and a save the run changed, the run's file-backup, and the lock ($owner $null: no lock).
+function LockCase([string]$owner, [int]$parent, [bool]$changed, [bool]$answer = $true) {
+    $d = Join-Path $env:TEMP "playlock-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $run = Join-Path $d 'run'; $saves = Join-Path $d 'saves'; $ini = Join-Path $d 'd3d9_proxy.ini'; $lockFile = Join-Path $d 'AGENT_GAME_LOCK.txt'
+    New-Item -ItemType Directory $saves | Out-Null
+    [IO.File]::WriteAllText($ini, $corey); Set-Content (Join-Path $saves 'a.save') 'corey'
+    Save-RunFiles $run ([ordered]@{ $ini = $ini }) $saves
+    if ($changed) { [IO.File]::WriteAllText($ini, (Add-RunMarker "[Proxy]`r`nEnable=0`r`n" $run)); Set-Content (Join-Path $saves 'a.save') 'test' }
+    if ($owner) { Set-Content $lockFile "verify_runtime.ps1 runtime gate 2026-11-16 12:00:00Z run $run`r`n$owner" }
+    $script:asked = 0
+    # An error stops the Play script (its catch prints it and exits), so here it counts as a refusal.
+    try { $r = Resolve-TestLocks @($lockFile) $parent @($ini) { param($l) $script:asked++; $answer } }
+    catch { $r = @{ refuse = "error: $($_.Exception.Message)"; restored = @() } }
+    $o = [pscustomobject]@{ refuse = $r.refuse; restored = @($r.restored).Count; asked = $script:asked
+        coreyIni = [IO.File]::ReadAllText($ini) -eq $corey; coreySave = (Get-Content (Join-Path $saves 'a.save')) -eq 'corey'; lock = Test-Path $lockFile }
+    Remove-Item $d -Recurse -Force
+    $o
+}
+function LockCases {
+    $c = LockCase (Owner $live) $PID $true
+    [ordered]@{
+        'live lock: refused, nothing changed' = [bool]$c.refuse -and $c.refuse -match 'runtime gate' -and $c.lock -and -not $c.coreyIni -and $c.asked -eq 0
+        'gate''s own launch: allowed, its settings kept' = $(
+            $c = LockCase (Owner $live) $live.Id $true; -not $c.refuse -and $c.lock -and -not $c.coreyIni -and -not $c.coreySave)
+        'leftover lock: settings and saves put back, lock removed, launches' = $(
+            $c = LockCase (Owner $dead) $PID $true; -not $c.refuse -and $c.coreyIni -and $c.coreySave -and -not $c.lock -and $c.restored -ge 2)
+        'pid now used by another process (other start time): leftover' = $(
+            $c = LockCase (Owner $live -60) $PID $true; -not $c.refuse -and $c.coreyIni -and -not $c.lock)
+        'clean state: launches, nothing changed' = $(
+            $c = LockCase $null $PID $false; -not $c.refuse -and $c.restored -eq 0 -and $c.coreyIni -and $c.coreySave -and $c.asked -eq 0)
+        'lock without pid: asks, and No refuses' = $(
+            $c = LockCase 'no pid recorded' $PID $true $false; [bool]$c.refuse -and $c.asked -eq 1 -and $c.lock -and -not $c.coreyIni)
+    }
+}
+function Use-LockFns($texts) { foreach ($t in $texts) { . ([scriptblock]::Create($t)) } }
+# Use-LockFns defines them in its own scope; dot-source the call so they land here.
+. Use-LockFns $lockFns
+$cases = LockCases
+foreach ($k in $cases.Keys) { Check $k $cases[$k] }
+# Each mutant removes one rule; the case it names must fail.
+$mutants = [ordered]@{
+    'live lock: refused, nothing changed' = @('if ($live.Count) {', 'if ($false) {')
+    'gate''s own launch: allowed, its settings kept' = @("if (`$kind -eq 'live' -and `$id -eq `$parentPid) { `$kind = 'gate' }", '')
+    'leftover lock: settings and saves put back, lock removed, launches' = @("`$kind = if (`$proc) { 'live' } else { 'leftover' }", "`$kind = 'live'")
+    'pid now used by another process (other start time): leftover' = @("-gt 2) { `$kind = 'leftover' }", '-gt 1e9) { }')
+    'clean state: launches, nothing changed' = @('-SimpleMatch $RunMarkerText', "-Pattern 'Proxy'")
+    'lock without pid: asks, and No refuses' = @('if (-not (& $askUnknown $l))', 'if ($false)')
+}
+$mutantNames = @($mutants.Keys)
+for ($m = 0; $m -lt $mutantNames.Count; $m++) {
+    $name = $mutantNames[$m]; $from, $to = $mutants[$name]
+    $text = $lockFns -join "`n"
+    if (-not $text.Contains($from)) { Check "mutant ${m}: rule text found" $false; continue }
+    . Use-LockFns @($text.Replace($from, $to))
+    $mc = LockCases
+    Check "rule removed, case fails: $name" (-not $mc[$name])
+}
+. Use-LockFns $lockFns
+Stop-Process -Id $live.Id -Force -ErrorAction SilentlyContinue
 "failures $fail"
 exit [int]($fail -gt 0)
 
