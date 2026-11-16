@@ -547,6 +547,53 @@ def make_run(folder: str, case: str) -> str:
     return run
 
 
+# Free-play session logs for gate.evaluate_session: case -> checks that must FAIL (every other check must PASS).
+# 300 frames, goggles on at proxy frames 100..139, so the goggles-off is proxy frame 140 and Remix ray traces again
+# from frame 141 (one frame later, as in session 20261115-135449 at frame 41475).
+SESSION_CASES = {
+    "session_good": (),
+    "session_scene_clear": ("goggles_toggle_rebuilds",),          # 94 static meshes built, as at 135449 frame 41476
+    "session_dark_off": ("goggles_dark_frame",),                  # first ray-traced frame at 0.2x the luma 10 later
+    "session_dropped_character": ("remix_dropped_character_frames",),  # Remix 0 characters, proxy drew them +/-3
+    "session_goggles_no_characters": (),                          # 0 characters inside goggles does not count
+    "session_device_lost": ("clean_quit",),
+}
+
+
+def make_session(folder: str, case: str) -> str:
+    d = os.path.join(folder, case)
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    pg, tel = [], []
+    for f in range(300):
+        g = 1 if 100 <= f < 140 else 0
+        pg.append(f"{f},400,5,1,{g},{1 - g}")
+        rt = not 100 <= f <= 140
+        luma = 20 if (case == "session_dark_off" and f == 141) else 100
+        builds = 94 if (case == "session_scene_clear" and f == 141) else (3 if f == 141 else 0)
+        skinned = 0 if ((case == "session_dropped_character" and f == 220)
+                        or (case == "session_goggles_no_characters" and f == 120)) else 5
+        thumb = base64.b64encode(np.full(gate.THUMB_W * gate.THUMB_H, luma, np.uint8).tobytes()).decode()
+        tel.append(json.dumps({"frame": f, "rayTraced": rt, "staticBlasBuilds": builds, "skinnedInstances": skinned,
+                               "instances": 500, "lumaThumb": thumb}))
+    gate.save_text(os.path.join(d, "d3d9_proxy_gate.csv"), "\n".join(pg) + "\n")
+    gate.save_text(os.path.join(d, "rtx_telemetry.jsonl"), "\n".join(tel) + "\n")
+    lost = "[error] vkQueueSubmit: VK_ERROR_DEVICE_LOST\n" if case == "session_device_lost" else ""
+    gate.save_text(os.path.join(d, "rtx-remix_logs_remix-dxvk.log"), "[info] Remix started\n" + lost)
+    return d
+
+
+def check_session_case(folder: str, case: str) -> tuple[bool, str]:
+    result = gate.evaluate_session(make_session(folder, case))
+    status = {c["check"]: c["status"] for c in result["checks"]}
+    want = {c: gate.FAIL for c in SESSION_CASES[case]}
+    wrong = [f"{c}: {st}, expected {want.get(c, gate.PASS)}" for c, st in status.items() if st != want.get(c, gate.PASS)]
+    wrong += [f"{c}: not reported" for c in want if c not in status]
+    if (result["status"] == gate.PASS) != (not want):
+        wrong.append(f"session status {result['status']}")
+    return not wrong, "; ".join(wrong) or "as expected"
+
+
 def check_case(folder: str, case: str) -> tuple[bool, dict, str]:
     """(expectation met, result, explanation). Checks the case does not name must PASS, except fps_regression, which
     only WARNs when no previous run is given (the PREVIOUS cases get one)."""

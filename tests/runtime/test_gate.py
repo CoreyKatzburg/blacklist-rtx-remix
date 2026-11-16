@@ -292,6 +292,23 @@ class FakeRunTest(unittest.TestCase):
                 self.assertEqual(by_name["remix_ray_tracing"]["status"], want_rt, (spot_name, by_name["remix_ray_tracing"]))
                 self.assertEqual(by_name["remix_compile_stall"]["status"], want_cs, (spot_name, by_name["remix_compile_stall"]))
 
+    def test_session_mode_fake_sessions(self):
+        with tempfile.TemporaryDirectory() as td:
+            for case in fakerun.SESSION_CASES:
+                ok, why = fakerun.check_session_case(td, case)
+                self.assertTrue(ok, f"{case}: {why}")
+
+    def test_session_mode_on_20261115_135449(self):
+        """Corey's free-play session: goggles go off at proxy frame 41475 and Remix rebuilds 94 static meshes on the
+        next frame (the dark frame he saw), so goggles_toggle_rebuilds must FAIL and name that goggles-off."""
+        d = r"D:\BlacklistOverhaul\experiments\playtest-evidence\play-setup-logs\before-20261115-135449"
+        if not os.path.exists(os.path.join(d, "rtx_telemetry.jsonl")):
+            self.skipTest("session logs not on this machine")
+        by = {c["check"]: c for c in gate.evaluate_session(d)["checks"]}
+        g = by["goggles_toggle_rebuilds"]
+        self.assertEqual(g["status"], gate.FAIL, g)
+        self.assertIn("94 at 41475", g["detail"])
+
 
 class DriveHelpersTest(unittest.TestCase):
     def test_set_ini_replaces_and_inserts(self):

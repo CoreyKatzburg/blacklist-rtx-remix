@@ -1794,6 +1794,115 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
     save_text(os.path.join(folder, "result.md"), markdown(result))
     return result
 
+
+def _first_file(folder: str, names: tuple[str, ...]) -> str | None:
+    return next((os.path.join(folder, n) for n in names if os.path.exists(os.path.join(folder, n))), None)
+
+
+def evaluate_session(folder: str) -> dict:
+    """Score the logs of a free-play session (a play-setup logs folder: rtx_telemetry.jsonl, d3d9_proxy_gate.csv and
+    rtx-remix_logs_remix-dxvk.log) with the gate rules that need no scripted camera: goggles_toggle_rebuilds and
+    goggles_dark_frame on every goggles-off (proxy goggles column 1 -> 0), remix_dropped_character_frames on every
+    frame, clean_quit on device loss. Telemetry is streamed (sessions reach 1.6 GB). Writes nothing to the folder."""
+    run = Run.__new__(Run)
+    run.dir, run.manifest, run.metrics = folder, {}, []
+    tel_path = _first_file(folder, ("rtx_telemetry.jsonl", "telemetry.jsonl"))
+    pg_path = _first_file(folder, ("d3d9_proxy_gate.csv", "proxy_gate.csv"))
+    tsrc = f"{os.path.basename(tel_path or 'rtx_telemetry.jsonl')} + {os.path.basename(pg_path or 'd3d9_proxy_gate.csv')}"
+    builds_lim, dark_lim = THRESHOLDS["goggles_toggle_max_builds"], THRESHOLDS["goggles_dark_min_ratio"]
+    goggle_checks = (("goggles_toggle_rebuilds", f"<= {builds_lim} (GUESS)"),
+                     ("goggles_dark_frame", f">= {dark_lim:g} (GUESS)"),
+                     ("remix_dropped_character_frames", "0"))
+    if not tel_path or not pg_path:
+        for name, thr in goggle_checks:
+            run.add(name, NOT_MEASURED, None, thr, "session has no telemetry or no proxy gate CSV", tsrc)
+    else:
+        pg = read_csv_frames(pg_path, 6)
+        tel: dict[int, tuple] = {}   # frame -> (rayTraced, staticBlasBuilds, skinnedInstances, instances, luma)
+        with open(tel_path, "rb") as f:
+            for ln in f:
+                try:
+                    o = json.loads(ln)
+                except ValueError:
+                    continue
+                th = o.get("lumaThumb")
+                luma = float(np.frombuffer(base64.b64decode(th), np.uint8).mean()) if th else None
+                if isinstance(o.get("frame"), int):
+                    tel[o["frame"]] = (o.get("rayTraced"), o.get("staticBlasBuilds"), o.get("skinnedInstances"),
+                                       o.get("instances"), luma)
+
+        def goggles(fr: int) -> bool | None:
+            row = pg.get(fr)
+            return None if row is None or len(row) < 5 else int(row[4]) == 1
+
+        offs = [k for k in sorted(pg) if goggles(k) is False and goggles(k - 1) is True]
+        builds, ratios, unknown = [], [], []
+        for k in offs:
+            first = next((f for f in range(k, k + 31) if f in tel and tel[f][0] is True), None)
+            if first is None or not isinstance(tel[first][1], (int, float)):
+                unknown.append(k)
+                continue
+            if not tel[first][3]:            # no level loaded: a menu, not a goggles toggle in play
+                continue
+            builds.append((int(tel[first][1]), k, first))
+            later = [f for f in range(first, first + 200) if f in tel and tel[f][0] is True][10:11]
+            if later and tel[first][4] is not None and tel[later[0]][4]:
+                ratios.append((tel[first][4] / tel[later[0]][4], k, first))
+        nm = f"{len(offs)} goggles-off(s), {len(unknown)} without a ray-traced frame with staticBlasBuilds in 30 frames"
+        if not builds:
+            run.add("goggles_toggle_rebuilds", NOT_MEASURED, None, goggle_checks[0][1], nm, tsrc)
+        else:
+            bad = [b for b in builds if b[0] > builds_lim]
+            w = max(builds)
+            run.add("goggles_toggle_rebuilds", FAIL if bad else PASS, w[0], goggle_checks[0][1],
+                    f"{len(bad)} of {len(builds)} goggles-off(s) built > {builds_lim} static meshes (scene cleared); "
+                    f"worst {w[0]} at goggles-off frame {w[1]} (first ray-traced frame {w[2]})"
+                    + "".join(f"; {b[0]} at {b[1]}" for b in sorted(bad, key=lambda b: b[1])[:50]), tsrc)
+        if not ratios:
+            run.add("goggles_dark_frame", NOT_MEASURED, None, goggle_checks[1][1], nm + ", none with 10 later "
+                    "ray-traced frames and lumaThumb", tsrc)
+        else:
+            w = min(ratios)
+            run.add("goggles_dark_frame", PASS if w[0] >= dark_lim else FAIL, round(w[0], 3), goggle_checks[1][1],
+                    f"worst luma ratio {w[0]:.3f} at goggles-off frame {w[1]} (first ray-traced frame {w[2]}), "
+                    f"{len(ratios)} goggles-off(s)", tsrc)
+
+        # remix_dropped_character_frames: the gate run rule, on every frame of the session
+        def pg_skinned(fr: int) -> int | None:
+            row = pg.get(fr)
+            return None if row is None or len(row) < 5 else int(row[2])
+
+        dropped, char_frames = [], 0
+        for tf, (rt, _, sk, _, _) in tel.items():
+            if not isinstance(sk, (int, float)) or not (pg_skinned(tf) or 0) > 0:
+                continue
+            char_frames += 1
+            if rt is not True or any(goggles(f) is not False for f in range(tf - 3, tf + 4)):
+                continue
+            if sk == 0 and all((pg_skinned(f) or 0) > 0 for f in range(tf - 3, tf + 4)):
+                dropped.append(tf)
+        if not char_frames:
+            run.add("remix_dropped_character_frames", NOT_MEASURED, None, "0",
+                    "no frame where the proxy drew characters and telemetry has skinnedInstances", tsrc)
+        else:
+            run.add("remix_dropped_character_frames", PASS if not dropped else FAIL, len(dropped), "0",
+                    f"{len(dropped)} of {char_frames} proxy character frames had 0 Remix skinnedInstances while the "
+                    f"proxy drew characters +/-3 frames outside goggles"
+                    + (f"; frames {', '.join(map(str, dropped[:10]))}" if dropped else ""), tsrc)
+
+    dxvk = _first_file(folder, ("rtx-remix_logs_remix-dxvk.log", "remix-dxvk.log"))
+    if not dxvk:
+        run.add("clean_quit", NOT_MEASURED, None, "no VK_ERROR_DEVICE_LOST", "no remix-dxvk.log in the session",
+                "remix-dxvk.log")
+    else:
+        lost = [i + 1 for i, ln in enumerate(read_lines(dxvk)) if "VK_ERROR_DEVICE_LOST" in ln]
+        run.add("clean_quit", FAIL if lost else PASS, len(lost), "no VK_ERROR_DEVICE_LOST",
+                f"VK_ERROR_DEVICE_LOST on line(s) {', '.join(map(str, lost[:5]))}" if lost else "no device loss",
+                os.path.basename(dxvk))
+    status = PASS if all(x["status"] in (PASS, WARN) for x in run.metrics) else FAIL
+    return {"status": status, "session": os.path.abspath(folder), "thresholds": THRESHOLDS, "checks": run.metrics}
+
+
 def pose_check(run: Run, spots: list[dict]) -> None:
     """The camera direction in the proxy's trace must follow the requested yaw/pitch (relative to the first stop;
     the sign convention is learnt from the first pure-yaw and first pitched stop), and the pan must turn >= 350 deg."""
@@ -1948,8 +2057,10 @@ if __name__ == "__main__":
     ap.add_argument("folder")
     ap.add_argument("--previous", help="an earlier run folder: a spot more than 10% slower than it FAILs")
     ap.add_argument("--reference", help="the no-Remix reference run folder: input latency is compared with it per spot")
+    ap.add_argument("--session", action="store_true",
+                    help="folder is a free-play session's logs (play-setup logs), not a gate run: see evaluate_session")
     a = ap.parse_args()
-    r = evaluate(a.folder, previous=a.previous, reference=a.reference)
+    r = evaluate_session(a.folder) if a.session else evaluate(a.folder, previous=a.previous, reference=a.reference)
     for c in r["checks"]:
         print(f"[{c['status']}] {c['check']}: {c['detail']}")
     print("GATE", r["status"])
