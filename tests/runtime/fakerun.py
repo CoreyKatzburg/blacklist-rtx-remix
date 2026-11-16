@@ -246,7 +246,7 @@ class Builder:
         spot = {"name": self.name, "mission": "fake", "nearField": 300, "error": None, "windows": self.windows,
                 "telemetry": None if self.case == "no_telemetry" else "telemetry.jsonl",
                 "proxyFrames": "proxy_frames.csv", "proxyGate": None if self.case == "no_proxy_gate" else "proxy_gate.csv",
-                "proxyLog": None}
+                "proxyLog": "proxy.log"}
         if self.case != "no_mouse_lag":
             bump = 5.0 if self.case == "lag_within_margin" else (5.5 if self.case == "lag_over_margin" else 0.0)
             samples = [round(22.0 + bump + ((i % 3) - 1) * 0.5, 2) for i in range(20)]
@@ -275,6 +275,29 @@ class Builder:
             if self.case != "no_terminate":
                 b32 += "[00:02:00.000] info:  Sending Terminate command to server...\n"
             gate.save_text(os.path.join(self.dir, "bridge32.log"), b32)
+        s_val = 109 if self.case == "standins_ignored" else 0
+        um_val = 15 if self.case == "unplaced_balls" else 0
+        mm_val = 3 if self.case == "moving_balls" else 0
+        xm_val = 80 if self.case == "lamps_no_flare_jump" else 59
+        tm_val = 700 if self.case == "dimmed_linger" else 10
+        plog = (
+            "lightpub: loaded (scale 1, sun 1, fill 1, max 20, flare stand-ins 0, trace 1, "
+            "stand-in skip unplaced 1, skip moving 1)\n"
+            f"lightpub: stray frame 120 lamps 120 without flare {xm_val} (max {xm_val}) flares 61 "
+            f"stand-ins {s_val} on unplaced {um_val} (max {um_val}) on moving {mm_val} (max {mm_val}) "
+            f"dimmed 2 (max 2) longest dim {tm_val} frames (max {tm_val})\n"
+        )
+        gate.save_text(os.path.join(self.dir, "proxy.log"), plog)
+        trows = ["frame,node,id,change,old,new", "100,0x1,1,started,0.0,100.0"]
+        if self.case == "switchoff_lag":
+            val = 100.0
+            for fr in range(120, 781, 60):
+                trows.append(f"{fr},0x1,1,brightness,{val:.4f},{val * 0.5:.4f}")
+                val *= 0.5
+            trows.append(f"800,0x1,1,stopped,{val:.4f},0")
+        else:
+            trows.append("130,0x1,1,stopped,100.0,0")
+        gate.save_text(os.path.join(self.dir, "lightpub_trace.csv"), "\n".join(trows) + "\n")
         gate.save_json(os.path.join(self.dir, "spot.json"), spot)
 
 
@@ -314,7 +337,7 @@ CASES = {
     "no_mouse_lag": ((), ("input_latency_ms",)),        # missing mouse_lag in spot.json: NOT MEASURED, fails the gate
     "fps_regression": (("fps_regression",), ()),        # 15% below the previous run
     "fps_drop_9pct": ((), ()),                          # 9% below the previous run: passes
-    "no_reference": ((), ("input_latency_ms",)),        # no --reference: NOT MEASURED, which fails the gate
+    "no_reference": ((), ("input_latency_ms", "lamps_without_flare")),  # no --reference: NOT MEASURED, fails gate
     "too_dark": (("brightness_floor",), ()),
     "blurry_angles": (("angled_sharpness",), ()),
     "pose_off": (("pose",), ()),
@@ -343,7 +366,15 @@ CASES = {
                                     "nonfinite_thumb_pixels", "raster_fallback_frames", "flashes", "still_flicker",
                                     "nan_pixels", "neon_fraction", "brightness_floor", "angled_sharpness",
                                     "outline_overlap", "pose", "goggles", "goggles_toggle_rebuilds",
-                                    "goggles_dark_frame", *RECORDER, "clean_quit")),
+                                    "goggles_dark_frame", "flare_standins_off", "flare_unplaced_balls",
+                                    "flare_moving_balls", "lamps_without_flare", "lights_dimmed_linger",
+                                    "light_switchoff_lag", *RECORDER, "clean_quit")),
+    "standins_ignored": (("flare_standins_off",), ()),
+    "unplaced_balls": (("flare_unplaced_balls",), ()),
+    "moving_balls": (("flare_moving_balls",), ()),
+    "lamps_no_flare_jump": (("lamps_without_flare",), ()),
+    "dimmed_linger": (("lights_dimmed_linger",), ()),
+    "switchoff_lag": (("light_switchoff_lag",), ()),
     "untimed_steps": (("step_timing",), ()),          # every 5th still frame: a step with no timing
     "child_over_parent": (("step_timing",), ()),      # a nested step 1.0 ms longer than its parent
     "child_timer_jitter": ((), ()),                   # 0.4 ms over its parent: inside the tolerance

@@ -42,6 +42,12 @@ Checks (thresholds in THRESHOLDS):
                            staticBlasBuilds <= 40 (GUESS)
   goggles_dark_frame       on that same first rayTraced=true frame, mean luma / mean luma 10 ray-traced frames later
                            >= 0.4 (GUESS)
+  flare_standins_off       when proxy.log says flare stand-ins 0, stray line stand-ins S must be 0
+  flare_unplaced_balls     stray line max unplaced stand-ins UM: 0 when skip unplaced SU=1, <= 15 (GUESS) when SU=0
+  flare_moving_balls       stray line max moving stand-ins MM: 0 when skip moving SM=1
+  lamps_without_flare      spot max of lamps without flare XM <= --reference spot max + 10 (GUESS)
+  lights_dimmed_linger     stray line max longest dim TM <= 600 frames (GUESS, ~10 s at 60 fps)
+  light_switchoff_lag      max time from downward brightness run start to stopped in lightpub_trace.csv <= 1.0 s (GUESS)
   pose                     the camera really went where it was told (proxy camera trace vs requested yaw/pitch)
   goggles                  each goggle mode toggled (proxy log) and looks the same with ray tracing on and off
                            (no missing geometry, no different picture)
@@ -54,6 +60,7 @@ import base64
 import json
 import math
 import os
+import re
 import sys
 
 import numpy as np
@@ -87,6 +94,10 @@ THRESHOLDS = {
     "goggles_dark_min_ratio": 0.4,     # GUESS. Mean luma ratio vs 10 ray-traced frames later on toggle-off.
     "present_stalls_max": 0,           # d3d9_proxy_frames.csv col 3 > 50 ms in measured windows (excl. loads).
     "quit_present_max_ms": 1000.0,     # No proxy Present > 1000 ms in the last 10 s before Terminate.
+    "flare_unplaced_max_noskip": 15,   # GUESS. Max unplaced stand-in spheres when skip unplaced SU=0.
+    "lamps_without_flare_margin": 10,  # GUESS. Max jump over --reference spot max XM.
+    "lights_dimmed_max_frames": 600,   # GUESS. ~10 s at 60 fps.
+    "light_switchoff_max_s": 1.0,      # GUESS. Seconds from downward brightness run to stopped.
     }
 TELEMETRY_FIELDS = ("frame", "frameTimeMs", "gpuTimeMs", "instances", "skinnedInstances", "staticBlasRebuilds",
                     "cameraCut", "textureMemoryMB", "vramUsedMB")
@@ -645,6 +656,193 @@ def check_clean_quit_dirs(dirs: list[str], run_dir: str | None = None,
     return (PASS if problems == 0 else FAIL), problems, "; ".join(parts)
 
 
+_LP_CFG_RE = re.compile(
+    r"lightpub:.*?\(.*?\bflare stand-ins\s+(\d+)\b.*?\bstand-in skip unplaced\s+(\d+)\b.*?\bskip moving\s+(\d+)\b"
+)
+_LP_STRAY_RE = re.compile(
+    r"lightpub:\s+stray frame\s+(\d+)\s+lamps\s+\d+\s+without flare\s+\d+\s+\(max\s+(\d+)\)\s+"
+    r"flares\s+\d+\s+stand-ins\s+(\d+)\s+on unplaced\s+\d+\s+\(max\s+(\d+)\)\s+"
+    r"on moving\s+\d+\s+\(max\s+(\d+)\)\s+dimmed\s+\d+\s+\(max\s+\d+\)\s+"
+    r"longest dim\s+\d+\s+frames\s+\(max\s+(\d+)\)"
+)
+
+
+def _find_proxy_log(spot: dict) -> str | None:
+    p = spot_path(spot, spot.get("proxyLog"))
+    if p and os.path.exists(p):
+        return p
+    return find_session_log(spot["_dir"], "proxy") or find_session_log(spot["_dir"], "d3d9_proxy")
+
+
+def _parse_lightpub_log(path: str) -> list[tuple[tuple[int, int, int], int, int, int, int, int, int]]:
+    """Return [( (E, SU, SM), frame, XM, S, UM, MM, TM ), ...] from proxy.log."""
+    cfg: tuple[int, int, int] | None = None
+    rows = []
+    for ln in read_lines(path):
+        m = _LP_CFG_RE.search(ln)
+        if m:
+            cfg = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            continue
+        m = _LP_STRAY_RE.search(ln)
+        if m and cfg is not None:
+            rows.append((cfg, int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                         int(m.group(4)), int(m.group(5)), int(m.group(6))))
+    return rows
+
+
+def lightpub_checks(run: Run, good: list[dict], reference: dict[str, dict] | None) -> None:
+    """Worker B's lightpub checks: S1..S5 from proxy.log and T1 from lightpub_trace.csv."""
+    log_src = "proxy.log (lightpub)"
+    trace_src = "lightpub_trace.csv"
+    parsed: dict[str, list[tuple[tuple[int, int, int], int, int, int, int, int, int]]] = {}
+    missing_log = []
+    for s in good:
+        lp = _find_proxy_log(s)
+        rows = _parse_lightpub_log(lp) if lp else []
+        if not rows:
+            missing_log.append(s["name"])
+        else:
+            parsed[s["name"]] = rows
+
+    if not good or missing_log:
+        msg = ("no spot ran far enough to judge" if not good
+               else "missing lightpub stray/settings lines in proxy.log for: " + ", ".join(missing_log))
+        run.add("flare_standins_off", NOT_MEASURED, None, "0 when flare stand-ins 0", msg, log_src)
+        run.add("flare_unplaced_balls", NOT_MEASURED, None,
+                f"0 when SU=1, <= {THRESHOLDS['flare_unplaced_max_noskip']} when SU=0 (GUESS)", msg, log_src)
+        run.add("flare_moving_balls", NOT_MEASURED, None, "0 when SM=1", msg, log_src)
+        run.add("lamps_without_flare", NOT_MEASURED, None,
+                f"<= reference + {THRESHOLDS['lamps_without_flare_margin']} (GUESS)", msg, log_src)
+        run.add("lights_dimmed_linger", NOT_MEASURED, None,
+                f"<= {THRESHOLDS['lights_dimmed_max_frames']} frames (GUESS)", msg, log_src)
+    else:
+        all_rows = [(name, *row) for name, rows in parsed.items() for row in rows]
+        # S1: flare_standins_off
+        off_rows = [(n, fr, S) for n, (E, _, _), fr, _, S, _, _, _ in all_rows if E == 0]
+        bad_s1 = [r for r in off_rows if r[2] > 0]
+        worst_s1 = max((r[2] for r in off_rows), default=0)
+        run.add("flare_standins_off", PASS if not bad_s1 else FAIL, worst_s1, "0 when flare stand-ins 0",
+                f"max stand-ins S={worst_s1} with flare stand-ins 0 ({len(bad_s1)} bad line(s))", log_src)
+
+        # S2: flare_unplaced_balls
+        noskip_lim = THRESHOLDS["flare_unplaced_max_noskip"]
+        bad_s2 = [(n, fr, SU, UM) for n, (_, SU, _), fr, _, _, UM, _, _ in all_rows
+                  if UM > (0 if SU == 1 else noskip_lim)]
+        worst_um = max(r[5] for r in all_rows)
+        run.add("flare_unplaced_balls", PASS if not bad_s2 else FAIL, worst_um,
+                f"0 when SU=1, <= {noskip_lim} when SU=0 (GUESS)",
+                f"worst max-unplaced UM={worst_um} ({len(bad_s2)} violation(s))", log_src)
+
+        # S3: flare_moving_balls
+        sm1_rows = [(n, fr, MM) for n, (_, _, SM), fr, _, _, _, MM, _ in all_rows if SM == 1]
+        bad_s3 = [r for r in sm1_rows if r[2] > 0]
+        worst_mm = max((r[2] for r in sm1_rows), default=0)
+        run.add("flare_moving_balls", PASS if not bad_s3 else FAIL, worst_mm, "0 when SM=1",
+                f"worst max-moving MM={worst_mm} with SM=1 ({len(bad_s3)} violation(s))", log_src)
+
+        # S4: lamps_without_flare
+        margin = THRESHOLDS["lamps_without_flare_margin"]
+        thresh_s4 = f"<= reference + {margin} (GUESS)"
+        if reference is None:
+            run.add("lamps_without_flare", NOT_MEASURED, None, thresh_s4,
+                    "no reference run given (--reference), so not compared", log_src)
+        else:
+            diffs, missing_ref = [], []
+            for s in good:
+                name = s["name"]
+                now_xm = max(r[2] for r in parsed[name])
+                ref_s = reference.get(name)
+                ref_lp = _find_proxy_log(ref_s) if ref_s else None
+                ref_rows = _parse_lightpub_log(ref_lp) if ref_lp else []
+                if not ref_rows:
+                    missing_ref.append(name)
+                else:
+                    ref_xm = max(r[2] for r in ref_rows)
+                    diffs.append((now_xm - ref_xm, name, now_xm, ref_xm))
+            if not diffs or missing_ref:
+                run.add("lamps_without_flare", NOT_MEASURED, None, thresh_s4,
+                        "no reference proxy.log lightpub baseline for: " + (", ".join(missing_ref) or "no spot"),
+                        log_src)
+            else:
+                worst_jump = max(d[0] for d in diffs)
+                detail = f"worst jump {worst_jump:+d} over reference; " + "; ".join(
+                    f"{n} {a} vs {b}" for _, n, a, b in diffs)
+                run.add("lamps_without_flare", PASS if worst_jump <= margin else FAIL, worst_jump, thresh_s4,
+                        detail, log_src)
+
+        # S5: lights_dimmed_linger
+        worst_tm = max(r[7] for r in all_rows)
+        lim_tm = THRESHOLDS["lights_dimmed_max_frames"]
+        run.add("lights_dimmed_linger", PASS if worst_tm <= lim_tm else FAIL, worst_tm,
+                f"<= {lim_tm} frames (GUESS)", f"worst longest-dim max TM={worst_tm} frames", log_src)
+
+    # T1: light_switchoff_lag from lightpub_trace.csv
+    t1_thresh = f"<= {THRESHOLDS['light_switchoff_max_s']:g} s (GUESS)"
+    if not good:
+        run.add("light_switchoff_lag", NOT_MEASURED, None, t1_thresh, "no spot ran far enough to judge", trace_src)
+        return
+    traces: list[tuple[dict, str]] = []
+    missing_trace = []
+    for s in good:
+        lp = _find_proxy_log(s)
+        cand = os.path.join(os.path.dirname(lp), "lightpub_trace.csv") if lp else os.path.join(s["_dir"], "lightpub_trace.csv")
+        if not os.path.exists(cand):
+            cand = os.path.join(s["_dir"], "lightpub_trace.csv")
+        if os.path.exists(cand):
+            traces.append((s, cand))
+        else:
+            missing_trace.append(s["name"])
+    if missing_trace:
+        run.add("light_switchoff_lag", NOT_MEASURED, None, t1_thresh,
+                "missing lightpub_trace.csv for: " + ", ".join(missing_trace), trace_src)
+        return
+
+    lags: list[tuple[float, int, str, str]] = []
+    missing_fps = []
+    for s, tp in traces:
+        want_f, recs_f = coverage(scene_pairs(s), "telemetry", "telemetry")
+        vals_f = [r["frameTimeMs"] for r in recs_f if isinstance(r.get("frameTimeMs"), (int, float))]
+        mean_fps = (1000.0 / max(float(np.mean(vals_f)), 1e-3)) if (want_f > 0 and len(vals_f) == want_f) else None
+        run_start: dict[str, int | None] = {}
+        for ln in read_lines(tp):
+            parts = [x.strip() for x in ln.split(",")]
+            if len(parts) < 6 or not parts[0].isdigit():
+                continue
+            fr, _, lid, chg, old_v, new_v = int(parts[0]), parts[1], parts[2], parts[3], parts[4], parts[5]
+            if chg == "started":
+                run_start[lid] = None
+            elif chg == "brightness":
+                try:
+                    if float(new_v) < float(old_v):
+                        if run_start.get(lid) is None:
+                            run_start[lid] = fr
+                    else:
+                        run_start[lid] = None
+                except ValueError:
+                    run_start[lid] = None
+            elif chg == "stopped":
+                st_fr = run_start.get(lid)
+                lag_fr = (fr - st_fr) if st_fr is not None else 0
+                run_start[lid] = None
+                if lag_fr == 0:
+                    lags.append((0.0, 0, s["name"], lid))
+                elif mean_fps is None:
+                    missing_fps.append(s["name"])
+                else:
+                    lags.append((lag_fr / mean_fps, lag_fr, s["name"], lid))
+    if missing_fps:
+        run.add("light_switchoff_lag", NOT_MEASURED, None, t1_thresh,
+                "no scene mean FPS for: " + ", ".join(sorted(set(missing_fps))), trace_src)
+    elif not lags:
+        run.add("light_switchoff_lag", PASS, 0.0, t1_thresh, "0 stopped events in lightpub_trace.csv", trace_src)
+    else:
+        worst_s, worst_fr, w_spot, w_id = max(lags, key=lambda x: x[0])
+        run.add("light_switchoff_lag", PASS if worst_s <= THRESHOLDS["light_switchoff_max_s"] else FAIL,
+                round(worst_s, 3), t1_thresh,
+                f"worst {worst_s:.2f} s ({worst_fr} frames) at {w_spot} id={w_id} ({len(lags)} stopped event(s))",
+                trace_src)
+
+
 def load_other_run(folder: str | None) -> dict[str, dict] | None:
     """Spots of an earlier or reference run folder keyed by name: None when no folder was given, {} when the folder
     has no manifest (so every spot is NOT MEASURED)."""
@@ -900,6 +1098,7 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
                 f"worst frame {worst:.4%} of character triangles inward", tsrc)
 
     recorder_checks(run, pick, good, tsrc)
+    lightpub_checks(run, good, ref_spots)
 
     # goggles_toggle_rebuilds & goggles_dark_frame: first rayTraced=true frame after rayTraced=false in goggles windows.
     goggles_pairs = pick(("goggles",))
