@@ -106,6 +106,10 @@ class Builder:
             img[20:36, 40:56] = np.clip(img[20:36, 40:56] + 10, 0, 255)
         if c == "pulse_still" and wname == "y90_p0":
             img = np.clip(img + 12.0 * math.sin(i * 2.0 * math.pi / 12.0), 0, 255)
+        if c == "local_pulse_still" and wname == "y90_p0" and 6 <= i < 11:
+            img[16:32, 40:64] = np.clip(img[16:32, 40:64] + 32.0, 0, 255)
+        if c == "sparse_strobe_still" and wname == "y90_p0" and i >= 2 and (i - 2) % 4 == 0:
+            img[16:32, 40:56] = np.clip(img[16:32, 40:56] + 10.0, 0, 255)
         if c == "untimed_steps" and kind == "still" and i % 5 == 0:
             rec["passMs"]["InjectRTX/Ray Reconstruction"][0] = -1.0          # the recorder's sentinel: never timed
         if c == "child_over_parent" and kind == "move" and i == 2:
@@ -327,6 +331,8 @@ CASES = {
     "pop_still": (("flashes",), ()),
     "flicker_still": (("still_flicker",), ()),
     "pulse_still": (("still_flicker",), ()),
+    "local_pulse_still": (("still_flicker",), ()),
+    "sparse_strobe_still": (("still_flicker",), ()),
     "blas_rebuild": (("static_blas_rebuilds",), ()),
     "slow_frame": (("frames_over_50ms",), ()),
     "loading_in_window": ((), ()),                        # >50 ms frames during a loading screen are excluded: passes

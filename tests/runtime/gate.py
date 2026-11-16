@@ -71,6 +71,7 @@ import numpy as np
 THRESHOLDS = {
     "nan_pixels": 0, "neon_fraction": 0.001, "skinned_min": 1, "outline_overlap": 0.85, "inward_fraction": 0.005,
     "raster_fallback_frames": 0, "flashes": 0, "still_block_jitter": 4.0, "still_luma_drift": 6.0,
+    "still_block_pulse": 16.0, "still_block_step4": 6.0,
     "static_blas_rebuilds": 0,
     # Zero hitches outside loading screens (Corey, Nov 15). Loading-screen frames are excluded using the proxy trace
     # (sceneDraws == 0 in d3d9_proxy_gate.csv or empty/all-zero camera in d3d9_proxy_frames.csv).
@@ -260,22 +261,36 @@ def find_flashes(frames: np.ndarray, k: float = 3.0, floor: float = 12.0, max_le
     return found
 
 
-def still_flicker(frames: np.ndarray, block: int = 8) -> tuple[float, float]:
-    """(block_jitter, luma_drift) across a still-camera capture (0-255 scale).
-    block_jitter is the worst 8x8 block's median frame-to-frame |delta|, catching steady or alternating local flicker
-    while ignoring a single-frame pop. luma_drift is max - min whole-frame mean luma after dropping the two highest
-    and lowest frames, catching slow exposure hunting or brightness pulsing while ignoring a 1-2 frame flash."""
+def still_flicker(frames: np.ndarray, block: int = 8) -> tuple[float, float, float, float]:
+    """(block_jitter, luma_drift, block_pulse, block_step4) across a still-camera capture (0-255 scale).
+    - block_jitter: worst 8x8 block's median frame-to-frame |delta| (steady/alternating flicker).
+    - luma_drift: trimmed max - min whole-frame mean luma (slow exposure hunting).
+    - block_pulse: worst 8x8 block's min(pos_travel, neg_travel) on a 7-frame running median (>=4-frame local pulses).
+    - block_step4: worst 8x8 block's 4th-largest frame-to-frame |delta| (sparse local strobes below flashes floor)."""
     frames = dedupe(frames)
-    if len(frames) < 4:
-        return 0.0, 0.0
+    n = len(frames)
+    if n < 4:
+        return 0.0, 0.0, 0.0, 0.0
     if frames.shape[1] > THUMB_H or frames.shape[2] > THUMB_W:
         frames = np.array([thumb(f, THUMB_W, THUMB_H) for f in frames], np.float32)
     h, w = (frames.shape[1] // block) * block, (frames.shape[2] // block) * block
-    blocks = frames[:, :h, :w].reshape(len(frames), h // block, block, w // block, block).mean(axis=(2, 4))
-    block_jitter = float(np.median(np.abs(np.diff(blocks, axis=0)), axis=0).max())
+    blocks = frames[:, :h, :w].reshape(n, h // block, block, w // block, block).mean(axis=(2, 4))
+    diffs = np.abs(np.diff(blocks, axis=0))
+    block_jitter = float(np.median(diffs, axis=0).max())
     means = np.sort(frames.mean(axis=(1, 2)))
     trimmed = means[2:-2] if len(means) >= 8 else means
-    return block_jitter, float(trimmed[-1] - trimmed[0])
+    luma_drift = float(trimmed[-1] - trimmed[0])
+    if n >= 8:
+        pad = np.pad(blocks, ((3, 3), (0, 0), (0, 0)), mode="edge")
+        smooth = np.median(np.stack([pad[k : k + n] for k in range(7)], axis=0), axis=0)
+        sdiff = np.diff(smooth, axis=0)
+        pos_travel = np.maximum(0.0, sdiff).sum(axis=0)
+        neg_travel = np.maximum(0.0, -sdiff).sum(axis=0)
+        block_pulse = float(np.minimum(pos_travel, neg_travel).max())
+    else:
+        block_pulse = 0.0
+    block_step4 = float(np.sort(diffs, axis=0)[-4].max()) if len(diffs) >= 5 else 0.0
+    return block_jitter, luma_drift, block_pulse, block_step4
 
 
 def thumb(img: np.ndarray, w: int = 64, h: int = 36) -> np.ndarray:
@@ -1213,27 +1228,33 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
         run.add("flashes", PASS if flash_total == 0 else FAIL, flash_total, "0",
                 "; ".join(flash_detail) or "no flashes or pops", ", ".join(sorted(sources)))
 
-    # sustained flicker or slow brightness pulsing across still camera stops (>= 15 deduplicated frames)
-    worst_jitter, worst_drift, flicker_bad, flicker_missing, flicker_sources = 0.0, 0.0, [], [], set()
+    # sustained flicker, slow pulsing, >=4-frame local pulses, or sparse local strobes across still camera stops
+    worst_jitter, worst_drift, worst_pulse, worst_step4 = 0.0, 0.0, 0.0, 0.0
+    flicker_bad, flicker_missing, flicker_sources = [], [], set()
     j_limit, d_limit = THRESHOLDS["still_block_jitter"], THRESHOLDS["still_luma_drift"]
-    flicker_thresh = f"block jitter <= {j_limit:g}, drift <= {d_limit:g} (/255)"
+    p_limit, s4_limit = THRESHOLDS["still_block_pulse"], THRESHOLDS["still_block_step4"]
+    flicker_thresh = (f"block jitter <= {j_limit:g}, drift <= {d_limit:g}, "
+                      f"pulse <= {p_limit:g}, step4 <= {s4_limit:g} (/255)")
     for s, w in pick(("still",)):
         frames, src = window_frames(s, w)
         flicker_sources.add(src)
         n = 0 if frames is None else len(dedupe(frames))
         if n < THRESHOLDS["still_frames"]:
             flicker_missing.append(f"{s['name']}/{w['name']}: {n} frames"); continue
-        bj, ld = still_flicker(frames)
+        bj, ld, bp, bs4 = still_flicker(frames)
         worst_jitter, worst_drift = max(worst_jitter, bj), max(worst_drift, ld)
-        if bj > j_limit or ld > d_limit:
-            flicker_bad.append(f"{s['name']}/{w['name']} jitter {bj:.2f} drift {ld:.2f}")
+        worst_pulse, worst_step4 = max(worst_pulse, bp), max(worst_step4, bs4)
+        if bj > j_limit or ld > d_limit or bp > p_limit or bs4 > s4_limit:
+            flicker_bad.append(f"{s['name']}/{w['name']} jitter {bj:.2f} drift {ld:.2f} pulse {bp:.2f} step4 {bs4:.2f}")
     if flicker_missing or not pick(("still",)):
         run.add("still_flicker", NOT_MEASURED, None, flicker_thresh,
                 "incomplete frames: " + "; ".join(flicker_missing[:6] or ["no still windows"]),
                 ", ".join(sorted(flicker_sources)) or "none")
     else:
-        run.add("still_flicker", FAIL if flicker_bad else PASS, round(max(worst_jitter, worst_drift), 2), flicker_thresh,
-                f"worst block jitter {worst_jitter:.2f}, luma drift {worst_drift:.2f}"
+        run.add("still_flicker", FAIL if flicker_bad else PASS,
+                round(max(worst_jitter, worst_drift, worst_pulse, worst_step4), 2), flicker_thresh,
+                f"worst block jitter {worst_jitter:.2f}, luma drift {worst_drift:.2f}, "
+                f"pulse {worst_pulse:.2f}, step4 {worst_step4:.2f}"
                 + ("; " + "; ".join(flicker_bad[:5]) if flicker_bad else ""),
                 ", ".join(sorted(flicker_sources)))
 

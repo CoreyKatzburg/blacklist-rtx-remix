@@ -68,6 +68,12 @@ class MathTest(unittest.TestCase):
         pulse = np.array([np.clip(calm[i] + 12 * math.sin(i * 2 * math.pi / 12), 0, 255) for i in range(18)], np.float32)
         self.assertEqual(gate.find_flashes(pulse), [])                      # ...and slow pulsing is missed by flashes
         self.assertGreater(gate.still_flicker(pulse)[1], gate.THRESHOLDS["still_luma_drift"])
+        lpulse = calm.copy(); lpulse[6:11, 16:32, 40:64] = np.clip(lpulse[6:11, 16:32, 40:64] + 32, 0, 255)
+        self.assertEqual(gate.find_flashes(lpulse), [])                     # 5-frame local pulse > max_len=3
+        self.assertGreater(gate.still_flicker(lpulse)[2], gate.THRESHOLDS["still_block_pulse"])
+        strobe = calm.copy(); strobe[2::4, 16:32, 40:56] = np.clip(strobe[2::4, 16:32, 40:56] + 10, 0, 255)
+        self.assertEqual(gate.find_flashes(strobe), [])                     # 1-in-4 local strobe below flashes floor
+        self.assertGreater(gate.still_flicker(strobe)[3], gate.THRESHOLDS["still_block_step4"])
 
     def test_large_shift_compares_without_shift_not_nan(self):
         # Phase correlation can report a shift that leaves no area to compare (16 of 36 rows here). That returned NaN,
