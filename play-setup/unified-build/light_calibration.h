@@ -45,6 +45,11 @@ constexpr float kWeaponSpotRadiusCm = 3.0f;      // tight 3 cm flashlight lens (
 constexpr float kWeaponSpotReachCm = 1600.0f;    // 16 m real flashlight reach
 constexpr float kWeaponSpotRefDistanceCm = 400.0f;
 constexpr float kWeaponSpotVolumetricScale = 2.0f;
+// The guard flashlight's beam shape: near plane 50 x 50 at 150. In 46 saved dumps (Nov 16) it appears 447 times as
+// type 2, always with flags 58B2, and no other light has it. Its range is not stable: lit rows run 50 to 1000 (median
+// 155), so the range rule above sends one flashlight in and out of weapon class (3 cm lens vs a 20-35 cm ball with
+// 1/11-1/98 of the power). [Lights] WeaponSpotByShape=1 classifies on this shape instead; off by default.
+constexpr float kWeaponSpotNearWidthCm = 50.0f, kWeaponSpotNearHeightCm = 50.0f, kWeaponSpotNearDistanceCm = 150.0f;
 
 // ---- Room fill (game type 4, SH probes) -------------------------------------------------------------------------
 constexpr uint32_t kProbeFlag = 0x400;            // the engine only blends probes with this flag
@@ -75,6 +80,7 @@ struct Tuning {
     float spotSoftness = 0.1f;       // [Lights] SpotSoftness
     float sunAngularDiameter = 0.53f;// [Lights] SunAngularDiameter, degrees
     float shScale = 1.0f;            // the game's cSHScale, read from its character draws (1 until one is seen)
+    bool weaponSpotByShape = false;  // [Lights] WeaponSpotByShape: guard flashlights by beam shape, not range
 };
 
 enum class Kind : uint8_t { None, Sphere, Distant, Dome };
@@ -229,12 +235,21 @@ inline bool BuildSkyDome(const NodeData* nodes, size_t count, const Tuning& tuni
 
 // ---- One game light -> one Remix light --------------------------------------------------------------------------
 
-inline bool Qualifies(const NodeData& n) {
+// alreadyTracked: the light is published now and [Lights] KeepTrackedLights=1. It then stays published at any
+// brightness, down to 0, while the game keeps its node as a point, spot or sun: Consumption's pulsing group dips to
+// about 1e-4 every 1.9 s, and dropping it there made Remix destroy and re-create it each cycle (99 times per node in
+// run 070645). A light that was never published still needs more than 1e-4 to start.
+inline bool Qualifies(const NodeData& n, bool alreadyTracked = false) {
     if (n.type == 4) return IsProbe(n);
-    if (n.type < 1 || n.type > 3) return false;  // 0 = copies/templates
-    return MaxComponent(n.color) * n.intensity > 1e-4f;  // also rejects NaN
+    if (n.type < 1 || n.type > 3) return false;  // 0 = copies/templates, and the custodial switch's "off"
+    const float v = MaxComponent(n.color) * n.intensity;
+    return alreadyTracked ? v >= 0.0f : v > 1e-4f;  // both reject NaN
 }
-inline bool IsWeaponSpotlight(const NodeData& n) {
+inline bool IsWeaponSpotlight(const NodeData& n, bool byShape = false) {
+    if (byShape)
+        return n.type == 2 && std::fabs(n.nearSize[0] - kWeaponSpotNearWidthCm) < 0.5f &&
+               std::fabs(n.nearSize[1] - kWeaponSpotNearHeightCm) < 0.5f &&
+               std::fabs(n.nearDistance - kWeaponSpotNearDistanceCm) < 0.5f;
     return n.type == 2 && n.range > 0.0f && n.range <= kWeaponSpotMaxGameRangeCm &&
            n.nearDistance > n.range && n.nearSize[0] > 0.0f && n.nearSize[1] > 0.0f;
 }
@@ -246,8 +261,8 @@ inline CalibratedSphere CalibrateWeaponSpotlight(float userRadianceScale = 1.0f)
 }
 
 
-inline bool ConvertGameLight(const NodeData& n, const Tuning& tuning, PublishedLight* out) {
-    if (!Qualifies(n)) return false;
+inline bool ConvertGameLight(const NodeData& n, const Tuning& tuning, PublishedLight* out, bool alreadyTracked = false) {
+    if (!Qualifies(n, alreadyTracked)) return false;
     if (n.type == 4) return BuildRoomFill(n, tuning, out);
     *out = {};
     // Column 0 of the orientation is the way the light shines.
@@ -259,7 +274,7 @@ inline bool ConvertGameLight(const NodeData& n, const Tuning& tuning, PublishedL
         out->angularDiameterDegrees = tuning.sunAngularDiameter;
         return true;
     }
-    const bool weaponSpot = IsWeaponSpotlight(n);
+    const bool weaponSpot = IsWeaponSpotlight(n, tuning.weaponSpotByShape);
     const CalibratedSphere cal = weaponSpot
         ? CalibrateWeaponSpotlight(tuning.radianceScale)
         : CalibrateSphereLight(n.range, n.falloffStart, tuning.radianceScale);
@@ -302,6 +317,39 @@ struct TrackedEntry {
     uint64_t paramsHash = 0;
     void* handle = nullptr;
     uint32_t lastSeen = 0;
+    int8_t weaponClass = -1;  // last IsWeaponSpotlight answer for a spot, -1 before the first
+};
+
+// True when a published spot's weapon class differs from the previous frame's ("weapon flips" on the stray line).
+inline bool NoteWeaponClass(TrackedEntry* t, bool weapon) {
+    if (!t) return false;
+    const bool flip = t->weaponClass >= 0 && t->weaponClass != static_cast<int8_t>(weapon);
+    t->weaponClass = static_cast<int8_t>(weapon);
+    return flip;
+}
+
+// Nodes whose Remix light was destroyed while the node was still in the engine database. Creating one of them again
+// is a re-create ("recreated" on the stray line): Remix loses the light's history although the game never removed it.
+template <size_t N>
+struct DroppedWhilePresent {
+    uintptr_t nodes[N] = {};
+    size_t count = 0;
+    void Note(uintptr_t node) {
+        for (size_t i = 0; i < count; ++i)
+            if (nodes[i] == node) return;
+        if (count < N) nodes[count++] = node;
+    }
+    bool Take(uintptr_t node) {
+        for (size_t i = 0; i < count; ++i)
+            if (nodes[i] == node) { nodes[i] = nodes[--count]; return true; }
+        return false;
+    }
+    // Forget nodes the game removed, so a later light at a reused address is not counted as a re-create.
+    template <typename PresentFn>
+    void Prune(PresentFn&& present) {
+        for (size_t i = 0; i < count;)
+            if (present(nodes[i])) ++i; else nodes[i] = nodes[--count];
+    }
 };
 
 inline uint64_t StableNodeLightHash(uintptr_t node) {

@@ -47,6 +47,155 @@ static size_t Count(const std::vector<Recorded>& r, TraceChange c) {
     return n;
 }
 
+// The publish steps of lightpub.cpp SubmitLights for one frame, with the keys KeepTrackedLights (keep) and
+// WeaponSpotByShape (tuning.weaponSpotByShape), counting what the stray line and Remix would see.
+struct Node {
+    uintptr_t id;
+    lightcal::NodeData data;
+};
+struct Lifecycle {
+    bool keep = false;
+    lightcal::Tuning tuning;
+    lightcal::LightLifecycleTracker<16> tracker;
+    lightcal::DroppedWhilePresent<16> dropped;
+    uint32_t frame = 0, created = 0, destroyed = 0, recreated = 0, weaponFlips = 0;
+    uintptr_t nextHandle = 0x100;
+    void Step(const std::vector<Node>& database) {
+        ++frame;
+        for (const Node& n : database) {
+            const lightcal::TrackedEntry* t = tracker.Find(n.id);
+            const bool wasPublished = t && t->handle;
+            lightcal::PublishedLight pub;
+            if (!lightcal::ConvertGameLight(n.data, tuning, &pub, keep && wasPublished)) continue;
+            void* handle = nullptr;
+            uint32_t made = 0;
+            tracker.Upsert(n.id, 0, pub, frame,
+                           [&](uint64_t, const lightcal::PublishedLight&) { return reinterpret_cast<void*>(nextHandle++); },
+                           &made, nullptr, &handle);
+            created += made;
+            if (!wasPublished && dropped.Take(n.id)) ++recreated;
+            if (n.data.type == 2 &&
+                lightcal::NoteWeaponClass(tracker.Find(n.id), lightcal::IsWeaponSpotlight(n.data, tuning.weaponSpotByShape)))
+                ++weaponFlips;
+        }
+        auto present = [&](uintptr_t id) {
+            for (const Node& n : database)
+                if (n.id == id) return true;
+            return false;
+        };
+        for (size_t i = 0; i < tracker.Count(); ++i) {
+            const auto& e = tracker.Entries()[i];
+            if (e.lastSeen != frame && e.handle && present(e.node)) dropped.Note(e.node);
+        }
+        dropped.Prune(present);
+        tracker.SweepUnseen(frame, [&](void*) { ++destroyed; });
+    }
+    void* Handle(uintptr_t id) {
+        const lightcal::TrackedEntry* t = tracker.Find(id);
+        return t ? t->handle : nullptr;
+    }
+};
+
+static lightcal::NodeData Light(uint32_t type, float brightness, float range = 150.0f) {
+    lightcal::NodeData n;
+    n.type = type;
+    n.orientation[0][0] = n.orientation[1][1] = n.orientation[2][2] = 1.0f;
+    n.range = range;
+    n.falloffStart = range * 0.5f;
+    n.color[0] = brightness; n.color[1] = brightness * 0.5f; n.color[2] = brightness * 0.25f;
+    n.intensity = 1.0f;
+    return n;
+}
+// The guard flashlight as the dumps show it: type 2, near plane 50 x 50 at 150, with a range that wanders.
+static lightcal::NodeData GuardFlashlight(float range) {
+    lightcal::NodeData n = Light(2, 1.0f, range);
+    n.nearSize[0] = n.nearSize[1] = 50.0f;
+    n.nearDistance = 150.0f;
+    return n;
+}
+
+static void KeyCases() {
+    // KeepTrackedLights: Consumption's pulsing group dips to about 1e-4 once per cycle. With the key on, the light keeps
+    // its Remix handle through the dip and nothing is destroyed or re-created. With it off (today), the dip costs a
+    // destroy and a re-create, which is the old behaviour the key exists to remove.
+    for (const bool keep : {true, false}) {
+        Lifecycle s;
+        s.keep = keep;
+        s.Step({{1, Light(1, 0.8f)}});
+        void* const first = s.Handle(1);
+        s.Step({{1, Light(1, 5e-5f)}});     // the dip, below Qualifies' 1e-4 start threshold
+        s.Step({{1, Light(1, 0.8f)}});
+        if (keep)
+            CHECK(s.destroyed == 0 && s.recreated == 0 && s.created == 1 && s.Handle(1) == first,
+                  "keep tracked: dip destroyed %u recreated %u created %u, want 0 0 1 and the same handle", s.destroyed,
+                  s.recreated, s.created);
+        else
+            CHECK(s.destroyed == 1 && s.recreated == 1 && s.created == 2,
+                  "key off: dip destroyed %u recreated %u created %u, want 1 1 2 (today's re-create)", s.destroyed,
+                  s.recreated, s.created);
+    }
+    // KeepTrackedLights must not keep a light whose node the game removed, and its return is not a re-create.
+    {
+        Lifecycle s;
+        s.keep = true;
+        s.Step({{1, Light(1, 0.8f)}, {2, Light(1, 0.8f)}});
+        s.Step({{2, Light(1, 0.8f)}});
+        CHECK(s.destroyed == 1 && !s.Handle(1), "keep tracked: removed node destroyed %u, want 1", s.destroyed);
+        s.Step({{1, Light(1, 0.8f)}, {2, Light(1, 0.8f)}});
+        CHECK(s.recreated == 0, "keep tracked: a node the game removed and added back counted %u re-creates, want 0",
+              s.recreated);
+    }
+    // A light dropped while its node stayed, whose node the game then removes, is forgotten: a new light at the same
+    // address later is not a re-create.
+    {
+        Lifecycle s;
+        s.Step({{1, Light(1, 0.8f)}});
+        s.Step({{1, Light(1, 5e-5f)}});   // dropped while present (key off)
+        s.Step({});                       // the game removes the node
+        s.Step({{1, Light(1, 0.8f)}});
+        CHECK(s.recreated == 0, "removed after a drop: counted %u re-creates, want 0", s.recreated);
+    }
+    // KeepTrackedLights must not grow the light count: a light never published is not created at 1e-4 or at 0.
+    {
+        Lifecycle s;
+        s.keep = true;
+        s.Step({{1, Light(1, 1e-4f)}, {2, Light(2, 0.0f)}, {3, Light(1, 0.8f)}});
+        s.Step({{1, Light(1, 1e-4f)}, {2, Light(2, 0.0f)}, {3, Light(1, 0.8f)}});
+        CHECK(s.created == 1 && !s.Handle(1) && !s.Handle(2), "keep tracked: created %u lights, want only the lit one",
+              s.created);
+    }
+    // WeaponSpotByShape: a guard flashlight at range 545 is weapon class by shape; the range rule (<= 100) says no.
+    {
+        lightcal::Tuning shape;
+        shape.weaponSpotByShape = true;
+        lightcal::PublishedLight byShape, byRange;
+        CHECK(lightcal::ConvertGameLight(GuardFlashlight(545.0f), shape, &byShape) &&
+                  lightcal::ConvertGameLight(GuardFlashlight(545.0f), lightcal::Tuning{}, &byRange),
+              "guard flashlight must convert");
+        CHECK(lightcal::IsWeaponSpotlight(GuardFlashlight(545.0f), true) && byShape.radius == lightcal::kWeaponSpotRadiusCm,
+              "by shape: guard flashlight at range 545 is not weapon class (radius %g)", byShape.radius);
+        CHECK(!lightcal::IsWeaponSpotlight(GuardFlashlight(545.0f)) && byRange.radius != lightcal::kWeaponSpotRadiusCm,
+              "range rule: guard flashlight at range 545 should be a ball, as today");
+    }
+    // WeaponSpotByShape must never take an architectural spot: range 550, near plane 100 x 100 at 80.
+    {
+        lightcal::NodeData n = Light(2, 1.0f, 550.0f);
+        n.nearSize[0] = n.nearSize[1] = 100.0f;
+        n.nearDistance = 80.0f;
+        CHECK(!lightcal::IsWeaponSpotlight(n, true) && !lightcal::IsWeaponSpotlight(n),
+              "architectural spot 550 / 100x100 at 80 classified as a weapon light");
+    }
+    // The "weapon flips" count: a guard flashlight whose range crosses 100 between frames flips under today's rule
+    // and never by shape.
+    for (const bool byShape : {false, true}) {
+        Lifecycle s;
+        s.tuning.weaponSpotByShape = byShape;
+        for (int f = 0; f < 6; ++f) s.Step({{7, GuardFlashlight(f % 2 ? 545.0f : 80.0f)}});
+        CHECK(s.weaponFlips == (byShape ? 0u : 5u), "weapon flips by %s: %u, want %u", byShape ? "shape" : "range",
+              s.weaponFlips, byShape ? 0u : 5u);
+    }
+}
+
 int main() {
     // A light the game cuts at once on frame 50: started, then stopped on frame 50 with its full brightness.
     {
@@ -117,6 +266,7 @@ int main() {
         CHECK(!readable(old), "share: the check passed on the old unshared open");
         std::filesystem::remove(path);
     }
+    KeyCases();
     std::printf(g_failures ? "light_trace_test: %d FAILED\n" : "light_trace_test: all passed\n", g_failures);
     return g_failures ? 1 : 0;
 }

@@ -68,6 +68,10 @@ struct Settings {
     bool standInSkipUnplaced = lightcal::StandInOptions{}.skipUnplaced;
     bool standInSkipMoving = false;
     bool standInSkipSamGear = false;
+    // KeepTrackedLights=1: a light already published stays published at any brightness while the game keeps its node
+    // (lightcal::Qualifies). Off by default: every publish change starts off until a live run shows its numbers.
+    // The weapon-class rule's key, WeaponSpotByShape, lives in tuning.
+    bool keepTrackedLights = false;
     float standInRadius = 2.5f;       // max bulb radius in game units (cm), scaled per flare element size
     float standInIntensity = 20.0f;   // Remix emissive intensity
     // [Proxy] EnableDebuggingTelemetry=1: write lightpub_trace.csv next to the game exe (one line per light change).
@@ -121,6 +125,8 @@ void LoadSettings(const wchar_t* ini) {
         GetPrivateProfileIntW(L"Lights", L"StandInSkipUnplaced", lightcal::StandInOptions{}.skipUnplaced, ini) != 0;
     s.standInSkipMoving = GetPrivateProfileIntW(L"Lights", L"StandInSkipMoving", 0, ini) != 0;
     s.standInSkipSamGear = GetPrivateProfileIntW(L"Lights", L"StandInSkipSamGear", 0, ini) != 0;
+    s.tuning.weaponSpotByShape = GetPrivateProfileIntW(L"Lights", L"WeaponSpotByShape", 0, ini) != 0;
+    s.keepTrackedLights = GetPrivateProfileIntW(L"Lights", L"KeepTrackedLights", 0, ini) != 0;
     s.standInRadius = IniFloat(ini, L"StandInRadius", 2.5f);
     s.standInIntensity = IniFloat(ini, L"StandInIntensity", 20.0f);
     s.trace = GetPrivateProfileIntW(L"Proxy", L"EnableDebuggingTelemetry", 0, ini) != 0;
@@ -195,8 +201,9 @@ bool ReadNode(uintptr_t node, NodeData* out) {
     return true;
 }
 
-bool Wanted(const NodeData& n) {
-    if (!lightcal::Qualifies(n)) return false;
+// alreadyTracked: published now with KeepTrackedLights=1 (see lightcal::Qualifies).
+bool Wanted(const NodeData& n, bool alreadyTracked = false) {
+    if (!lightcal::Qualifies(n, alreadyTracked)) return false;
     switch (n.type) {
     case 1: return g_settings.includePoint;
     case 2: return g_settings.includeSpot;
@@ -261,6 +268,26 @@ const lightcal::TrackedEntry* FindTracked(uintptr_t node) {
     return g_tracker.Find(node);
 }
 
+// KeepTrackedLights: whether a node's light is published now, so a dip below the start threshold keeps it.
+bool KeptTracked(uintptr_t node) {
+    const lightcal::TrackedEntry* t = g_settings.keepTrackedLights ? g_tracker.Find(node) : nullptr;
+    return t && t->handle;
+}
+
+// Every light-class node in the engine database this frame, published or not, so a light dropped while its node
+// stays can be told from one the game removed. g_dropped remembers the dropped ones until they are created again.
+constexpr uint32_t kMaxPresent = 4096;
+uintptr_t g_present[kMaxPresent];
+uint32_t g_presentCount = 0;
+lightcal::DroppedWhilePresent<kMaxTracked> g_dropped;
+uint32_t g_recreatedWindow = 0, g_weaponFlipsWindow = 0;   // totals since the previous stray line
+
+bool Present(uintptr_t node) {
+    for (uint32_t i = 0; i < g_presentCount; ++i)
+        if (g_present[i] == node) return true;
+    return false;
+}
+
 // Copies qualifying lights while the game's database lock is held. No Remix calls here, so a
 // slow bridge can never stall game threads waiting on that lock.
 struct Snapshot {
@@ -270,6 +297,7 @@ struct Snapshot {
 Snapshot g_snapshot[kMaxTracked];
 
 uint32_t CollectLights(uintptr_t database) {
+    g_presentCount = 0;
     uintptr_t heads = 0;
     uint32_t classIndex = 0, headCount = 0;
     if (!Read(database + 0x2C, &heads) || !Read(database + 0x30, &headCount) ||
@@ -282,9 +310,12 @@ uint32_t CollectLights(uintptr_t database) {
         if (!Read(node + 0x1C, &cls) || !Read(node + 0x28, &next)) break;
         Snapshot& s = g_snapshot[count];
         s.data = {};
-        if (cls == g_lightClass && ReadNode(node, &s.data) && Wanted(s.data)) {
-            s.node = node;
-            ++count;
+        if (cls == g_lightClass && ReadNode(node, &s.data)) {
+            if (g_presentCount < kMaxPresent) g_present[g_presentCount++] = node;
+            if (Wanted(s.data, KeptTracked(node))) {
+                s.node = node;
+                ++count;
+            }
         }
         node = next;
     }
@@ -403,10 +434,12 @@ void SubmitLights(uint32_t count) {
         const Snapshot& s = g_snapshot[i];
         lightcal::PublishedLight published;
         // Level-wide probes (> 40 m) give no sphere light of their own; they feed the sky dome below.
-        if (!lightcal::ConvertGameLight(s.data, g_settings.tuning, &published)) continue;
+        if (!lightcal::ConvertGameLight(s.data, g_settings.tuning, &published, KeptTracked(s.node))) continue;
         if (s.data.type == 4) ++fills;
         const uint64_t hash = s.data.type == 4
             ? Fnv(&g_shScaleQuantised, sizeof(g_shScaleQuantised), ParamsHash(s.data)) : ParamsHash(s.data);
+        const lightcal::TrackedEntry* before = g_tracker.Find(s.node);
+        const bool wasPublished = before && before->handle;
         void* rawHandle = nullptr;
         g_tracker.Upsert(
             s.node, hash, published, g_frame,
@@ -417,14 +450,27 @@ void SubmitLights(uint32_t count) {
         const auto handle = static_cast<remixapi_LightHandle>(rawHandle);
         if (handle && g_remix.DrawLightInstance(handle) == REMIXAPI_ERROR_CODE_SUCCESS) ++drawn;
         if (!handle) continue;
+        if (!wasPublished && g_dropped.Take(s.node)) ++g_recreatedWindow;
+        if (s.data.type == 2 &&
+            lightcal::NoteWeaponClass(g_tracker.Find(s.node), lightcal::IsWeaponSpotlight(s.data, g_settings.tuning.weaponSpotByShape)))
+            ++g_weaponFlipsWindow;
         g_trace.See(s.node, lightcal::MaxComponent(s.data.color) * s.data.intensity, s.data.flags, g_frame, WriteTrace);
-        if ((s.data.type == 1 || s.data.type == 2) && g_lampCount < kMaxTracked)
+        // A light kept below the start threshold (KeepTrackedLights) lights nothing, so it is not a lamp here.
+        if ((s.data.type == 1 || s.data.type == 2) && lightcal::Qualifies(s.data) && g_lampCount < kMaxTracked)
             memcpy(g_lampPos[g_lampCount++], s.data.position, sizeof(g_lampPos[0]));
     }
     g_trace.Sweep(g_frame, WriteTrace);
     if (g_traceFile) fflush(g_traceFile);
     const bool dome = g_settings.includeFill && DrawDome(count);
-    // Destroy ONLY lights that left the engine database (level streaming or despawn).
+    // Lights about to be destroyed while the game still has their node: remembered, so their next creation counts as
+    // a re-create.
+    for (size_t i = 0; i < g_tracker.Count(); ++i) {
+        const auto& e = g_tracker.Entries()[i];
+        if (e.lastSeen != g_frame && e.handle && Present(e.node)) g_dropped.Note(e.node);
+    }
+    g_dropped.Prune(Present);
+    // Destroy lights that are no longer published: their node left the engine database (level streaming or despawn),
+    // or it stopped qualifying (lightcal::Qualifies; KeepTrackedLights keeps the second kind).
     g_tracker.SweepUnseen(g_frame, [](void* rawHandle) {
         g_remix.DestroyLight(static_cast<remixapi_LightHandle>(rawHandle));
     });
@@ -437,6 +483,7 @@ void DestroyAllTracked() {
     g_tracker.ClearAll([](void* rawHandle) {
         g_remix.DestroyLight(static_cast<remixapi_LightHandle>(rawHandle));
     });
+    g_dropped.count = 0;
     DestroyDome();
 }
 
@@ -525,13 +572,15 @@ void UpdateAutoRaytracing(bool inLevel) {
                      action.raytracing ? "live" : action.keepScene ? "kept for the pause" : "cleared", (int)r, (int)k);
 }
 
-// "skip sam gear" sits before the other two skips so the line still ends in "skip moving N)", which the harness
-// matches after a reload.
+// New keys go before "skip sam gear", so the line still ends in "skip moving N)", which the harness matches after a
+// reload.
 void LogSettings(const char* what) {
     if (g_log) g_log("lightpub: %s (scale %g, sun %g, fill %d, max %u, flare stand-ins %d, trace %d, "
+                     "weapon by shape %d, keep tracked %d, "
                      "skip sam gear %d, stand-in skip unplaced %d, skip moving %d)", what,
                      g_settings.tuning.radianceScale, g_settings.tuning.sunRadianceScale, g_settings.includeFill ? 1 : 0,
                      g_settings.maxLights, g_settings.flareStandIns ? 1 : 0, g_settings.trace ? 1 : 0,
+                     g_settings.tuning.weaponSpotByShape ? 1 : 0, g_settings.keepTrackedLights ? 1 : 0,
                      g_settings.standInSkipSamGear ? 1 : 0, g_settings.standInSkipUnplaced ? 1 : 0,
                      g_settings.standInSkipMoving ? 1 : 0);
 }
@@ -803,6 +852,9 @@ void DrawFlareStandIns() {
 //   moved / Sam's own gear flares (lightcal::IsSamGearFlare, a subset of moving)
 //   dimmed: published lights below 10% of their own peak brightness; longest dim: frames the longest of them has
 //   been dimmed (how long a light the game nearly switched off keeps lighting the Remix scene)
+//   weapon flips: published spots whose weapon class (lightcal::IsWeaponSpotlight) changed from one frame to the next
+//   recreated: Remix lights created again after we destroyed them while the game kept their node
+//   (both are totals since the previous stray line, not one frame's value)
 // New fields go at the end of the line; the gate's pattern reads it from the start.
 void UpdateStrayCounts() {
     struct Max { uint32_t lonely, unplaced, moving, dimmed, longestDim, samGear; };
@@ -818,11 +870,13 @@ void UpdateStrayCounts() {
     window.samGear = std::max(window.samGear, g_standInsSamGear);
     if (!g_log || !g_settings.logEveryFrames || g_frame % g_settings.logEveryFrames) return;
     g_log("lightpub: stray frame %u lamps %u without flare %u (max %u) flares %u stand-ins %u on unplaced %u (max %u) "
-          "on moving %u (max %u) dimmed %u (max %u) longest dim %u frames (max %u) on sam gear %u (max %u)",
+          "on moving %u (max %u) dimmed %u (max %u) longest dim %u frames (max %u) on sam gear %u (max %u) "
+          "weapon flips %u recreated %u",
           g_frame, g_lampCount, lonely, window.lonely, g_flareCount, g_standInsDrawn, g_standInsUnplaced,
           window.unplaced, g_standInsMoving, window.moving, dimmed, window.dimmed, longestDim, window.longestDim,
-          g_standInsSamGear, window.samGear);
+          g_standInsSamGear, window.samGear, g_weaponFlipsWindow, g_recreatedWindow);
     window = {};
+    g_weaponFlipsWindow = g_recreatedWindow = 0;
 }
 
 void OnPresent() {
@@ -996,7 +1050,7 @@ void DumpLights(const wchar_t* path) {
         if (cls == g_lightClass && ReadNode(node, &n) && Read(node + 0x34, &flags) && Read(node + 0x2C, &nodeFlags)) {
             const lightcal::TrackedEntry* t = FindTracked(node);
             FilePrintf(file, "light\tnode=%08X\tnodeflags=%08X\tflags=%08X\ttype=%u\twanted=%d\ttracked=%d\tpos=%.6g,%.6g,%.6g\trow0=%.6g,%.6g,%.6g\trow1=%.6g,%.6g,%.6g\trow2=%.6g,%.6g,%.6g\tnear=%.6g,%.6g,%.6g\trange=%.6g\tfalloffStart=%.6g\tcolor=%.6g,%.6g,%.6g\tintensity=%.6g",
-                       static_cast<unsigned>(node), nodeFlags, flags, n.type, Wanted(n) ? 1 : 0, t && t->handle ? 1 : 0,
+                       static_cast<unsigned>(node), nodeFlags, flags, n.type, Wanted(n, KeptTracked(node)) ? 1 : 0, t && t->handle ? 1 : 0,
                        n.position[0], n.position[1], n.position[2],
                        n.orientation[0][0], n.orientation[0][1], n.orientation[0][2],
                        n.orientation[1][0], n.orientation[1][1], n.orientation[1][2],
