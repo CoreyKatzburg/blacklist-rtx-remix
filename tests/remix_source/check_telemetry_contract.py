@@ -77,7 +77,8 @@ def check(path):
                     errors.append(f"line {number}: frame {obj['frame']} not increasing")
                 previous = obj["frame"]
             errors += [f"line {number}: {p}" for p in check_maps(obj)]
-            for key in ("frameTimeMs", "gpuTimeMs", "textureMemoryMB", "vramUsedMB", "telemetryCpuMs", "textureBudgetMB"):
+            for key in ("frameTimeMs", "gpuTimeMs", "textureMemoryMB", "vramUsedMB", "telemetryCpuMs", "textureBudgetMB",
+                        "vramFreeMB"):
                 if isinstance(obj.get(key), (int, float)) and not isinstance(obj.get(key), bool) and obj[key] < 0:
                     errors.append(f"line {number}: {key} negative")
             if len(errors) > 20:

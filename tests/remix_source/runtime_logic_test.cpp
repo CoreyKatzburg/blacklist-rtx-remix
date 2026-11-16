@@ -125,6 +125,7 @@ static void testTelemetry(const std::string& dir) {
   t.legacyMaterialDraws = 31;
   t.texturesDemoted = 2;
   t.textureBudgetMB = 3072.0;
+  t.vramFreeMB = 1185.4;
   t.thumbNonFinite = 5;
   t.thumbClipped = 9;
   t.skips[size_t(RtxSkip::ZeroPrimitives)] = 4;
@@ -142,7 +143,7 @@ static void testTelemetry(const std::string& dir) {
   CHECK(std::strstr(line, "\"skinnedTriangles\":42000,\"inwardSkinnedTriangles\":7") != nullptr, "skinned triangle fields printed: %s", line);
   CHECK(std::strstr(line, "\"lumaThumb\":\"AAAA\"}") != nullptr, "lumaThumb printed when non-empty: %s", line);
   CHECK(std::strstr(line, "\"rayTraced\":true,\"telemetryCpuMs\":0.250,\"replacedMaterialDraws\":800,\"legacyMaterialDraws\":31,"
-                          "\"texturesDemoted\":2,\"textureBudgetMB\":3072.0,\"thumbNonFinite\":5,\"thumbClipped\":9,") != nullptr,
+                          "\"texturesDemoted\":2,\"textureBudgetMB\":3072.0,\"vramFreeMB\":1185.4,\"thumbNonFinite\":5,\"thumbClipped\":9,") != nullptr,
         "recorder, material, texture and bad-pixel fields printed: %s", line);
   CHECK(std::strstr(line, "\"skips\":{\"zeroPrimitives\":4,\"noTextureHash\":17},") != nullptr, "only non-zero skip reasons printed: %s", line);
   CHECK(std::strstr(line, "\"passMs\":{\"InjectRTX\":[28.500,3.250,1],\"InjectRTX/Gate Telemetry\":[-1.000,0.125,2]},") != nullptr,
