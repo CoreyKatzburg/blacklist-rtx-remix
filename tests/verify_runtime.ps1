@@ -127,9 +127,20 @@ function Stop-Game {
 # proxy log says ray tracing switched on in this process, i.e. a level is rendering. Never Esc (quits from menus).
 function Start-GameAtCheckpoint {
     $log = "$S\d3d9_proxy.log"
-    $script:PlayProcess = Start-Process powershell.exe -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $Setup 'Play_Blacklist_with_Remix.ps1')`"", '-NoPause'
+    # Windows PowerShell started from PowerShell 7 inherits 7's PSModulePath and then has no Get-FileHash, so the Play
+    # script died silently and the game never started (Nov 15). Give it its own module path and keep its output.
+    $playLog = Join-Path $runDir "play-$(Get-Date -Format HHmmss).log"
+    $savedModulePath = $env:PSModulePath; $env:PSModulePath = "$env:windir\system32\WindowsPowerShell\v1.0\Modules"
+    try {
+        $script:PlayProcess = Start-Process powershell.exe -PassThru -WindowStyle Hidden -RedirectStandardOutput $playLog -RedirectStandardError "$playLog.err" `
+            -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $Setup 'Play_Blacklist_with_Remix.ps1')`"", '-NoPause'
+    } finally { $env:PSModulePath = $savedModulePath }
     $t = [Diagnostics.Stopwatch]::StartNew(); $loginTried = $false
     while (-not ($game = Get-Process Blacklist_game -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        if ($script:PlayProcess.HasExited) {
+            throw "The Play script exited ($($script:PlayProcess.ExitCode)) before the game started: " +
+                ((@(Get-Content $playLog, "$playLog.err" -ErrorAction SilentlyContinue) | Select-Object -Last 3) -join ' | ')
+        }
         if ($t.Elapsed.TotalSeconds -gt 300) { throw 'The game did not start within 5 minutes.' }
         if (-not $loginTried -and $t.Elapsed.TotalSeconds -gt 60 -and (Get-Process UbisoftGameLauncher -ErrorAction SilentlyContinue)) {
             $loginTried = $true
