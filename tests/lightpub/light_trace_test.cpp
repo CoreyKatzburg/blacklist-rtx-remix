@@ -1,6 +1,9 @@
 // Game-free test of lightcal::LightChangeTrace (light_calibration.h), the logic behind lightpub_trace.csv.
 // Each case feeds the per-frame values lightpub would publish and checks the events the CSV would get.
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <string>
 #include <vector>
 
 #include "../../play-setup/unified-build/light_calibration.h"
@@ -93,6 +96,26 @@ int main() {
         const auto r = Run(200, [](uint32_t) { return 2.25f; });
         CHECK(Count(r, TraceChange::Stopped) == 0 && Count(r, TraceChange::Brightness) == 0,
               "stuck: a light that never changes must leave only its started event");
+    }
+    {   // sharing: another process (the gate harness) must be able to read the trace while the game writes it
+        const std::wstring path = (std::filesystem::temp_directory_path() / L"lightpub_trace_share_test.csv").wstring();
+        auto readable = [&](FILE* writer) {
+            if (!writer) return false;
+            std::fputs("frame,node,id,change,old,new\n", writer);
+            std::fflush(writer);
+            FILE* reader = _wfsopen(path.c_str(), L"r", _SH_DENYNO);
+            char line[64] = {};
+            const bool ok = reader && std::fgets(line, sizeof line, reader) && std::strncmp(line, "frame,", 6) == 0;
+            if (reader) std::fclose(reader);
+            std::fclose(writer);
+            return ok;
+        };
+        CHECK(readable(lightcal::OpenTraceFile(path.c_str(), false)), "share: trace file not readable while open");
+        // Fake case: the old open (_wfopen_s, no sharing) must fail this check, or the check proves nothing.
+        FILE* old = nullptr;
+        _wfopen_s(&old, path.c_str(), L"w");
+        CHECK(!readable(old), "share: the check passed on the old unshared open");
+        std::filesystem::remove(path);
     }
     std::printf(g_failures ? "light_trace_test: %d FAILED\n" : "light_trace_test: all passed\n", g_failures);
     return g_failures ? 1 : 0;

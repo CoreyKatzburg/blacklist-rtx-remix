@@ -364,7 +364,7 @@ void UpdateTraceFile() {
         const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
         wchar_t* slash = n ? wcsrchr(path, L'\\') : nullptr;
         if (!slash || wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"lightpub_trace.csv")) return;
-        if (_wfopen_s(&g_traceFile, path, openedOnce ? L"a" : L"w") || !g_traceFile) return;
+        if (!(g_traceFile = lightcal::OpenTraceFile(path, openedOnce))) return;
         if (!openedOnce) fputs("frame,node,id,change,old,new\n", g_traceFile);
         openedOnce = true;
         g_trace.Clear();   // the trace runs without the file too; restart it so every light gets a started line

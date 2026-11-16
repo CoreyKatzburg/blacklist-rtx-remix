@@ -19,6 +19,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <share.h>
 
 namespace lightcal {
 
@@ -390,6 +392,12 @@ constexpr float kTraceRelativeStep = 0.05f;
 constexpr float kDimFraction = 0.1f;
 
 enum class TraceChange { Started, Brightness, Flags, Stopped };
+
+// Opens lightpub_trace.csv so other processes can read (and copy) it while the game writes it: the gate harness
+// copies it mid-launch. Plain _wfopen_s opens without sharing, and every reader then fails.
+inline FILE* OpenTraceFile(const wchar_t* path, bool append) {
+    return _wfsopen(path, append ? L"a" : L"w", _SH_DENYNO);
+}
 
 inline const char* TraceChangeName(TraceChange c) {
     switch (c) {
