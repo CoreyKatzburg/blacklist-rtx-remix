@@ -228,6 +228,14 @@ function Stop-Game {
     $script:PlayProcess = $null
 }
 
+# Why a no-Remix run cannot record a picture, or $null. With every monitor switched off the original game draws its
+# window black (Nov 16: references 045456 and 054905 were black after Corey turned his monitors off at about 2 to 3 AM;
+# Remix captures still worked). Windows then lists each monitor with Present False; a monitor that is on has Present True.
+function Get-DisplayProblem($monitors) {
+    if (@($monitors | Where-Object Present).Count) { return $null }
+    "No monitor is switched on (Windows lists $(@($monitors).Count) monitors, none present). The original game draws a black picture without a display: turn a monitor on, then run again."
+}
+
 # True after removing $path, when it is a Play-script lock ($LockTag) whose start time is not before $since (the start
 # of this run's own Play script). Corey's lock, or one written before this run's Play script started, stays.
 function Remove-OwnPlayLock([string]$path, [datetime]$since) {
@@ -410,6 +418,7 @@ if ($running) { throw "$($running.Name) is already running (pid $($running.Id), 
 $otherLock = 'D:\BlacklistOverhaul\experiments\GAME_IN_USE.txt'
 if (Test-Path $otherLock) { throw "Someone else has the game: $(Get-Content $otherLock -Raw)" }
 if (Test-Path $GameLock) { throw "Someone else has the game: $(Get-Content $GameLock -Raw)" }
+if ($NoRemix) { $displayProblem = Get-DisplayProblem @(Get-PnpDevice -Class Monitor -ErrorAction SilentlyContinue); if ($displayProblem) { throw $displayProblem } }
 # A killed run leaves its marker line in the setup ini (its finally block never ran): its "before" files are in its
 # file-backup folder, and this run would otherwise take the changed ini as its own "before".
 $leftOver = @(Get-LeftOverRuns @((Join-Path $Setup 'd3d9_proxy.ini'), "$S\d3d9_proxy.ini"))

@@ -4,7 +4,7 @@
 param([string]$Gate = (Join-Path (Split-Path $PSScriptRoot) 'verify_runtime.ps1'))
 $ErrorActionPreference = 'Stop'
 $ast = [Management.Automation.Language.Parser]::ParseFile($Gate, [ref]$null, [ref]$null)
-foreach ($n in 'Remove-OwnPlayLock', 'Wait-RestartedGame') {
+foreach ($n in 'Remove-OwnPlayLock', 'Wait-RestartedGame', 'Get-DisplayProblem') {
     $f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true) | Select-Object -First 1
     if (-not $f) { throw "missing $n" }
     . ([scriptblock]::Create($f.Extent.Text))
@@ -43,6 +43,13 @@ $g = Start-Process ping -ArgumentList '-n', '2', '127.0.0.1' -PassThru -WindowSt
 Check 'an older process is not taken for the restart' ($null -eq (Wait-RestartedGame $g.Id $gStart 2 'PING'))
 Stop-Process -Id $pre.Id -Force -ErrorAction SilentlyContinue
 Remove-Item $dir -Recurse -Force
+# Display check for -NoRemix (Nov 16 black references): the monitor list as Windows gave it with Corey's monitors off,
+# then the same list with one monitor on.
+$off = @('ACI27A8', 'HKC2731', 'DEFAULT_MONITOR') | ForEach-Object { [pscustomobject]@{ InstanceId = "DISPLAY\$_"; Present = $false } }
+Check 'all monitors off: refused' ([bool](Get-DisplayProblem $off))
+Check 'no monitors listed: refused' ([bool](Get-DisplayProblem @()))
+$on = @($off[0], [pscustomobject]@{ InstanceId = 'DISPLAY\HKC2731'; Present = $true })
+Check 'one monitor on: allowed' ($null -eq (Get-DisplayProblem $on))
 "failures $fail"
 exit [int]($fail -gt 0)
 
