@@ -121,23 +121,20 @@ class Steering(unittest.TestCase):
         with mock.patch.object(drive, "mouse_move_rel", wild_x), self.assertRaisesRegex(RuntimeError, "inconsistent"):
             s._calibrate_mouse()
 
-    def test_snap_pose_writes_the_stop_into_game_memory(self):
-        # No-Remix Paladin, Nov 16: mouse steering left y0_p0 at yaw -63, pitch 30 and y0_p-30 at yaw 156.
-        s = self.run_with(178, 45.0, -26.0, 45.0, -26.0)
-        s.yaw, s.pitch = 90.0, -30.0
-        game = self.game
-
-        def set_rotation(controller, yaw, pitch):
-            with game.lock:
-                game.yaw, game.pitch = yaw, pitch
-        game.set_rotation = set_rotation
-        self.assertEqual(s.snap_pose(), 1)
-        yaw, pitch, _ = game.rotation(0)
-        self.assertLess(abs(gate.wrap(yaw - (s.base_yaw + 90.0))), 0.3)
-        self.assertLess(abs(pitch + 30.0), 0.3)
-        game.set_rotation = lambda controller, yaw, pitch: None   # fake: the game ignores the write
-        s.yaw = 0.0
-        self.assertEqual(s.snap_pose(), -1)   # three writes and still off: recorded as poseWrites -1
+    def test_snap_pose_corrects_with_settled_mouse_steps(self):
+        # No-Remix custodial, Nov 16 05:21: written rotations did not hold, and stops at pitch +-30 ended 1 to 2.3
+        # degrees off. Fake: 178 FPS, each input eased over 30 frames, calibration 12% low, start 2.3 degrees off.
+        s = self.run_with(178, 117.0, -53.0, 103.0, -47.0)
+        self.game.ease_frames = 30
+        s.yaw, s.pitch = 2.3, -2.0
+        steps = s.snap_pose()
+        self.assertGreater(steps, 0)
+        yaw, pitch, _ = self.game.rotation(0)
+        self.assertLess(abs(gate.wrap(yaw - (s.base_yaw + 2.3))), 0.3)
+        self.assertLess(abs(pitch + 2.0), 0.3)
+        with mock.patch.object(drive, "mouse_move_rel", lambda dx, dy: None):   # fake: the game ignores the mouse
+            s.yaw = 0.0
+            self.assertEqual(s.snap_pose(), -1)
 
     def test_off_pose_stop_is_retried_and_marked(self):
         # Paladin reference, Nov 16: stops were captured 4 to 157 degrees from the asked view and nothing said so.

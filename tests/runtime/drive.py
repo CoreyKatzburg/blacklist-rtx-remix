@@ -650,16 +650,28 @@ class Spot:
         """Without Remix the game runs at ~178 FPS and eases each mouse input over several frames, so mouse steering
         left reference stops 4 to 28 degrees off (Custodial and bright hall, Nov 16) and Paladin stops up to 157 off.
         There the stop's exact direction is written into the controller's rotation in game memory, and checked again
-        once the camera is still. Returns how many writes it took (0: the mouse already got there), or -1 when the
-        camera was still off after three."""
-        for writes in range(4):
+        once the camera is still. Returns how many corrections it took (0: the mouse already got there), or -1 when
+        the camera was still off after SNAP_STEPS (recorded as poseWrites).
+
+        The memory write does not hold: the controller has no other rotation field, and the game rewrites Rotation
+        from its own state, so the reference run of Nov 16 05:21 (con_custodial) ended every written stop where the
+        mouse had left it, 1 to 2.3 degrees off at pitch +-30 ("poseWrites -1"). So the corrections are mouse moves,
+        each sent only once the camera has been still for 0.25 s: the game eases one input over many frames at
+        178 FPS, and a correction sent mid-ease is added on top of it."""
+        for steps in range(self.SNAP_STEPS + 1):
             yaw, pitch = self._settled()
-            if abs(gate.wrap(self.base_yaw + self.yaw - yaw)) < 0.3 and abs(self.base_pitch + self.pitch - pitch) < 0.3:
-                return writes
-            if writes < 3:
-                self.game.set_rotation(self.controller, self.base_yaw + self.yaw, self.base_pitch + self.pitch)
-                time.sleep(0.1)
+            err_yaw = gate.wrap(self.base_yaw + self.yaw - yaw)
+            err_pitch = self.base_pitch + self.pitch - pitch
+            if abs(err_yaw) < 0.3 and abs(err_pitch) < 0.3:
+                return steps
+            if steps < self.SNAP_STEPS:
+                dx = int(round(err_yaw * self.counts_per_deg_x * 0.8)) if abs(err_yaw) >= 0.3 else 0
+                dy = int(round(err_pitch * self.counts_per_deg_y * 0.8)) if abs(err_pitch) >= 0.3 else 0
+                mouse_move_rel(dx or (int(math.copysign(1, err_yaw * self.counts_per_deg_x)) if abs(err_yaw) >= 0.3 else 0),
+                               dy or (int(math.copysign(1, err_pitch * self.counts_per_deg_y)) if abs(err_pitch) >= 0.3 else 0))
         return -1
+
+    SNAP_STEPS = 6
 
     OFF_POSE_DEG = 1.0   # a stop further than this from the asked view (yaw or pitch) is off-pose
     POSE_TRIES = 3
