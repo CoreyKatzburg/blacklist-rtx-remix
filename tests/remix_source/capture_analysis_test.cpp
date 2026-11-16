@@ -207,6 +207,34 @@ static void testSynthetic() {
           b.synthBlendWeightReg == 7 && b.synthBonesFirstReg == 41 && b.synthBoneIndexScale == 765.0f,
           "vs_87D8E2DF skinning normal synthesis metadata mismatch");
   }
+
+  // Skinned shaders 0x6ec90 / 0x7106c write `mul o5, c5.xxxy, v3.w` with def c5 = (0,1,0,0):
+  // TEXCOORD4.xyz is always zero and reads only the w channel of NORMAL0. That is not a normal
+  // output; the shader must fall back to the synthesized skinned normal. The control writes
+  // `mul o5, c5.yyyy, v3` (the real normal) and must still be detected.
+  for (const bool readsNormalXyz : { false, true }) {
+    using namespace as;
+    std::vector<uint32_t> c = { 0xFFFE0300u };
+    ctab(c, { { "gWorldToProj", 8, 4 }, { "gBones", 41, 156 } });
+    def(c, 5, 0.0f, 1.0f, 0.0f, 0.0f);
+    dcl(c, 0, 0, dst(V, 0)); dcl(c, 3, 0, dst(V, 3)); dcl(c, 2, 0, dst(V, 6)); dcl(c, 1, 0, dst(V, 7));
+    dcl(c, 0, 0, dst(O, 0)); dcl(c, 5, 4, dst(O, 5));
+    for (uint32_t k = 0; k < 4; k++) emit(c, 9, dst(O, 0, 1u << k), { src(V, 0), src(C, 8 + k) });
+    if (readsNormalXyz) {
+      emit(c, 5, dst(O, 5), { src(C, 5, 0x55), src(V, 3) });      // mul o5, c5.yyyy, v3
+    } else {
+      emit(c, 5, dst(O, 5), { src(C, 5, 0x40), src(V, 3, 0xFF) }); // mul o5, c5.xxxy, v3.w
+    }
+    c.push_back(0x0000FFFFu);
+    const auto z = analyzeVertexShaderForCapture(c.data(), c.size());
+    if (readsNormalXyz) {
+      CHECK(z.valid && z.hasNormalOutput && z.normalOutputUsage == 5 && z.normalOutputIndex == 4,
+            "o5 = v3 must be the normal output (has=%d)", z.hasNormalOutput);
+    } else {
+      CHECK(z.valid && !z.hasNormalOutput && z.hasSynthesizedNormal && z.synthHasSkinning,
+            "o5 = c5.xxxy * v3.w is not a normal output (has=%d synth=%d)", z.hasNormalOutput, z.hasSynthesizedNormal);
+    }
+  }
 }
 
 // --- game data ---------------------------------------------------------------------------
@@ -241,7 +269,7 @@ static void testGameShaders(const std::string& path, const char* dumpPath) {
   std::FILE* dump = dumpPath ? std::fopen(dumpPath, "w") : nullptr;
   const std::set<std::string> camera = { "gWorldToProj", "gViewportOffset", "gViewportSB", "cViewPos_VS", "cProjSkinMesh" };
   const std::set<std::string> worldRotation = { "gLocalToWorld", "gBones", "gDrawScale", "gForces" };
-  size_t valid = 0, world = 0, worldWithNormalInput = 0, normalsFound = 0, withRanges = 0;
+  size_t valid = 0, world = 0, worldWithNormalInput = 0, normalsFound = 0, withRanges = 0, zeroNormalShadersSeen = 0;
   std::map<std::string, int> normalSemantics;
 
   for (const auto& sh : shaders) {
@@ -263,6 +291,15 @@ static void testGameShaders(const std::string& path, const char* dumpPath) {
 
     valid += a.valid;
     CHECK(a.valid, "game shader at 0x%zx failed to analyse", sh.offset);
+    // These write `mul o5, cN.<literal zero xyz>, v3.w`: TEXCOORD4.xyz is always (0,0,0), so they must
+    // synthesize the normal. Skinned: 78BCCBDD, 514A5FAA. World: 6E196E77, F6CAEE4E, 5EA537BA, 0335612F.
+    const bool zeroSkinned = sh.offset == 0x6ec90 || sh.offset == 0x7106c;
+    const bool zeroWorld = sh.offset == 0x6e840 || sh.offset == 0x6f3a0 || sh.offset == 0x70c0c || sh.offset == 0x71780;
+    if (zeroSkinned || zeroWorld) {
+      zeroNormalShadersSeen++;
+      CHECK(!a.hasNormalOutput && a.hasSynthesizedNormal && (zeroSkinned ? a.synthHasSkinning : a.synthHasLocalToWorld),
+            "0x%zx: zero TEXCOORD4 must not be the normal output (has=%d synth=%d)", sh.offset, a.hasNormalOutput, a.hasSynthesizedNormal);
+    }
 
     if (isWorld) {
       world++;
@@ -298,7 +335,11 @@ static void testGameShaders(const std::string& path, const char* dumpPath) {
             std::printf(" [u%d.%d mask%x:", an.m_outputUsage[o] & 0xFF, an.m_outputUsage[o] >> 8, an.m_outputMask[o]);
             for (uint32_t c = 0; c < 3; c++) {
               std::printf(" {");
-              for (uint32_t v = 0; v < kMaxInputs; v++) if (st.outputs[o * 4 + c].test(v) && an.m_inputUsage[v] >= 0) std::printf("%d.%d ", an.m_inputUsage[v] & 0xFF, an.m_inputUsage[v] >> 8);
+              for (uint32_t v = 0; v < kMaxInputs; v++) {
+                for (uint32_t k = 0; k < 4; k++) {
+                  if (st.outputs[o * 4 + c].test(inputBit(v, k)) && an.m_inputUsage[v] >= 0) std::printf("%d.%d.%c ", an.m_inputUsage[v] & 0xFF, an.m_inputUsage[v] >> 8, "xyzw"[k]);
+                }
+              }
               std::printf("}");
             }
             std::printf("]");
@@ -347,10 +388,10 @@ static void testGameShaders(const std::string& path, const char* dumpPath) {
   // Every world shader with an input normal (172/172 = 100%) must either emit a normal output
   // or synthesize a smooth normal so zero world or character shaders fall back to flat triangles.
   const std::map<std::string, int> expected = {
-    { "SYNTH_OBJ", 5 }, { "SYNTH_SKINNED", 19 }, { "SYNTH_WORLD", 44 },
-    { "TEXCOORD1", 5 }, { "TEXCOORD2", 21 }, { "TEXCOORD3", 3 }, { "TEXCOORD4", 75 }
+    { "SYNTH_OBJ", 5 }, { "SYNTH_SKINNED", 21 }, { "SYNTH_WORLD", 48 },
+    { "TEXCOORD1", 5 }, { "TEXCOORD2", 21 }, { "TEXCOORD3", 3 }, { "TEXCOORD4", 69 }
   };
-  CHECK(shaders.size() == 263 && world == 198 && worldWithNormalInput == 172, "game shader inventory changed");
+  CHECK(shaders.size() == 263 && world == 198 && worldWithNormalInput == 172 && zeroNormalShadersSeen == 6, "game shader inventory changed");
   CHECK(normalsFound == worldWithNormalInput && normalSemantics == expected,
         "normal output detection changed (found %zu of %zu)", normalsFound, worldWithNormalInput);
 }
