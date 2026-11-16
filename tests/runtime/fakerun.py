@@ -47,12 +47,10 @@ def view(yaw: float, pitch: float, rng) -> np.ndarray:
     return np.clip(img + rng.normal(0, 0.8, img.shape), 0, 255)
 
 
-# case -> (frame time ms, GPU time ms) for every frame. Healthy runs are 10 ms and 8 ms: 100 FPS, input latency 12 ms.
+# case -> (frame time ms, GPU time ms) for every frame. Healthy runs are 10 ms and 8 ms: 100 FPS, CPU wait 2 ms.
 FRAME_TIMES = {
     "low_fps": (14.0, 12.0),           # 71 FPS: WARN under the 90 target, the gate still passes
-    "high_latency": (17.5, 9.0),       # 57 FPS, input latency 26 ms (+14 over the reference), CPU wait 8.5 ms
-    "lag_within_margin": (12.0, 7.0),  # input latency 17 ms: +5 over the reference, exactly the margin: passes
-    "lag_over_margin": (12.5, 7.5),    # input latency 17.5 ms: +5.5 over the reference: fails; CPU wait is 5 ms
+    "high_latency": (17.5, 9.0),       # 57 FPS, CPU wait 8.5 ms -> fails latency_overhead_ms
     "fps_regression": (11.8, 8.0),     # 84.7 FPS: 15% below the 100 FPS previous run: FAIL
     "fps_drop_9pct": (10.98, 8.0),     # 91 FPS: 9% below the previous run: passes
 }
@@ -86,6 +84,8 @@ class Builder:
         c = self.case
         if c == "nan_frame" and kind == "still" and i == 3: rec["thumbNonFinite"] = 40
         if c == "slow_frame" and kind == "pan" and i == 30: rec["frameTimeMs"] = 61.0
+        loading = (c == "loading_in_window" and wname == "to_y45_p0" and i in (2, 3))
+        if loading: rec["frameTimeMs"] = 120.0
         if c in FRAME_TIMES: rec["frameTimeMs"], rec["gpuTimeMs"] = FRAME_TIMES[c]
         if c == "no_skinned" and kind == "still" and i == 3: rec["skinnedInstances"] = 0
         if c == "blas_rebuild" and kind == "pan" and i == 50: rec["staticBlasRebuilds"] = 1
@@ -117,10 +117,14 @@ class Builder:
         cp = math.radians(self.pitch)
         if c == "pan_short" and kind == "pan":
             cy = math.radians(self.base_cam - self.yaw * 0.5)
-        fx, fy, fz = math.cos(cp) * math.cos(cy), math.cos(cp) * math.sin(cy), math.sin(cp)
-        self.proxy.append(f"{self.pframe},1.0,14.0,0.5,1500,1,P:22:0:1.0:2.0:3.0:{fx:.5f}:{fy:.5f}:{fz:.5f}:0.0")
-        handoff = 0 if (c == "raster_flash" and kind == "pan" and i == 70) else 1
-        self.pgate.append(f"{self.pframe},1400,40,{handoff},{1 if goggles else 0},1")
+        if loading:
+            self.proxy.append(f"{self.pframe},1.0,1.6,0.5,29,0,")
+            self.pgate.append(f"{self.pframe},0,0,0,0,1")
+        else:
+            fx, fy, fz = math.cos(cp) * math.cos(cy), math.cos(cp) * math.sin(cy), math.sin(cp)
+            self.proxy.append(f"{self.pframe},1.0,14.0,0.5,1500,1,P:22:0:1.0:2.0:3.0:{fx:.5f}:{fy:.5f}:{fz:.5f}:0.0")
+            handoff = 0 if (c == "raster_flash" and kind == "pan" and i == 70) else 1
+            self.pgate.append(f"{self.pframe},1400,40,{handoff},{1 if goggles else 0},1")
         return img
 
     def window(self, name: str, kind: str, n: int, extra=None, goggles=False, motion=None):
@@ -213,6 +217,11 @@ class Builder:
                 "telemetry": None if self.case == "no_telemetry" else "telemetry.jsonl",
                 "proxyFrames": "proxy_frames.csv", "proxyGate": None if self.case == "no_proxy_gate" else "proxy_gate.csv",
                 "proxyLog": None}
+        if self.case != "no_mouse_lag":
+            bump = 5.0 if self.case == "lag_within_margin" else (5.5 if self.case == "lag_over_margin" else 0.0)
+            samples = [round(22.0 + bump + ((i % 3) - 1) * 0.5, 2) for i in range(20)]
+            spot["mouse_lag"] = {"samples_ms": samples, "game_share_ms": 14.0, "after_game_ms": round(8.0 + bump, 2),
+                                 "method": "fake 20x5deg gdigrab"}
         if self.case == "spot_error":
             spot["error"] = "RuntimeError: loaded map 'menu', checkpoint was recorded in 'S_CON_Global'"
         if self.case == "no_thumbs":
@@ -249,10 +258,12 @@ CASES = {
     "pulse_still": (("still_flicker",), ()),
     "blas_rebuild": (("static_blas_rebuilds",), ()),
     "slow_frame": (("frames_over_50ms",), ()),
+    "loading_in_window": ((), ()),                        # >50 ms frames during a loading screen are excluded: passes
     "low_fps": ((), ()),                                # WARN min_median_fps (WARNS); the gate passes
-    "high_latency": (("latency_overhead_ms", "input_latency_ms"), ()),
+    "high_latency": (("latency_overhead_ms",), ()),
     "lag_within_margin": ((), ()),                      # +5 ms over the reference: the margin's edge still passes
     "lag_over_margin": (("input_latency_ms",), ()),     # +5.5 ms over the reference
+    "no_mouse_lag": ((), ("input_latency_ms",)),        # missing mouse_lag in spot.json: NOT MEASURED, fails the gate
     "fps_regression": (("fps_regression",), ()),        # 15% below the previous run
     "fps_drop_9pct": ((), ()),                          # 9% below the previous run: passes
     "no_reference": ((), ("input_latency_ms",)),        # no --reference: NOT MEASURED, which fails the gate
@@ -262,14 +273,14 @@ CASES = {
     "pan_short": (("pose",), ()),
     "goggles_missing": (("goggles",), ()),
     "goggles_untoggled": ((), ("goggles",)),
-    "no_telemetry": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms", "input_latency_ms",
+    "no_telemetry": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms",
                           "skinned_min", "static_blas_rebuilds", "inward_fraction", "nonfinite_thumb_pixels",
                           *RECORDER)),
     # Remix writing only every 15th frame: per-frame checks can't pass; flashes fall back to the screen captures
-    "sparse_telemetry": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms", "input_latency_ms",
+    "sparse_telemetry": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms",
                               "skinned_min", "static_blas_rebuilds", "inward_fraction", "nonfinite_thumb_pixels",
                               *RECORDER)),
-    "renamed_fields": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms", "input_latency_ms")),
+    "renamed_fields": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms")),
     "no_dumps": ((), ("nan_pixels", "neon_fraction", "brightness_floor", "angled_sharpness", "outline_overlap")),
     "no_proxy_gate": ((), ("raster_fallback_frames",)),
     "no_thumbs": ((), ()),                       # still measurable from the screen captures (pan at full rate)
@@ -293,8 +304,7 @@ CASES = {
 
 
 # case -> checks that must WARN (shown in the result; the gate still passes)
-WARNS = {"low_fps": ("min_median_fps",), "high_latency": ("min_median_fps",), "lag_within_margin": ("min_median_fps",),
-         "lag_over_margin": ("min_median_fps",), "fps_regression": ("min_median_fps",)}
+WARNS = {"low_fps": ("min_median_fps",), "high_latency": ("min_median_fps",), "fps_regression": ("min_median_fps",)}
 PREVIOUS = {"fps_regression", "fps_drop_9pct"}    # judged against a previous run: the healthy 100 FPS run
 NO_REFERENCE = {"no_reference"}                  # run without --reference
 

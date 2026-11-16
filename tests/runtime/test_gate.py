@@ -122,6 +122,26 @@ class MathTest(unittest.TestCase):
             self.assertTrue(any("frameTimeMs" in x for x in problems))
             self.assertTrue(any("not JSON" in x for x in problems))
 
+    def test_is_zero_or_empty_camera(self):
+        self.assertTrue(gate.is_zero_or_empty_camera(["0", "1.0", "1.6", "0.5", "3", "0", ""]))
+        self.assertTrue(gate.is_zero_or_empty_camera(["545", "1.0", "1.6", "0.5", "29", "3",
+                                                      "G:0:0:-0.000:-0.000:-0.000:1.0:0.0:0.0:0.0"]))
+        self.assertTrue(gate.is_zero_or_empty_camera(["10", "1.0", "1.6", "0.5", "29", "3",
+                                                      "G:0:1:10.0:20.0:30.0:1.0:0.0:0.0:0.0"]))
+        self.assertFalse(gate.is_zero_or_empty_camera(["3050", "1.0", "16.0", "1.0", "1428", "8",
+                                                       "G:0:0:3769.8:3085.6:225.2:0.14:0.08:-0.98:0.0"]))
+
+    def test_spot_mouse_lag(self):
+        self.assertIsNone(gate.spot_mouse_lag({}))
+        self.assertIsNone(gate.spot_mouse_lag({"mouse_lag": {"samples_ms": [20.0] * 19}}))
+        res = gate.spot_mouse_lag({"mouse_lag": {"samples_ms": [20.0] * 10 + [24.0] * 10,
+                                                 "game_share_ms": 14.0, "after_game_ms": 8.0}})
+        self.assertIsNotNone(res)
+        self.assertAlmostEqual(res["median"], 22.0)
+        self.assertAlmostEqual(res["spread"], 4.0)
+        self.assertAlmostEqual(res["game"], 14.0)
+        self.assertAlmostEqual(res["after"], 8.0)
+
 
 class LatencyTableTest(unittest.TestCase):
     def test_present_row_reads_the_present_duration_not_the_clock(self):

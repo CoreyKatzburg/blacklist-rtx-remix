@@ -21,12 +21,14 @@ Checks (thresholds in THRESHOLDS):
   still_flicker            sustained local flicker (worst 8x8 block median frame-to-frame |delta|) and slow whole-frame
                            brightness pulsing (trimmed mean-luma drift) across still camera stops
   static_blas_rebuilds     static-geometry acceleration structure rebuilds while the camera rotates (telemetry)
-  frames_over_50ms         telemetry frameTimeMs > 50 in any measured window (goggle windows included: no freezes)
+  frames_over_50ms         telemetry frameTimeMs > 50 in any measured window, excluding loading-screen frames
+                           (proxy sceneDraws == 0 or all-zero/empty camera)
   min_median_fps           median FPS over the scene windows: WARN below 90 (Corey's target: a goal, not a limit)
   fps_regression           each spot's median FPS against the same spot in --previous: FAIL when more than 10% slower;
                            WARN when no previous run is given
-  input_latency_ms         each spot's median mouse-to-screen time against the same spot in --reference (the no-Remix
-                           run): FAIL when more than the GUESS margin above it; NOT MEASURED without --reference
+  input_latency_ms         each spot's median mouse-to-screen time (spot.json mouse_lag.samples_ms, >= 20 turns) against
+                           the same spot in --reference (the no-Remix run): FAIL when more than the GUESS margin above it;
+                           NOT MEASURED when missing or without --reference
   step_timing              per-step GPU times (telemetry passMs): untimed steps, and nested steps longer than their parent
   skip_occlusion_share     worst scene window's share of draws skipped by occlusionQuery (telemetry skips / proxy draws)
   skip_other_share         worst scene window's share of draws skipped for any other reason
@@ -53,9 +55,8 @@ THRESHOLDS = {
     "nan_pixels": 0, "neon_fraction": 0.001, "skinned_min": 1, "outline_overlap": 0.85, "inward_fraction": 0.005,
     "raster_fallback_frames": 0, "flashes": 0, "still_block_jitter": 4.0, "still_luma_drift": 6.0,
     "static_blas_rebuilds": 0,
-    # Zero hitches (Corey, Nov 15: none outside loading screens). Loading screens are NOT excluded: nothing in
-    # drive.py ends a window when a level load starts, so a load during a move, pan, combat or goggles window counts
-    # as a hitch here. Not verified whether the game ever loads inside one; the teleport hold is outside every window.
+    # Zero hitches outside loading screens (Corey, Nov 15). Loading-screen frames are excluded using the proxy trace
+    # (sceneDraws == 0 in d3d9_proxy_gate.csv or empty/all-zero camera in d3d9_proxy_frames.csv).
     "frames_over_50ms": 0,
     "min_median_fps": 90.0,  # Corey's target, Nov 15: WARN below it, not a fail. Median FPS over the SCENE windows (goggles excluded).
     "max_wait_overhead_ms": 5.0,
@@ -334,6 +335,34 @@ def camera_angles(row: list[str]) -> tuple[float, float] | None:
     return None
 
 
+def is_zero_or_empty_camera(row: list[str]) -> bool:
+    """True when a d3d9_proxy_frames.csv row has no published camera or only an all-zero (0, 0, 0) camera
+    (the loading-screen signature observed in d3d9_proxy_frames.csv)."""
+    if len(row) < 7 or not row[6]:
+        return True
+    unskipped = [p for p in (pub.split(":") for pub in row[6].split("|")) if len(p) >= 9 and p[2] == "0"]
+    if not unskipped:
+        return True
+    return all(abs(float(p[3])) < 1e-6 and abs(float(p[4])) < 1e-6 and abs(float(p[5])) < 1e-6 for p in unskipped)
+
+
+def is_loading_frame(spot: dict, w: dict, idx: int, n_tids: int) -> bool:
+    """True when the proxy frame corresponding to telemetry index `idx` in window `w` is a loading-screen frame
+    (sceneDraws == 0 in proxy_gate.csv, or empty/all-zero camera in proxy_frames.csv). Fails closed (False) if proxy
+    data for that frame is missing."""
+    pids = frames_in(w, "proxy")
+    if not pids:
+        return False
+    pf = pids[idx] if len(pids) == n_tids else pids[min(len(pids) - 1, idx * len(pids) // max(1, n_tids))]
+    pg = spot["_data"]["pgate"]
+    if pf in pg and len(pg[pf]) >= 2 and int(pg[pf][1]) == 0:
+        return True
+    prx = spot["_data"]["proxy"]
+    if pf in prx and is_zero_or_empty_camera(prx[pf]):
+        return True
+    return False
+
+
 def wrap(deg: float) -> float:
     return (deg + 180.0) % 360.0 - 180.0
 
@@ -544,15 +573,26 @@ def spot_fps(spot: dict) -> float | None:
     return 1000.0 / max(float(np.median(vals)), 1e-3)
 
 
-def spot_input_latency(spot: dict) -> float | None:
-    """Median mouse-to-screen estimate (frame time + CPU/bridge wait) over one spot's scene frames; None unless every
-    frame has frameTimeMs and gpuTimeMs."""
-    want, recs = coverage(scene_pairs(spot), "telemetry", "telemetry")
-    lats = [ft + max(0.0, ft - gt) for ft, gt in ((r.get("frameTimeMs"), r.get("gpuTimeMs")) for r in recs)
-            if isinstance(ft, (int, float)) and isinstance(gt, (int, float))]
-    if want == 0 or len(lats) < want:
+def spot_mouse_lag(spot: dict) -> dict | None:
+    """Mouse-to-screen lag stats from spot.json['mouse_lag']: median, IQR spread, and game/after shares;
+    None unless samples_ms has at least 20 finite numbers."""
+    ml = spot.get("mouse_lag")
+    if not isinstance(ml, dict):
         return None
-    return float(np.median(lats))
+    raw = ml.get("samples_ms")
+    if not isinstance(raw, list):
+        return None
+    samples = [float(x) for x in raw if isinstance(x, (int, float)) and math.isfinite(x)]
+    if len(samples) < 20:
+        return None
+    game = ml.get("game_share_ms")
+    after = ml.get("after_game_ms")
+    return {
+        "median": float(np.median(samples)),
+        "spread": float(np.percentile(samples, 75) - np.percentile(samples, 25)),
+        "game": float(game) if isinstance(game, (int, float)) and math.isfinite(game) else None,
+        "after": float(after) if isinstance(after, (int, float)) and math.isfinite(after) else None,
+    }
 
 
 def fps_regression_check(run: Run, good: list[dict], previous: dict[str, dict] | None) -> None:
@@ -581,31 +621,42 @@ def fps_regression_check(run: Run, good: list[dict], previous: dict[str, dict] |
             detail, src)
 
 
+def _fmt_lag(s: dict | None) -> str:
+    if s is None:
+        return "not measured"
+    parts = [f"spread {s['spread']:.1f}"]
+    if s["game"] is not None and s["after"] is not None:
+        parts.append(f"game {s['game']:.1f}+after {s['after']:.1f}")
+    return f"{s['median']:.1f} ms ({', '.join(parts)})"
+
+
 def input_lag_check(run: Run, good: list[dict], reference: dict[str, dict] | None) -> None:
-    """Each spot's median mouse-to-screen time against the same spot in the no-Remix reference run (--reference), within
-    input_lag_margin_ms (a GUESS). Without a reference the check is NOT MEASURED: there is no fixed limit."""
-    src = "rtx_telemetry.jsonl (frameTimeMs, gpuTimeMs): this run and the reference run (--reference)"
+    """Each spot's median mouse-to-screen time (spot.json mouse_lag.samples_ms, >= 20 turns) against the same spot in
+    the no-Remix reference run (--reference), within input_lag_margin_ms (a GUESS). Without --reference or when any
+    spot lacks mouse_lag, the check is NOT MEASURED: there is no fixed limit."""
+    src = "spot.json mouse_lag (20 mouse turns): this run and the reference run (--reference)"
     margin = THRESHOLDS["input_lag_margin_ms"]
     threshold = f"<= reference + {margin:g} ms per spot (GUESS margin)"
-    ours = {s["name"]: spot_input_latency(s) for s in good}
-    shown = "; ".join(f"{n} {v:.1f} ms" if v is not None else f"{n} not measured" for n, v in ours.items())
+    ours = {s["name"]: spot_mouse_lag(s) for s in good}
+    shown = "; ".join(f"{n} {_fmt_lag(v)}" for n, v in ours.items())
     if reference is None:
         run.add("input_latency_ms", NOT_MEASURED, None, threshold,
                 f"no reference run given (--reference), so not compared; this run: {shown or 'no spot measured'}", src)
         return
     diffs, missing = [], []
     for name, now in ours.items():
-        base = spot_input_latency(reference[name]) if name in reference else None
+        base = spot_mouse_lag(reference[name]) if name in reference else None
         if now is None or base is None:
             missing.append(name)
         else:
-            diffs.append((now - base, name, now, base))
+            diffs.append((now["median"] - base["median"], name, now, base))
     if not diffs or missing:
         run.add("input_latency_ms", NOT_MEASURED, None, threshold,
-                "no comparable input latency for: " + (", ".join(missing) or "no spot measured"), src)
+                "no comparable mouse_lag for: " + (", ".join(missing) or "no spot measured"), src)
         return
     worst = max(d[0] for d in diffs)
-    detail = f"worst spot {worst:+.2f} ms over reference; " + "; ".join(f"{n} {a:.1f} vs {b:.1f} ms" for _, n, a, b in diffs)
+    detail = f"worst spot {worst:+.2f} ms over reference; " + "; ".join(
+        f"{n} {_fmt_lag(a)} vs {_fmt_lag(b)}" for _, n, a, b in diffs)
     run.add("input_latency_ms", PASS if worst <= margin else FAIL, round(worst, 2), threshold, detail, src)
 
 
@@ -630,10 +681,30 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
         value, ok = judge(vals)
         run.add(name, PASS if ok else bad, value, threshold, describe(value, want), tsrc)
 
-    over = lambda v: sum(1 for x in v if x > 50.0)
-    telemetry_check("frames_over_50ms", pick(MEASURED), "frameTimeMs",
-                    lambda v: (over(v), over(v) <= THRESHOLDS["frames_over_50ms"]),
-                    "0", lambda v, n: f"{v} of {n} frames over 50 ms")
+    measured_pairs = pick(MEASURED)
+    if not measured_pairs:
+        run.add("frames_over_50ms", NOT_MEASURED, None, "0", "no windows of this kind were run", tsrc)
+    else:
+        want_50, recs_50 = coverage(measured_pairs, "telemetry", "telemetry")
+        have_50 = sum(1 for r in recs_50 if isinstance(r.get("frameTimeMs"), (int, float)))
+        if want_50 == 0 or have_50 < want_50:
+            run.add("frames_over_50ms", NOT_MEASURED, None, "0",
+                    f"telemetry has {have_50} of {want_50} frames with 'frameTimeMs'", tsrc)
+        else:
+            over_nonload, excluded_load = 0, 0
+            for s, w in measured_pairs:
+                tel = s["_data"]["telemetry"]
+                tids = frames_in(w, "telemetry")
+                for idx, tf in enumerate(tids):
+                    if tel[tf]["frameTimeMs"] > 50.0:
+                        if is_loading_frame(s, w, idx, len(tids)):
+                            excluded_load += 1
+                        else:
+                            over_nonload += 1
+            detail = f"{over_nonload} of {want_50} frames over 50 ms" + (
+                f" ({excluded_load} loading-screen frames excluded)" if excluded_load else "")
+            run.add("frames_over_50ms", PASS if over_nonload <= THRESHOLDS["frames_over_50ms"] else FAIL,
+                    over_nonload, "0", detail, tsrc)
     telemetry_check("skinned_min", pick(SCENE), "skinnedInstances",
                     lambda v: (min(v), min(v) >= THRESHOLDS["skinned_min"]),
                     ">= 1 every frame", lambda v, n: f"fewest character meshes in {n} frames: {v}")
