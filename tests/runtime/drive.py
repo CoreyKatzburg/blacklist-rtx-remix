@@ -785,6 +785,7 @@ class Spot:
         os.makedirs(os.path.join(self.out, "switch"), exist_ok=True)
         for v in self.spot.get("switches", SWITCHES):
             name = v["name"]
+            mark = len(self.log.new_text())
             try:
                 for section, key, value in v.get("ini", []):
                     set_ini(self.ini, section, key, value)
@@ -794,10 +795,13 @@ class Spot:
                         front(hwnd)
                     tap(keys["toggle"])
                 self.hold(3.0)
+                proof = self.await_log(v["expectLog"], mark) if v.get("expectLog") else None
                 rel = f"frames/switch_{name}.gray"
                 w = self.window(f"switch_{name}", "switch", lambda: (self.capture(rel, 30), self.dump(f"switch_{name}")),
                                 frames=rel, frameSize=[CAP_W, CAP_H], dump=f"switch_{name}", switch=v)
                 w["lights"] = self.light_dump(os.path.join(self.out, "switch", f"{name}_lights.tsv"))
+                if proof:
+                    w["logProof"] = proof
                 w["gamePose"] = [self.rel_pose()]
                 w["samMoved"] = self.sam_moved(f"switch_{name}")
             finally:
@@ -809,6 +813,33 @@ class Spot:
                     self.hold(3.0)
                 write_ini(self.ini, original)
                 self.hold(3.0)
+
+    def await_log(self, want: dict, mark: int) -> dict:
+        """Proof that a live ini edit took (worker B, Nov 16): after `mark` in this spot's proxy.log, a line holding
+        want["reloaded"] (such as "settings reloaded (... skip unplaced 1, skip moving 0)"), then at least
+        want["count"] lines holding want["after"] (such as "lightpub: stray"). Raises when the reload line is missing,
+        so the step is never measured on settings that did not load."""
+        reloaded, after, count = want["reloaded"], want.get("after", ""), int(want.get("count", 0))
+        found: dict = {}
+        last = [0.0]
+
+        def seen() -> bool:
+            if time.monotonic() - last[0] < 0.5:   # proxy.log can be megabytes; read it twice a second, not 20 times
+                return False
+            last[0] = time.monotonic()
+            lines = self.log.new_text()[mark:].splitlines()
+            at = next((i for i, line in enumerate(lines) if reloaded in line), None)
+            if at is None:
+                return False
+            found["reloadLine"] = lines[at]
+            found["afterLines"] = [line for line in lines[at + 1:] if after and after in line]
+            return len(found["afterLines"]) >= count
+        self.hold(float(want.get("timeout", 60)), until=seen)
+        if "reloadLine" not in found:
+            raise RuntimeError(f"no proxy.log line '{reloaded}' after the ini edit")
+        if len(found["afterLines"]) < count:
+            found["short"] = f"{len(found['afterLines'])} of {count} '{after}' lines before the timeout"
+        return found
 
     def light_switch(self, flip: dict) -> None:
         """Faces the reference pose, presses the use key (the spot stands Sam at a light switch) and records the
@@ -1034,7 +1065,9 @@ def main() -> int:
                     back = time.monotonic() + 3.0   # the trials alternate direction; put the camera back on the stop
                     while not s.pose(s.yaw, s.pitch) and time.monotonic() < back:
                         time.sleep(0.008)
-            if spot.get("switchTest") and not a.no_remix:   # the switches are Remix settings
+            # "switchAfterLight": the switches run after the light switch, at the same stop (worker B, Nov 16).
+            late = bool(spot.get("switchAfterLight"))
+            if spot.get("switchTest") and not a.no_remix and not late:   # the switches are Remix settings
                 s.switch_test()
             if not spot.get("switchOnly"):
                 s.sweep_and_pan()
@@ -1042,6 +1075,8 @@ def main() -> int:
                     s.goggles()
             if spot.get("lightSwitch"):
                 s.light_switch(spot["lightSwitch"])
+            if spot.get("switchTest") and not a.no_remix and late:
+                s.switch_test()
     except Exception as e:   # recorded in spot.json; gate.py fails the spot
         result["error"] = f"{type(e).__name__}: {e}"
         print("SPOT ERROR", result["error"])

@@ -273,6 +273,42 @@ class Reference(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "inconsistent"):
             calibrate([40.0, 100.0, 40.0, 100.0, 40.0, 100.0], True)
 
+    def test_live_ini_step_needs_its_own_reload_line_then_stray_lines(self):
+        import types
+        want = {"reloaded": "settings reloaded (scale 1, stand-in skip unplaced 1, skip moving 0)",
+                "after": "lightpub: stray", "count": 2, "timeout": 30}
+        old = "lightpub: settings reloaded (scale 1, stand-in skip unplaced 1, skip moving 0)\nlightpub: stray a\n"
+
+        def run(chunks):
+            # the log grows by one chunk per check; text before `mark` is from earlier steps and must not count
+            text = [old]
+            feed = iter(chunks)
+            def new_text():
+                return text[0]
+            s = drive.Spot.__new__(drive.Spot)
+            s.log = types.SimpleNamespace(new_text=new_text)
+            def hold(seconds, until=None):
+                for _ in range(len(chunks) + 1):
+                    if until():
+                        return
+                    text[0] += next(feed, "")
+            s.hold = hold
+            clock = iter(range(0, 10_000, 1))
+            with mock.patch.object(drive.time, "monotonic", lambda: float(next(clock))):
+                return s.await_log(want, len(old))
+
+        # the setting did not load: the reload line shows the old value, so the step must not be measured
+        with self.assertRaisesRegex(RuntimeError, "no proxy.log line"):
+            run(["lightpub: stray b\n", "lightpub: settings reloaded (scale 1, stand-in skip unplaced 0, skip moving 0)\n",
+                 "lightpub: stray c\n", "lightpub: stray d\n"])
+        # a stray line before the reload belongs to the previous settings
+        got = run(["lightpub: stray b\n", "lightpub: settings reloaded (scale 1, stand-in skip unplaced 1, skip moving 0)\n",
+                   "lightpub: stray c\n", "lightpub: stray d\n"])
+        self.assertEqual(got["afterLines"], ["lightpub: stray c", "lightpub: stray d"])
+        self.assertNotIn("short", got)
+        got = run(["lightpub: settings reloaded (scale 1, stand-in skip unplaced 1, skip moving 0)\n", "lightpub: stray c\n"])
+        self.assertIn("1 of 2", got["short"])
+
     def test_rt_off_picture_needs_ten_frames_not_ray_traced(self):
         import json, os, tempfile, types
         def spot_with(flags):
