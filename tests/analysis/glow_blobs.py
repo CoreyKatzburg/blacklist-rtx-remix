@@ -24,17 +24,50 @@ Rule:
      original has). Any other blob is counted. PASS when the count is at most ALLOWED, else FAIL.
 Output: one line "glow_blobs: unmatched N of M blobs (...)", then one line per unmatched blob.
 
+Second count, puffs (coordinator, Nov 16: Corey's "lights floating in mid air" may be large soft discs or starbursts,
+which rule 2 skips as too big):
+  5. Both pictures are averaged into 4x4 pixel cells; each cell's contrast is its value minus the median of the
+     15x15 cells (60x60 px) around it.
+  6. A cell is unexplained when its Remix contrast is at least PUFF_STEPS and the original's contrast in the same cell
+     stays under ORIG_STEPS (the original has no bright area there). A 4-connected group of unexplained cells
+     covering more than BLOB_MAX_PX pixels is one puff. PASS when there are at most ALLOWED puffs.
+  Limit: this also counts an area Remix lights that the original leaves dark (a lit room seen through a doorway),
+  because pictures alone cannot tell a glow from a lit surface.
+
+Third count, lost glows (the reverse direction; coordinator, Nov 16: switching every ball off must not pass when a
+lamp glow the original shows goes missing):
+  7. An original glow is a small blob found in the original by rules 1 and 2 (contrast >= BLOB_STEPS, <= BLOB_MAX_PX
+     pixels, inside the border, not the rim of a bigger bright area).
+  8. Remix shows it when, within MATCH_PX of its peak, Remix has its own bump of at least ORIG_STEPS, or Remix's
+     brightest pixel reaches KEEP_FRAC of the original's peak luma (the glow merged into a Remix area at least about
+     as bright). For a strong glow (original contrast >= STRONG_STEPS, a light source) the original's luma is first
+     scaled by the same local gain as rule 3, capped at 255, because Remix lights every wall brighter and a plain
+     brightened wall must not count as showing a lamp. Weaker original spots (Sam's buckles, wet-floor glints,
+     shadow edges; up to 90 steps at con_bright_hall) are compared unscaled, since Sam's idle pose and the
+     reflections differ between runs. Otherwise the glow is lost. PASS when at most ALLOWED are lost.
+  Measured on 142638 against 000454 (24 stills with a matching pose): erasing each original glow of contrast
+  >= 100 from the Remix still is counted lost 97 times of 105 (the 8 misses: 5 lamps wider than the erased disc,
+  3 in Remix areas above 191 luma); unedited stills count 1 lost, a lamp reflection in a wet-floor stain that
+  Remix does not draw (y180_p-30, x 305 y 104).
+
+HUD: with --orig-spot, pixels that stand out (contrast >= ORIG_STEPS) at the same screen place in at least half of
+the original spot's stills, although the camera turned between them, are the HUD; the mask is that set grown by 2 px
+with enclosed holes (the radar disc) filled. Blobs, puffs and glows whose peak lies on the HUD are skipped in all
+three counts. Without --orig-spot (two files) there is no HUD mask, and the output says so.
+The verdict is PASS only when all three counts pass.
+
   --remix-spot / --orig-spot / --still [--orig-still]: instead of the files, two gate spot folders and a window name;
             the stills and both cameras come from spot.json and proxy_frames.csv, and the pose test always runs.
 Exit codes: 0 PASS, 1 FAIL, 2 NOT MEASURED.
-Limits: blobs over BLOB_MAX_PX and the rim of larger bright areas are skipped, so a large soft puff or a starburst
-merged into a bright area is not counted; the skipped counts are printed.
+Limits: the orb count skips blobs over BLOB_MAX_PX and the rim of larger bright areas (the skipped counts are
+printed); those are what the puff count is for. The puff count cannot tell a glow from a surface Remix lights and
+the original leaves dark. The lost count misses a lamp whose place Remix fills with an area of 191 luma or more.
 
 Usage: glow_blobs.py --remix R.gray --orig O.gray [--pose P] [--crops DIR]
        glow_blobs.py --remix-spot DIR --orig-spot DIR --still NAME [--orig-still NAME] [--crops DIR]
        glow_blobs.py --self-test
 """
-import argparse, json, math, pathlib, sys
+import argparse, json, math, pathlib, re, sys
 import numpy as np
 
 W, H = 320, 180
@@ -42,6 +75,9 @@ WIN = 25
 BLOB_STEPS, ORIG_STEPS, BLOB_MAX_PX, MATCH_PX, BORDER_PX, ALLOWED = 24.0, 12.0, 200, 6, 3, 0
 GAIN_MAX, RING_BRIGHT_MAX = 6.0, 0.2
 POSE_CM, POSE_DEG = 25.0, 1.5
+CELL, CELL_WIN, PUFF_STEPS = 4, 15, 24.0
+KEEP_FRAC, STRONG_STEPS = 0.75, 100.0
+HUD_MIN_STILLS = 8
 
 
 def still(path: pathlib.Path) -> np.ndarray:
@@ -87,29 +123,125 @@ def blobs(c: np.ndarray):
 YY, XX = np.mgrid[0:H, 0:W]
 
 
-def judge(remix: np.ndarray, orig: np.ndarray):
-    """Rows for every candidate blob, and counts of the blobs skipped by each rule."""
-    cr, br = contrast(remix)
-    co, bo = contrast(orig)
-    rows, skipped = [], {"big": 0, "border": 0, "area edge": 0}
-    for area, (y, x), peak in blobs(cr):
+def small_blobs(img, c, bg, hud, skipped):
+    """Blobs of contrast map c that rule 2 keeps, with the distance map around each peak; skips are tallied."""
+    for area, (y, x), peak in blobs(c):
         if area > BLOB_MAX_PX:
             skipped["big"] += 1
             continue
         if not (BORDER_PX <= x < W - BORDER_PX and BORDER_PX <= y < H - BORDER_PX):
             skipped["border"] += 1
             continue
+        if hud is not None and hud[y, x]:
+            skipped["hud"] += 1
+            continue
         d = np.hypot(YY - y, XX - x)
-        ring = remix[(d >= 6) & (d <= 12)]
-        if np.mean(ring > br[y, x] + 0.5 * peak) > RING_BRIGHT_MAX:
+        ring = img[(d >= 6) & (d <= 12)]
+        if np.mean(ring > bg[y, x] + 0.5 * peak) > RING_BRIGHT_MAX:
             skipped["area edge"] += 1
             continue
+        yield area, y, x, peak, d
+
+
+def judge(remix: np.ndarray, orig: np.ndarray, hud=None):
+    """Rows for every candidate blob, and counts of the blobs skipped by each rule."""
+    cr, br = contrast(remix)
+    co, bo = contrast(orig)
+    rows, skipped = [], {"big": 0, "border": 0, "hud": 0, "area edge": 0}
+    for area, y, x, peak, d in small_blobs(remix, cr, br, hud, skipped):
         orig_bump = float(co[d <= MATCH_PX].max())
         gain = float(np.clip((br[y, x] + 1.0) / (bo[y, x] + 1.0), 1.0, GAIN_MAX))
         excess = peak - gain * max(orig_bump, 0.0)
         rows.append({"x": x, "y": y, "area": area, "peak": peak, "orig": orig_bump, "gain": gain,
                      "excess": excess, "matched": orig_bump >= ORIG_STEPS or excess < BLOB_STEPS})
     return rows, skipped
+
+
+def lost_glows(remix: np.ndarray, orig: np.ndarray, hud=None):
+    """Rules 7 and 8: rows for every original glow, with "lost" set when Remix does not show it."""
+    cr, br = contrast(remix)
+    co, bo = contrast(orig)
+    rows, skipped = [], {"big": 0, "border": 0, "hud": 0, "area edge": 0}
+    for area, y, x, peak, d in small_blobs(orig, co, bo, hud, skipped):
+        near = d <= MATCH_PX
+        bump, top = float(cr[near].max()), float(remix[near].max())
+        gain = float(np.clip((br[y, x] + 1.0) / (bo[y, x] + 1.0), 1.0, GAIN_MAX)) if peak >= STRONG_STEPS else 1.0
+        need = KEEP_FRAC * min(255.0, gain * float(orig[y, x]))
+        rows.append({"x": x, "y": y, "area": area, "peak": peak, "orig_luma": float(orig[y, x]), "gain": gain,
+                     "need": need, "remix_bump": bump, "remix_top": top, "lost": bump < ORIG_STEPS and top < need})
+    return rows, skipped
+
+
+def cell_contrast(img: np.ndarray):
+    h, w = H // CELL, W // CELL
+    s = img[: h * CELL, : w * CELL].reshape(h, CELL, w, CELL).mean(axis=(1, 3))
+    r = CELL_WIN // 2
+    win = np.lib.stride_tricks.sliding_window_view(np.pad(s, r, mode="edge"), (CELL_WIN, CELL_WIN))
+    return s - np.median(win.reshape(h, w, -1), axis=2)
+
+
+def puffs(remix: np.ndarray, orig: np.ndarray, hud=None):
+    """Rules 5 and 6: one row per group of unexplained cells larger than BLOB_MAX_PX pixels."""
+    cr, co = cell_contrast(remix), cell_contrast(orig)
+    mask = (cr >= PUFF_STEPS) & (co < ORIG_STEPS)
+    rows, skipped = [], {"hud": 0}
+    h, w = mask.shape
+    seen = np.zeros_like(mask)
+    for y0, x0 in zip(*np.nonzero(mask)):
+        if seen[y0, x0]:
+            continue
+        stack, cells = [(y0, x0)], []
+        seen[y0, x0] = True
+        while stack:
+            y, x = stack.pop()
+            cells.append((y, x))
+            for yy, xx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= yy < h and 0 <= xx < w and mask[yy, xx] and not seen[yy, xx]:
+                    seen[yy, xx] = True
+                    stack.append((yy, xx))
+        if len(cells) * CELL * CELL <= BLOB_MAX_PX:
+            continue
+        ys, xs = np.array(cells).T
+        k = int(np.argmax(cr[ys, xs]))
+        py, px = int(ys[k] * CELL + CELL // 2), int(xs[k] * CELL + CELL // 2)
+        if hud is not None and hud[py, px]:
+            skipped["hud"] += 1
+            continue
+        rows.append({"x": px, "y": py, "area": len(cells) * CELL * CELL, "x0": int(xs.min() * CELL),
+                     "y0": int(ys.min() * CELL), "x1": int(xs.max() * CELL + CELL), "y1": int(ys.max() * CELL + CELL),
+                     "remix": float(cr[ys, xs].mean()), "orig": float(co[ys, xs].mean())})
+    return rows, skipped
+
+
+def hud_mask(stills):
+    """Pixels that stand out at the same screen place in at least half of the stills (the HUD), grown by 2 px, with
+    enclosed holes filled; None when there are fewer than HUD_MIN_STILLS stills to tell the HUD from the scene."""
+    if len(stills) < HUD_MIN_STILLS:
+        return None
+    m = (np.stack([contrast(s)[0] for s in stills]) >= ORIG_STEPS).mean(axis=0) >= 0.5
+    grown = m.copy()
+    for dy in range(-2, 3):
+        for dx in range(-2, 3):
+            grown |= np.roll(np.roll(m, dy, 0), dx, 1)
+    outside = np.zeros_like(grown)
+    stack = [(y, x) for y in range(H) for x in (0, W - 1)] + [(y, x) for x in range(W) for y in (0, H - 1)]
+    stack = [(y, x) for y, x in stack if not grown[y, x]]
+    for y, x in stack:
+        outside[y, x] = True
+    while stack:
+        y, x = stack.pop()
+        for yy, xx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= yy < H and 0 <= xx < W and not grown[yy, xx] and not outside[yy, xx]:
+                outside[yy, xx] = True
+                stack.append((yy, xx))
+    return ~outside
+
+
+def spot_hud(spot: pathlib.Path):
+    """HUD mask from the spot's turn stills (windows named y<yaw>_p<pitch>, each at a different camera direction)."""
+    wins = json.loads((spot / "spot.json").read_text()).get("windows", [])
+    return hud_mask([still(spot / w["frames"]) for w in wins if re.fullmatch(r"y-?\d+_p-?\d+", w["name"])
+                     and w.get("frames") and (spot / w["frames"]).exists()])
 
 
 def spot_still(spot: pathlib.Path, name: str):
@@ -156,6 +288,45 @@ def report(rows, skipped, out=print) -> bool:
     return ok
 
 
+def report_puffs(rows, skipped, out=print) -> bool:
+    ok = len(rows) <= ALLOWED
+    out(f"glow_blobs: puffs {len(rows)} (bright areas over {BLOB_MAX_PX} px, Remix cell contrast >= {PUFF_STEPS:g} "
+        f"where the original's stays < {ORIG_STEPS:g}; skipped {skipped['hud']} hud): {'PASS' if ok else 'FAIL'}")
+    for r in sorted(rows, key=lambda r: -r["area"]):
+        out(f"  puff at x {r['x']} y {r['y']} (box {r['x0']},{r['y0']} to {r['x1']},{r['y1']}): area {r['area']} px, "
+            f"Remix contrast {r['remix']:.1f}, original {r['orig']:.1f}")
+    return ok
+
+
+def report_lost(rows, skipped, out=print) -> bool:
+    bad = [r for r in rows if r["lost"]]
+    ok = len(bad) <= ALLOWED
+    skip = ", ".join(f"{v} {k}" for k, v in skipped.items())
+    out(f"glow_blobs: lost {len(bad)} of {len(rows)} original glows (skipped {skip}; Remix bump < {ORIG_STEPS:g} and "
+        f"Remix luma < {KEEP_FRAC:g} x the original's, gain-matched from contrast {STRONG_STEPS:g}): "
+        f"{'PASS' if ok else 'FAIL'}")
+    for r in sorted(bad, key=lambda r: -r["peak"]):
+        out(f"  lost at x {r['x']} y {r['y']}: area {r['area']} px, original contrast {r['peak']:.1f} luma "
+            f"{r['orig_luma']:.0f} x gain {r['gain']:.2f}, Remix bump {r['remix_bump']:.1f} luma {r['remix_top']:.0f} "
+            f"(needed {r['need']:.0f})")
+    return ok
+
+
+def check_all(remix, orig, hud, out=print):
+    """All three counts; returns (verdict, orbs unmatched, puffs, lost)."""
+    out(f"glow_blobs: hud mask {'none' if hud is None else f'{int(hud.sum())} px'}")
+    rows, skipped = judge(remix, orig, hud)
+    ok1 = report(rows, skipped, out)
+    prow, pskip = puffs(remix, orig, hud)
+    ok2 = report_puffs(prow, pskip, out)
+    lrow, lskip = lost_glows(remix, orig, hud)
+    ok3 = report_lost(lrow, lskip, out)
+    ok = ok1 and ok2 and ok3
+    n = (sum(not r["matched"] for r in rows), len(prow), sum(r["lost"] for r in lrow))
+    out(f"glow_blobs: {'PASS' if ok else 'FAIL'} (orbs unmatched {n[0]}, puffs {n[1]}, lost glows {n[2]})")
+    return ok, n
+
+
 def crops(rows, remix, orig, outdir: pathlib.Path, k=3, half=20, scale=6):
     """Remix | original crop pairs around the k blobs with the largest excess."""
     from PIL import Image
@@ -190,15 +361,28 @@ def _dot(img, x, y, amp=80.0, sigma=1.6):
 def self_test() -> int:
     fails = []
 
+    def tally(name, good, line):
+        print(f"{'ok  ' if good else 'FAIL'} {name}: {line}")
+        if not good:
+            fails.append(name)
+
     def case(name, remix, orig, want_ok, want_unmatched):
         rows, skipped = judge(remix.astype(np.float32), orig.astype(np.float32))
         lines = []
         ok = report(rows, skipped, out=lines.append)
-        n = sum(not r["matched"] for r in rows)
-        good = ok == want_ok and n == want_unmatched
-        print(f"{'ok  ' if good else 'FAIL'} {name}: {lines[0]}")
-        if not good:
-            fails.append(name)
+        tally(name, ok == want_ok and sum(not r["matched"] for r in rows) == want_unmatched, lines[0])
+
+    def puff_case(name, remix, orig, want):
+        rows, skipped = puffs(remix.astype(np.float32), orig.astype(np.float32))
+        lines = []
+        report_puffs(rows, skipped, out=lines.append)
+        tally(name, len(rows) == want, lines[0])
+
+    def lost_case(name, remix, orig, want, hud=None):
+        rows, skipped = lost_glows(remix.astype(np.float32), orig.astype(np.float32), hud)
+        lines = []
+        report_lost(rows, skipped, out=lines.append)
+        tally(name, sum(r["lost"] for r in rows) == want, lines[0])
 
     base = _scene()
     orig = base * 0.4                                         # the original is darker overall
@@ -220,36 +404,82 @@ def self_test() -> int:
          base + np.where((abs(XX - 60) < 15) & (abs(YY - 40) < 15), 90, 0), orig, True, 0)
     case("an orb in the 3 px border is skipped", _dot(base, 1, 90), orig, True, 0)
     ok, *_ = pose_ok("0,0,0,-90,0;0,0,0,-87,0")
-    print(f"{'ok  ' if not ok else 'FAIL'} a 3 degree pose difference is refused")
-    if ok:
-        fails.append("pose")
+    tally("a 3 degree pose difference is refused", not ok, "pose_ok says " + str(ok))
+
+    # Puffs (rules 5 and 6).
+    disc = lambda img, x, y, amp=50.0, r=12: img + amp / (1 + np.exp((np.hypot(XX - x, YY - y) - r) / 1.5))
+    puff_case("a soft disc of radius 12 px that only Remix shows is one puff", disc(base, 150, 90), orig, 1)
+    puff_case("the same disc in both pictures (original 2.5x darker) is not a puff",
+              disc(base, 150, 90), disc(orig, 150, 90, amp=20), 0)
+    puff_case("a small orb is not a puff (the orb count has it)", _dot(base, 150, 90), orig, 0)
+    puff_case("no puff: Remix and original agree", base, orig, 0)
+
+    # Lost glows (rules 7 and 8).
+    lamp = _dot(orig, 100, 60, amp=120)                       # a strong lamp glow in the original, contrast about 120
+    lost_case("a lamp the original shows on a dark wall, Remix shows only the wall (2.5x) is lost", base, lamp, 1)
+    lost_case("a lamp on a wall Remix lights 6x (above 0.75 x the lamp's own luma) is still lost", base * 2.5, lamp, 1)
+    lost_case("Remix shows the lamp (brighter) is not lost", _dot(base, 100, 60, amp=150), lamp, 0)
+    lost_case("Remix shows the lamp 2 px off is not lost", _dot(base, 102, 61, amp=60), lamp, 0)
+    merged = np.where((abs(XX - 100) < 20) & (abs(YY - 60) < 20), 230.0, base)
+    lost_case("the lamp merged into a Remix area of 230 luma is not lost", merged, lamp, 0)
+    lost_case("a weak original highlight (contrast 60, a buckle or glint) on a wall Remix lights brighter is not lost",
+              base * 2.5, _dot(orig, 100, 60, amp=60), 0)
+    hud = (np.hypot(XX - 100, YY - 60) <= 8)
+    lost_case("an original-only glow on the HUD mask is not lost", base, lamp, 0, hud)
+    lost_case("no glow lost: Remix and original agree", base, orig, 0)
 
     # Real pictures (coordinator, Nov 16): run 20261115-142638 con_bright_hall against the original game's picture in
     # reference-20261116-000454 at the same pose. Missing data fails the self-test rather than skipping it.
+    global STRONG_STEPS
     gate = pathlib.Path(r"D:\BlacklistOverhaul\experiments\remix-gate")
     rx_spot, og_spot = gate / "20261115-142638" / "con_bright_hall", gate / "reference-20261116-000454" / "con_bright_hall"
     try:
+        og_hud = spot_hud(og_spot)
         og_y0, og_y0_pose = spot_still(og_spot, "y0_p0")
 
-        def real(name, remix_win, want_ok, check=None, orig=(og_y0, og_y0_pose)):
-            img, pose = spot_still(rx_spot, remix_win)
+        def real(name, remix_win, want, check=None, orig=(og_y0, og_y0_pose), spot=rx_spot, edit=None):
+            """want: (verdict, orbs unmatched, puffs, lost), each None for "any"."""
+            img, pose = spot_still(spot, remix_win)
+            if edit:
+                img = edit(img)
             pok, *_ = pose_ok((pose, orig[1]))
-            rows, skipped = judge(img, orig[0])
             lines = []
-            ok = report(rows, skipped, out=lines.append)
-            good = pok and ok == want_ok and (check is None or check(rows))
-            print(f"{'ok  ' if good else 'FAIL'} {name}: {'' if pok else 'pose mismatch; '}{lines[0]}")
-            if not good:
-                fails.append(name)
+            ok, n = check_all(img, orig[0], og_hud, out=lines.append)
+            got = (ok, *n)
+            good = pok and all(w is None or w == g for w, g in zip(want, got)) and (check is None or check(img, orig[0]))
+            tally(name, good, ("" if pok else "pose mismatch; ") + lines[-1])
 
-        real("142638 y0_p0 (stand-in balls on) fails", "y0_p0", False)
-        real("142638 switch step with the balls off (FlareStandIns=0) passes", "switch_flare_balls_off", True)
-        lamp = lambda rows: any(abs(r["x"] - 196) <= 3 and abs(r["y"] - 57) <= 3 and r["matched"] for r in rows)
+        tally("the HUD mask is built from the original spot's turn stills", og_hud is not None and og_hud.sum() > 500,
+              f"{'none' if og_hud is None else int(og_hud.sum())} px")
+        real("142638 y0_p0 (stand-in balls on) fails on orbs", "y0_p0", (False, 12, None, 0))
+        real("142638 switch step with the balls off (FlareStandIns=0) passes all three counts",
+             "switch_flare_balls_off", (True, 0, 0, 0))
+        real("142638 switch_base fails, and has a puff", "switch_base", (False, None, None, 0),
+             lambda r, o: len(puffs(r, o, og_hud)[0]) >= 1)
+        lamp = lambda r, o: any(abs(x["x"] - 196) <= 3 and abs(x["y"] - 57) <= 3 and x["matched"]
+                                for x in judge(r, o, og_hud)[0])
         real("142638 y180_p0: the ceiling strip lamp at x 196 y 57, which the original shows, is judged and not counted",
-             "y180_p0", False, lamp, spot_still(og_spot, "y180_p0"))
+             "y180_p0", (False, None, None, 0), lamp, spot_still(og_spot, "y180_p0"))
+        real("063147 y0_p0 (scene black while shaders compile, only glows drawn) fails the lost count",
+             "y0_p0", (False, None, None, None), lambda r, o: sum(x["lost"] for x in lost_glows(r, o, og_hud)[0]) >= 3,
+             spot=gate / "20261116-063147" / "con_bright_hall")
+
+        def erase(x, y, r=9):
+            def f(img):
+                return np.where(np.hypot(YY - y, XX - x) <= r, contrast(img)[1], img)
+            return f
+        # The original's ceiling lamp at x 37 y 8 (contrast 129, luma 137) erased from the Remix still: Remix's wall
+        # there is brighter than 0.75 x 137, so only the gain-matched rule for strong glows sees it go.
+        real("142638 y0_p0 with the original's ceiling lamp at x 37 y 8 erased from Remix: lost 1",
+             "y0_p0", (False, 12, None, 1), edit=erase(37, 8))
+        saved, STRONG_STEPS = STRONG_STEPS, float("inf")
+        try:
+            real("broken version (no gain matching for strong glows) misses that erased lamp: lost 0",
+                 "y0_p0", (False, 12, None, 0), edit=erase(37, 8))
+        finally:
+            STRONG_STEPS = saved
     except (OSError, SystemExit) as e:
-        print(f"FAIL real-picture cases: data missing ({e})")
-        fails.append("real-picture data")
+        tally("real-picture cases", False, f"data missing ({e})")
     print("self-test:", "all passed" if not fails else f"FAILED {fails}")
     return 1 if fails else 0
 
@@ -267,11 +497,11 @@ def main():
     ap.add_argument("--orig-still")
     ap.add_argument("--crops", type=pathlib.Path)
     a = ap.parse_args()
-    pose = a.pose
+    pose, hud = a.pose, None
     if a.remix_spot and a.orig_spot and a.still:
         remix, rpose = spot_still(a.remix_spot, a.still)
         orig, opose = spot_still(a.orig_spot, a.orig_still or a.still)
-        pose = (rpose, opose)
+        pose, hud = (rpose, opose), spot_hud(a.orig_spot)
     elif a.remix and a.orig:
         remix, orig = still(a.remix), still(a.orig)
     else:
@@ -281,10 +511,9 @@ def main():
         if not ok:
             print(f"glow_blobs: NOT MEASURED, poses differ by {dist:.0f} cm, yaw {dyaw:.2f}, pitch {dpitch:.2f} deg")
             sys.exit(2)
-    rows, skipped = judge(remix, orig)
-    ok = report(rows, skipped)
+    ok, _ = check_all(remix, orig, hud)
     if a.crops:
-        for p in crops(rows, remix, orig, a.crops):
+        for p in crops(judge(remix, orig, hud)[0], remix, orig, a.crops):
             print(f"crop {p}")
     sys.exit(0 if ok else 1)
 
