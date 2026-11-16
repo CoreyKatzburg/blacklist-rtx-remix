@@ -12,7 +12,9 @@ Checks (thresholds in THRESHOLDS):
                            [0.60x, 1.50x], near-white delta <= +0.10, floor >= 0.03; NOT MEASURED without raster
   neon_fraction            worst dump's share of clipped, strongly coloured pixels: max channel >= 1.0 and
                            (max - min) / max >= 0.5 (white highlights are allowed, neon colours are not)
-  skinned_min              fewest active character meshes in any frame (telemetry skinnedInstances)
+  skinned_min              fewest active character meshes in any frame where proxy skinnedSceneDraws > 0
+  remix_dropped_character_frames  frames outside goggles where Remix has 0 skinned instances while proxy sent
+                           skinnedSceneDraws > 0 on that frame and 3 frames either side (must be 0)
   outline_overlap          Sam's near-field depth outline, the game's own depth (= Remix off) against Remix's depth
                            of the same frame, before and after the close-camera sweep: share of the game's outline
                            pixels that have a Remix outline pixel within 2 px
@@ -69,7 +71,8 @@ import sys
 import numpy as np
 
 THRESHOLDS = {
-    "nan_pixels": 0, "neon_fraction": 0.001, "skinned_min": 1, "outline_overlap": 0.85, "inward_fraction": 0.005,
+    "nan_pixels": 0, "neon_fraction": 0.001, "skinned_min": 1, "remix_dropped_character_frames": 0,
+    "outline_overlap": 0.85, "inward_fraction": 0.005,
     "raster_fallback_frames": 0, "flashes": 0, "still_block_jitter": 4.0, "still_luma_drift": 6.0,
     "still_block_pulse": 16.0, "still_block_step4": 6.0,
     "static_blas_rebuilds": 0,
@@ -407,16 +410,10 @@ def is_proxy_loading(spot: dict, pf: int, no_remix: bool = False) -> bool:
     return False
 
 
-def is_loading_frame(spot: dict, w: dict, idx: int, n_tids: int, no_remix: bool = False) -> bool:
-    """True when every proxy frame that telemetry index `idx` in window `w` could map to is a loading-screen frame.
-    Fails closed (False) if proxy data is missing."""
-    pids = frames_in(w, "proxy")
-    if not pids:
-        return False
-    m = len(pids)
-    lo = max(0, min(idx, idx + m - n_tids))
-    hi = min(m - 1, max(idx, idx + m - n_tids))
-    return all(is_proxy_loading(spot, pids[j], no_remix=no_remix) for j in range(lo, hi + 1))
+def is_loading_frame(spot: dict, tf: int, no_remix: bool = False) -> bool:
+    """True when the proxy row with the same frame number `tf` explicitly shows a loading screen.
+    When that row is absent, returns False (unknown -> never excuses a hitch)."""
+    return is_proxy_loading(spot, tf, no_remix=no_remix)
 
 
 def wrap(deg: float) -> float:
@@ -1008,10 +1005,9 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
             over_nonload, excluded_load = 0, 0
             for s, w in measured_pairs:
                 tel = s["_data"]["telemetry"]
-                tids = frames_in(w, "telemetry")
-                for idx, tf in enumerate(tids):
+                for tf in frames_in(w, "telemetry"):
                     if tel[tf]["frameTimeMs"] > 50.0:
-                        if is_loading_frame(s, w, idx, len(tids), no_remix=no_remix):
+                        if is_loading_frame(s, tf, no_remix=no_remix):
                             excluded_load += 1
                         else:
                             over_nonload += 1
@@ -1049,9 +1045,47 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
                 f" ({excluded_p} loading-screen frames excluded)" if excluded_p else "")
             run.add("present_stalls", PASS if stalls <= THRESHOLDS["present_stalls_max"] else FAIL,
                     stalls, "0", detail, "d3d9_proxy_frames.csv")
-    telemetry_check("skinned_min", pick(SCENE), "skinnedInstances",
-                    lambda v: (min(v), min(v) >= THRESHOLDS["skinned_min"]),
-                    ">= 1 every frame", lambda v, n: f"fewest character meshes in {n} frames: {v}")
+    # skinned_min & remix_dropped_character_frames: join telemetry skinnedInstances with proxy_gate skinnedSceneDraws
+    scene_pairs_list = pick(SCENE)
+    if not scene_pairs_list:
+        run.add("skinned_min", NOT_MEASURED, None, ">= 1 every frame", "no windows of this kind were run", tsrc)
+        run.add("remix_dropped_character_frames", NOT_MEASURED, None, "0", "no windows of this kind were run", tsrc)
+    else:
+        want_sk, recs_sk = coverage(scene_pairs_list, "telemetry", "telemetry")
+        have_sk = sum(1 for r in recs_sk if isinstance(r.get("skinnedInstances"), (int, float)))
+        want_pg, pg_rows = coverage(scene_pairs_list, "proxy", "pgate")
+        have_pg = sum(1 for r in pg_rows if len(r) >= 3)
+        if want_sk == 0 or have_sk < want_sk or want_pg == 0 or have_pg < want_pg:
+            msg = (f"telemetry has {have_sk} of {want_sk} frames with 'skinnedInstances', "
+                   f"proxy_gate has {have_pg} of {want_pg}")
+            run.add("skinned_min", NOT_MEASURED, None, ">= 1 every frame", msg, tsrc)
+            run.add("remix_dropped_character_frames", NOT_MEASURED, None, "0", msg, tsrc)
+        else:
+            sk_vals, dropped_chars, n_char_frames = [], 0, 0
+            for s, w in scene_pairs_list:
+                tel, pg = s["_data"]["telemetry"], s["_data"]["pgate"]
+                for tf in frames_in(w, "telemetry"):
+                    if tf in pg and len(pg[tf]) >= 3 and int(pg[tf][2]) > 0:
+                        n_char_frames += 1
+                        sk_inst = int(tel[tf]["skinnedInstances"])
+                        sk_vals.append(sk_inst)
+                        if sk_inst == 0 and all(
+                            f in pg and len(pg[f]) >= 3 and int(pg[f][2]) > 0 for f in range(tf - 3, tf + 4)
+                        ):
+                            dropped_chars += 1
+            if not sk_vals:
+                run.add("skinned_min", NOT_MEASURED, None, ">= 1 every frame",
+                        f"0 of {want_sk} scene frames had proxy skinnedSceneDraws > 0", tsrc)
+            else:
+                min_sk = min(sk_vals)
+                run.add("skinned_min", PASS if min_sk >= THRESHOLDS["skinned_min"] else FAIL,
+                        min_sk, ">= 1 every frame",
+                        f"fewest character meshes in {n_char_frames} proxy-drawn frames: {min_sk}", tsrc)
+            run.add("remix_dropped_character_frames",
+                    PASS if dropped_chars <= THRESHOLDS["remix_dropped_character_frames"] else FAIL,
+                    dropped_chars, "0",
+                    f"{dropped_chars} of {want_sk} scene frames had 0 Remix skinnedInstances while proxy drew +/-3",
+                    f"{tsrc} + d3d9_proxy_gate.csv")
     telemetry_check("static_blas_rebuilds", pick(ROTATING), "staticBlasRebuilds",
                     lambda v: (sum(v), sum(v) <= THRESHOLDS["static_blas_rebuilds"]),
                     "0 while rotating", lambda v, n: f"{v} rebuilds in {n} rotating frames")

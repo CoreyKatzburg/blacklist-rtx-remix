@@ -587,7 +587,7 @@ def run_self_test() -> None:
     local_pulse = calm.copy()
     local_pulse[6:11, 16:32, 40:64] = np.clip(local_pulse[6:11, 16:32, 40:64] + 32.0, 0.0, 255.0)
     assert gate.find_flashes(local_pulse) == [], "expected find_flashes blind spot on 5-frame pulse"
-    old_bj, old_ld = gate.still_flicker(local_pulse)
+    old_bj, old_ld, _, _ = gate.still_flicker(local_pulse)
     assert old_bj <= PROPOSED_THRESHOLDS["still_block_jitter"] and old_ld <= PROPOSED_THRESHOLDS["still_luma_drift"]
     lp_ext = still_flicker_extended(local_pulse)
     assert lp_ext["block_pulse"] > PROPOSED_THRESHOLDS["still_block_pulse"], lp_ext
@@ -598,7 +598,7 @@ def run_self_test() -> None:
     sparse_strobe = calm.copy()
     sparse_strobe[2::4, 16:32, 40:56] = np.clip(sparse_strobe[2::4, 16:32, 40:56] + 10.0, 0.0, 255.0)
     assert gate.find_flashes(sparse_strobe) == [], "expected find_flashes blind spot below floor=12"
-    sbj, sld = gate.still_flicker(sparse_strobe)
+    sbj, sld, _, _ = gate.still_flicker(sparse_strobe)
     assert sbj <= PROPOSED_THRESHOLDS["still_block_jitter"] and sld <= PROPOSED_THRESHOLDS["still_luma_drift"]
     ss_ext = still_flicker_extended(sparse_strobe)
     assert ss_ext["block_step4"] > PROPOSED_THRESHOLDS["still_block_step4"], ss_ext

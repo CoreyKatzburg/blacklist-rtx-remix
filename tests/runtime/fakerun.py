@@ -94,10 +94,10 @@ class Builder:
         if c == "load_count_mismatch" and wname == "to_y45_p0" and i in (0, 1): rec["frameTimeMs"] = 120.0
         if c == "slow_beside_nonload" and wname == "to_y45_p0" and i == 0: rec["frameTimeMs"] = 120.0
         loading = ((c == "loading_in_window" and wname == "to_y45_p0" and i in (2, 3))
-                   or (c in ("load_count_mismatch", "slow_beside_nonload") and wname == "to_y45_p0" and i == 0))
+                   or (c == "load_count_mismatch" and wname == "to_y45_p0" and i == 0))
         if c == "loading_in_window" and loading: rec["frameTimeMs"] = 120.0
         if c in FRAME_TIMES: rec["frameTimeMs"], rec["gpuTimeMs"] = FRAME_TIMES[c]
-        if c == "no_skinned" and kind == "still" and i == 3: rec["skinnedInstances"] = 0
+        if c in ("no_skinned", "proxy_no_char_ok") and kind == "still" and i == 3: rec["skinnedInstances"] = 0
         if c == "blas_rebuild" and kind == "pan" and i == 50: rec["staticBlasRebuilds"] = 1
         if c == "inward" and kind == "move" and i == 2: rec["inwardSkinnedTriangles"] = 900
         if c == "flash_pan" and kind == "pan" and i == 40: img = np.clip(img + 70, 0, 255)
@@ -150,7 +150,8 @@ class Builder:
             self.proxy.append(f"{self.pframe},{clk:.3f},14.0,{pms},1500,1,P:22:0:1.0:2.0:3.0:{fx:.5f}:{fy:.5f}:{fz:.5f}:0.0")
             handoff = 0 if (c == "raster_flash" and kind == "pan" and i == 70) else 1
             sdraws = 0 if c == "noremix_scenedraws0" else 1400
-            self.pgate.append(f"{self.pframe},{sdraws},40,{handoff},{1 if goggles else 0},1")
+            skdraws = 0 if (c == "proxy_no_char_ok" and kind == "still" and i == 3) else 40
+            self.pgate.append(f"{self.pframe},{sdraws},{skdraws},{handoff},{1 if goggles else 0},1")
         return img
 
     def window(self, name: str, kind: str, n: int, extra=None, goggles=False, motion=None):
@@ -164,12 +165,19 @@ class Builder:
             self.tframe += 1
             rec = dict(self.telemetry[-1], frame=self.tframe, frameTimeMs=10.0)
             self.telemetry.append(rec)
-        if self.case == "slow_beside_nonload" and name == "to_y45_p0":
+            w = {"name": name, "kind": kind, "yaw": self.yaw, "pitch": self.pitch,
+                 "telemetry": [start[0], self.tframe], "proxy": [start[1], self.pframe], **(extra or {})}
             self.pframe += 1
-            self.proxy.append(f"{self.pframe}," + self.proxy[-1].split(",", 1)[1])
-            self.pgate.append(f"{self.pframe}," + self.pgate[-1].split(",", 1)[1])
-        w = {"name": name, "kind": kind, "yaw": self.yaw, "pitch": self.pitch,
-             "telemetry": [start[0], self.tframe], "proxy": [start[1], self.pframe], **(extra or {})}
+        elif self.case == "slow_missing_proxy" and name == "to_y45_p0":
+            self.tframe += 1
+            rec = dict(self.telemetry[-1], frame=self.tframe, frameTimeMs=120.0)
+            self.telemetry.append(rec)
+            w = {"name": name, "kind": kind, "yaw": self.yaw, "pitch": self.pitch,
+                 "telemetry": [start[0], self.tframe], "proxy": [start[1], self.pframe], **(extra or {})}
+            self.pframe += 1
+        else:
+            w = {"name": name, "kind": kind, "yaw": self.yaw, "pitch": self.pitch,
+                 "telemetry": [start[0], self.tframe], "proxy": [start[1], self.pframe], **(extra or {})}
         self.windows.append(w)
         return w, imgs
 
@@ -323,7 +331,8 @@ CASES = {
     "nan_pixel": (("nan_pixels", "scene_brightness"), ()),
     "nan_frame": (("nonfinite_thumb_pixels",), ()),
     "neon": (("neon_fraction",), ()),
-    "no_skinned": (("skinned_min",), ()),
+    "no_skinned": (("skinned_min", "remix_dropped_character_frames"), ()),
+    "proxy_no_char_ok": ((), ()),
     "sam_missing": (("outline_overlap",), ()),
     "inward": (("inward_fraction",), ()),
     "raster_flash": (("raster_fallback_frames",), ()),
@@ -341,7 +350,7 @@ CASES = {
     "short_row_in_window": ((), ("skip_occlusion_share", "skip_other_share", "present_stalls")),
     "cut_short_proxy": ((), ()),                          # last proxy row cut short mid-write: finishes and passes
     "load_count_mismatch": (("frames_over_50ms",), ()),   # 7 tel vs 6 proxy: 1 loading frame excuses only t0, t1 fails
-    "slow_beside_nonload": (("frames_over_50ms",), ()),   # 6 tel vs 7 proxy: t0 maps to [load, nonload] -> fails
+    "slow_missing_proxy": (("frames_over_50ms",), ()),    # slow frame whose frame number is absent from proxy -> fails
     "noremix_scenedraws0": (("frames_over_50ms",), ()),   # noRemix=True: sceneDraws=0 ignored, real camera + 120ms -> fails
     "low_fps": ((), ()),                                # WARN min_median_fps (WARNS); the gate passes
     "near_target_fps": ((), ()),                        # 89.96 FPS: WARN, must print 89.96 FPS not 90.0 FPS
@@ -368,19 +377,22 @@ CASES = {
     "quit_present_stall": (("clean_quit",), ()),
     "no_terminate": ((), ("clean_quit",)),
     "no_telemetry": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms",
-                          "skinned_min", "static_blas_rebuilds", "inward_fraction", "nonfinite_thumb_pixels",
+                          "skinned_min", "remix_dropped_character_frames", "static_blas_rebuilds",
+                          "inward_fraction", "nonfinite_thumb_pixels",
                           "goggles_toggle_rebuilds", "goggles_dark_frame", *RECORDER)),
     # Remix writing only every 15th frame: per-frame checks can't pass; flashes fall back to the screen captures
     "sparse_telemetry": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms",
-                              "skinned_min", "static_blas_rebuilds", "inward_fraction", "nonfinite_thumb_pixels",
+                              "skinned_min", "remix_dropped_character_frames", "static_blas_rebuilds",
+                              "inward_fraction", "nonfinite_thumb_pixels",
                               "goggles_toggle_rebuilds", "goggles_dark_frame", *RECORDER)),
     "renamed_fields": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms")),
     "no_dumps": ((), ("nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness", "outline_overlap")),
-    "no_proxy_gate": ((), ("raster_fallback_frames",)),
+    "no_proxy_gate": ((), ("raster_fallback_frames", "skinned_min", "remix_dropped_character_frames")),
     "no_thumbs": ((), ()),                       # still measurable from the screen captures (pan at full rate)
     "half_rate_capture": ((), ("flashes",)),     # screen capture saw half the game frames of the pan
     "spot_error": (("s1: setup",), ("frames_over_50ms", "present_stalls", "min_median_fps", "latency_overhead_ms",
-                                    "input_latency_ms", "skinned_min", "static_blas_rebuilds", "inward_fraction",
+                                    "input_latency_ms", "skinned_min", "remix_dropped_character_frames",
+                                    "static_blas_rebuilds", "inward_fraction",
                                     "nonfinite_thumb_pixels", "raster_fallback_frames", "flashes", "still_flicker",
                                     "nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
                                     "outline_overlap", "pose", "goggles", "goggles_toggle_rebuilds",
