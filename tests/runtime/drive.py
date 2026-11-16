@@ -1094,6 +1094,9 @@ class Spot:
                                 "-Out", os.path.join(self.out, smi_file), "-IntervalMs", "200", "-Query",
                                 "timestamp,memory.total,memory.used,memory.free,clocks.gr,clocks.mem,pstate,utilization.gpu"],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Wall-clock span of the frame capture (worker C, Nov 16): whole-process freezes of 3 to 5 s fell inside bench
+        # windows (sweep 113127: 05 frame 4012, 09 frames 4803 and 4804); these times rule the capture in or out.
+        capStart = clock()
         cap = start_capture(os.path.join(self.out, rel), fps=30, seconds=60.0)
         start = self.proxy.last_frame()
         try:
@@ -1106,6 +1109,9 @@ class Spot:
                     p.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     p.kill(); p.wait()
+            capEnd = clock()
+            print(f"BENCH CAPTURE {tag} start {capStart} end {capEnd}", flush=True)
+        w["captureClock"] = [capStart, capEnd]
         w["gameFrames"] = self.proxy.last_frame() - start
         w["gamePose"] = [self.rel_pose()]
         w["samMoved"] = self.sam_moved(tag)
@@ -1262,6 +1268,11 @@ class Spot:
         proc = subprocess.Popen([FFMPEG, "-v", "error", "-f", "gdigrab", "-framerate", str(grab_fps), "-draw_mouse", "0",
                                  "-offset_x", str(w // 4 - pw // 2), "-offset_y", str(h // 3 - ph // 2),
                                  "-video_size", f"{pw}x{ph}", "-i", "desktop", "-vf", "format=gray",
+                                 # passthrough: one output picture per real grab. ffmpeg's default constant frame rate
+                                 # filled every grab stall with copies of the last picture, sent in one burst (a 2 s
+                                 # stall: 263 shots in 300 ms, Nov 16), so Remix runs saw 5,700 to 7,000 repeated shots
+                                 # a second and timed turns by copies.
+                                 "-fps_mode", "passthrough",
                                  "-f", "rawvideo", "-"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
         shots: collections.deque = collections.deque(maxlen=600)
         arrivals = {"n": 0, "first": None, "last": None}   # the whole grab, since the deque keeps only the last 600
@@ -1299,8 +1310,9 @@ class Spot:
                     results.append({"error": "screen grab delivered under 10 shots a second"}); continue
                 if not any(img.any() for img in still):
                     results.append({"error": "screen grab is all black"}); continue
-                # More shots than gdigrab was asked for means it hands back the same picture again and again (monitors
-                # off, Nov 16 04:54 to 07:30: 5,700 to 7,000 shots a second, noise 0, 0 to 9 of 40 turns seen).
+                # More shots than gdigrab was asked for means it hands back the same picture again and again (Remix
+                # runs and monitors-off references, Nov 16: 5,700 to 7,142 shots a second, noise 0, 0 to 9 of 40 turns
+                # seen; cause: ffmpeg's constant-rate output, now passthrough). Kept as the guard if it comes back.
                 if len(still) > 2 * grab_fps * span_ms / 1000.0 + 2:
                     different = 1 + sum(bool(np.any(a != b)) for a, b in zip(still, still[1:]))
                     results.append({"error": f"screen grab repeats pictures (over {2 * grab_fps} shots a second, "
@@ -1647,6 +1659,12 @@ def main() -> int:
             front(hwnd)
             s._calibrate_mouse()
             result.update(s.bench(spot["bench"]))   # one pose per launch: nothing else
+            # bench "mouseLag": then the 20-turn input lag at the same stop (worker C, Nov 16: latency per setting).
+            if spot["bench"].get("mouseLag"):
+                front(hwnd)
+                lag: dict = {}
+                s.window("mouse_lag", "lag", lambda: lag.update(s.mouse_lag()))
+                result["mouse_lag"] = lag
             bad = [f"{c['name']}: {c['error']}" for c in result.get("captures", []) if c.get("error")]
             if bad:
                 result["error"] = "; ".join(bad)

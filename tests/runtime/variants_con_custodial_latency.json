@@ -1,0 +1,13 @@
+{
+ "about": "Worker C's input latency per setting (Nov 16, coordinator approved): one launch per variant at con_custodial y0_p0, the settings sweep's bench (settle 5 s, 150 frames, revisit) and then the 20-turn mouse_lag at the same stop (bench mouseLag). One setting changed against the play-setup baseline, plus two combinations. Read spot.json mouse_lag.samples_ms, the proxy frame logs, memory.csv and proxy_hitches.txt per launch. verify_runtime.ps1 -Variants <this file>.",
+ "spot": "con_custodial",
+ "bench": {"settle": 5, "frames": 150, "revisit": true, "mouseLag": true},
+ "variants": [
+  {"name": "01_base"},
+  {"name": "02_rr_cnn_0", "rtx": {"rtx.rayreconstruction.model": "0"}},
+  {"name": "03_dlss_balanced_2", "rtx": {"rtx.qualityDLSS": "2"}},
+  {"name": "04_dlss_perf_1", "rtx": {"rtx.qualityDLSS": "1"}},
+  {"name": "05_rr_cnn_0_dlss_balanced_2", "rtx": {"rtx.rayreconstruction.model": "0", "rtx.qualityDLSS": "2"}},
+  {"name": "06_rr_cnn_0_dlss_perf_1", "rtx": {"rtx.rayreconstruction.model": "0", "rtx.qualityDLSS": "1"}}
+ ]
+}
