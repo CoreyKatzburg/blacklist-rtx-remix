@@ -395,6 +395,21 @@ class Reference(unittest.TestCase):
             with mock.patch.object(drive, "start_capture", fake_capture(bytes(57600 * 20 - 1) + b"\x07")):
                 s.capture("dark.gray", 20)   # a nearly black room is still a picture
 
+    def test_bench_runs_the_light_switch_after_the_lit_room(self):
+        # Worker B's fog fade sweep: each variant launch needs the lit bench window first, then the fade.
+        s = drive.Spot.__new__(drive.Spot)
+        order = []
+        s.move = lambda *a: None
+        s.hold = lambda *a, **k: None
+        s.bench_window = lambda name, *a: order.append(name)
+        s.window = lambda name, kind, body, **k: order.append(name)
+        s.light_switch = lambda flip: order.append(("light_switch", flip["dumpsAt"]))
+        s.bench({"settle": 0, "frames": 1, "lightSwitch": {"key": "SPACE", "seconds": 20, "dumpsAt": [1, 18]}})
+        self.assertEqual(order, ["bench_y0_p0", "y0_p0", ("light_switch", [1, 18])])
+        order.clear()
+        s.bench({"settle": 0, "frames": 1})
+        self.assertNotIn("light_switch", [o[0] for o in order if isinstance(o, tuple)])
+
     def test_quit_keys_and_exit_wait(self):
         # Worker C's quit test: Alt+F4 must be a chord (Alt held while F4 goes down and up), and the arrows must be
         # the arrow block (extended), or the menu sees numpad keys.

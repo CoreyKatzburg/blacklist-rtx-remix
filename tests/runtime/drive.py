@@ -964,6 +964,10 @@ class Spot:
                 for k, v in keys.items():
                     set_ini(self.ini, "RemixConfig", k, str(v))
                 self.window(f"live_step{i + 1}", "still", lambda: self.hold(seconds), liveRtx=keys)
+        # cfg["lightSwitch"] (worker B, Nov 16, fog fade sweep at con_custodial): after the lit-room bench window, the
+        # light switch with its light dumps, so each variant launch also measures the fade (frames/light_switch.gray).
+        if cfg.get("lightSwitch"):
+            self.light_switch(cfg["lightSwitch"])
 
     def bench_window(self, name: str, want: int, tag: str, smi_file: str) -> dict:
         """One still window of at least `want` game frames with nvidia-smi sampling into `smi_file`."""
