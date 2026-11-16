@@ -385,6 +385,9 @@ private:
 // ramps down, or keeps publishing. Brightness is the game's peak colour x intensity. It counts as changed when it
 // moves more than kTraceRelativeStep from the last value written, so a slow ramp shows as a series of events.
 constexpr float kTraceRelativeStep = 0.05f;
+// A published light counts as dimmed while its brightness is below this fraction of the highest value it had since
+// it started publishing: the game has (nearly) switched it off but it still lights the Remix scene.
+constexpr float kDimFraction = 0.1f;
 
 enum class TraceChange { Started, Brightness, Flags, Stopped };
 
@@ -414,11 +417,17 @@ public:
         if (!e) {
             if (count_ == MaxTracked) return;
             e = &entries_[count_++];
-            *e = {node, brightness, flags, frame};
+            *e = {node, brightness, flags, frame, brightness, 0};
             emit(TraceEvent{node, TraceChange::Started, 0.0f, brightness, 0u, flags});
             return;
         }
         e->lastSeen = frame;
+        e->peak = std::max(e->peak, brightness);
+        if (!(brightness >= kDimFraction * e->peak)) {
+            if (!e->dimSince) e->dimSince = frame;
+        } else {
+            e->dimSince = 0;
+        }
         if (flags != e->flags) {
             emit(TraceEvent{node, TraceChange::Flags, e->brightness, e->brightness, e->flags, flags});
             e->flags = flags;
@@ -445,12 +454,25 @@ public:
 
     void Clear() { count_ = 0; }
 
+    // After Sweep: lights still published while dimmed, and the longest run of frames one of them has been dimmed
+    // (counting the frame it dimmed as 1).
+    void DimStats(uint32_t frame, uint32_t* dimmed, uint32_t* longestFrames) const {
+        *dimmed = *longestFrames = 0;
+        for (size_t i = 0; i < count_; ++i)
+            if (entries_[i].dimSince) {
+                ++*dimmed;
+                *longestFrames = std::max(*longestFrames, frame - entries_[i].dimSince + 1);
+            }
+    }
+
 private:
     struct Entry {
         uintptr_t node;
-        float brightness;
+        float brightness;   // last value written to the trace
         uint32_t flags;
         uint32_t lastSeen;
+        float peak;         // highest brightness seen
+        uint32_t dimSince;  // first frame of the current dimmed run, 0 when not dimmed
     };
     Entry* Find(uintptr_t node) {
         for (size_t i = 0; i < count_; ++i)
@@ -461,5 +483,94 @@ private:
     size_t count_ = 0;
 };
 
+// ---- Flare stand-ins and stray-light counts ---------------------------------------------------------------------
+// l3d::FlareNode fields (constructor FUN_01907250 and the saved dumps):
+//   +0x2C node flags. The constructor writes 0; placed flares read 7700. Bit 0 is set on 17 of 185 Consumption
+//         flares (63 of 209 on the Paladin), always together with +0x30 = -1 and a 0 byte at +0x3C, and 16 of those
+//         17 sit at the world origin: flares the scene never placed. No l3d code testing the bit was found, so
+//         what the game does with it is a guess.
+//   +0x30 index (constructor writes -1), +0x34 low bits (constructor sets bit 0 and clears 0xE; 0x2 = camera space),
+//   +0x84 float, +0x8C/+0x90 element array/count, +0xD4 world position.
+constexpr uint32_t kFlareNodeUnplaced = 0x1;   // +0x2C bit 0
+constexpr float kLampFlareRadiusCm = 100.0f;   // a lamp's glow card sits within a metre of its light
+constexpr float kFlareMovedCm = 0.5f;          // world lamp flares moved 0.00 cm between dumps, Sam's gear 0.9 cm+
+
+struct FlareData {
+    float pos[3] = {};
+    uint32_t nodeFlags = 0;      // +0x2C
+    uint32_t word34 = 0;         // +0x34
+    float peakIntensity = 0.0f;  // brightest element
+    float peakSize = 20.0f;      // that element's mean sprite size
+    bool moved = false;          // FlareMotion: has moved since first seen (hangs on Sam, a guard or a drone)
+};
+
+struct StandInOptions {
+    bool enabled = true;         // [Lights] FlareStandIns
+    bool skipUnplaced = false;   // [Lights] StandInSkipUnplaced: no ball on flares with +0x2C bit 0
+    bool skipMoving = false;     // [Lights] StandInSkipMoving: no ball on flares that move
+};
+
+// A glowing ball goes on a flare that has a bright element and is not a camera-space or sky-sized flare. The two
+// skips are off by default, which keeps the choice made before they existed.
+inline bool WantsStandIn(const FlareData& f, const StandInOptions& o) {
+    if (!o.enabled || (f.word34 & 0x2) || !(f.peakIntensity > 0.0f) || !(f.peakSize < 400.0f)) return false;
+    if (o.skipUnplaced && (f.nodeFlags & kFlareNodeUnplaced)) return false;
+    if (o.skipMoving && f.moved) return false;
+    return true;
+}
+
+// Remembers where each flare was first seen; a flare is "moved" from the first frame it is more than kFlareMovedCm
+// away from there, and stays so. Entries for flares not seen in a frame are dropped by Sweep.
+template <size_t MaxFlares>
+class FlareMotion {
+public:
+    bool Update(uintptr_t node, const float pos[3], uint32_t frame) {
+        Entry* e = nullptr;
+        for (size_t i = 0; i < count_ && !e; ++i)
+            if (entries_[i].node == node) e = &entries_[i];
+        if (!e) {
+            if (count_ == MaxFlares) return false;
+            e = &entries_[count_++];
+            *e = {node, {pos[0], pos[1], pos[2]}, frame, false};
+        }
+        e->lastSeen = frame;
+        const float d[3] = {pos[0] - e->first[0], pos[1] - e->first[1], pos[2] - e->first[2]};
+        if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > kFlareMovedCm * kFlareMovedCm) e->moved = true;
+        return e->moved;
+    }
+    void Sweep(uint32_t frame) {
+        for (size_t i = 0; i < count_;)
+            if (entries_[i].lastSeen != frame) entries_[i] = entries_[--count_];
+            else ++i;
+    }
+    void Clear() { count_ = 0; }
+
+private:
+    struct Entry {
+        uintptr_t node;
+        float first[3];
+        uint32_t lastSeen;
+        bool moved;
+    };
+    Entry entries_[MaxFlares] = {};
+    size_t count_ = 0;
+};
+
+// Published point/spot lights with no flare of any kind within kLampFlareRadiusCm. Many real fittings have no
+// flare (59 of about 123 in Consumption), so this is a count to watch for jumps, not a list of fake lights.
+inline uint32_t CountLampsWithoutFlare(const float (*lamps)[3], size_t lampCount, const FlareData* flares,
+                                       size_t flareCount) {
+    uint32_t lonely = 0;
+    for (size_t i = 0; i < lampCount; ++i) {
+        bool hasFlare = false;  // ("near" is a macro in windef.h)
+        for (size_t j = 0; j < flareCount && !hasFlare; ++j) {
+            const float d[3] = {lamps[i][0] - flares[j].pos[0], lamps[i][1] - flares[j].pos[1],
+                                lamps[i][2] - flares[j].pos[2]};
+            hasFlare = d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= kLampFlareRadiusCm * kLampFlareRadiusCm;
+        }
+        lonely += !hasFlare;
+    }
+    return lonely;
+}
 
 }  // namespace lightcal
