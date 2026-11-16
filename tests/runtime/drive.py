@@ -650,10 +650,11 @@ class Spot:
             raise RuntimeError(f"ray tracing was not off: rayTraced of the last {len(traced)} frames {traced}")
         return {"rayTracedLastFrames": traced}
 
-    def rt_is_on(self, timeout: float = 20.0) -> dict:
+    def rt_is_on(self, timeout: float = 60.0) -> dict:
         """Waits up to `timeout` s for Remix's last 10 telemetry frames to be ray traced; raises when they never are.
         Run 20261116-063147: con_bright_hall's launch never ray traced (the proxy logged "AutoRaytracing -> on" 56
-        times, Remix created no ray tracing passes), and its 92 windows were scored as a Remix result."""
+        times; worker C: Remix's background shader compile never reached 0, so it kept waiting), and its 92 windows
+        were scored as a Remix result. con_custodial waited 41 s for the same compile, then traced: hence 60 s."""
         last: list[bool] = []
 
         def traced() -> bool:
