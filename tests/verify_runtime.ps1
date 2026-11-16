@@ -34,6 +34,11 @@
 #                                          in gpu_mem.csv, one GateDump). Every config is put back after each launch.
 #                                          variant.json says whether remix-dxvk.log lists each changed rtx key with
 #                                          its new value; settings_report.py compares the variants. No gate verdict.
+#   verify_runtime.ps1 -RestoreFrom <run folder>
+#                                          puts back the files a killed run changed (inis, rtx.conf, saves) from the
+#                                          copies in <run>\file-backup, the launcher setting and the DX11 mod, and
+#                                          removes the game lock if that run took it. A run refuses to start while
+#                                          the setup ini still carries a run's marker line (runtime\run_files.ps1).
 # In Remix runs drive.py also saves <tag>_raster.pfm with ray tracing switched off for the stops in "rasterStops"
 # (default y0_p0), which gate.py compares with Remix's picture.
 # A spot in spots.json may name another spot's saves with "checkpoint" and move Sam elsewhere with "teleport"
@@ -42,7 +47,7 @@
 # off (screen frames come from gdigrab; the camera is set in memory). Only the goggle keys and the title-screen
 # keys need the game window in front, which this script does itself.
 param([string[]]$Spots = @(), [switch]$DryRun, [string]$CaptureCheckpoint = '', [switch]$Launch, [string]$Evaluate = '', [switch]$SkipInstall, [string]$SaveFrom = '',
-      [string]$Previous = '', [string]$Reference = '', [switch]$NoRemix, [string]$Variants = '')
+      [string]$Previous = '', [string]$Reference = '', [switch]$NoRemix, [string]$Variants = '', [string]$RestoreFrom = '')
 $ErrorActionPreference = 'Stop'
 $Tests = $PSScriptRoot
 $Runtime = Join-Path $Tests 'runtime'
@@ -79,7 +84,27 @@ function Gate($folder) {
     if ($ref) { $gateArgs += @('--reference', $ref) }
     Write-Host "  gate: previous run $(if ($prev) { $prev } else { '(none with the same spots)' }); no-Remix reference $(if ($ref) { $ref } else { '(none)' })"
     & $Py @gateArgs | Out-Host
-    return $LASTEXITCODE
+    $code = $LASTEXITCODE
+    # The FPS check against --previous is only like for like when both runs used the same builds: say so when not.
+    $note = Get-BuildNote $folder $prev
+    if ($note) {
+        Write-Host "  gate: $note" -ForegroundColor Yellow
+        $md = Join-Path $folder 'result.md'
+        if (Test-Path $md) { Add-Content $md "`r`n**Build note:** $note" }
+    }
+    return $code
+}
+function Get-RunBuild($folder) {
+    $m = Join-Path $folder 'manifest.json'
+    if (Test-Path $m) { (Get-Content $m -Raw | ConvertFrom-Json).build } else { $null }
+}
+function Get-BuildNote($folder, $prev) {
+    if (-not $prev) { return $null }
+    $a, $b = (Get-RunBuild $folder), (Get-RunBuild $prev)
+    if (-not $a -or -not $b) { return "the previous run $(Split-Path $prev -Leaf) and this run cannot be tied to builds (no build in a manifest), so the FPS comparison may mix builds." }
+    $diff = @(foreach ($k in 'remixRuntimeSha256', 'remixClientSha256', 'proxySha256') { if ($a.$k -ne $b.$k) { $k } })
+    if ($diff.Count) { return "the previous run $(Split-Path $prev -Leaf) used other builds ($($diff -join ', ') differ; dxvk-remix $($b.remixCommit) then, $($a.remixCommit) now), so the FPS comparison measures the build change too." }
+    $null
 }
 
 if ($DryRun) {
@@ -90,6 +115,30 @@ if ($DryRun) {
 if ($Evaluate) { exit (Gate $Evaluate) }
 
 . (Join-Path (Split-Path $Tests) 'play-setup\RemixPlayCommon.ps1')
+. (Join-Path $Runtime 'run_files.ps1')
+# Puts back what a run changed: each step on its own, so one failure cannot skip the rest. Returns the failures.
+function Restore-AfterRun([string]$runDir) {
+    $failed = @()
+    try { $failed += @(Restore-RunFiles $runDir) } catch { $failed += "files: $($_.Exception.Message)" }
+    try { $r = Restore-LauncherApi; if ($r) { Write-Step "Launcher setting put back: $r" } } catch { $failed += "launcher setting: $($_.Exception.Message)" }
+    try { if (Resume-Dx11Mod) { Write-Step 'DX11 lighting mod put back.' } } catch { $failed += "DX11 lighting mod: $($_.Exception.Message)" }
+    $failed
+}
+function Show-PutBackFailures($failed) {
+    if (-not @($failed).Count) { return }
+    Write-Host "  NOT PUT BACK ($(@($failed).Count)):" -ForegroundColor Red
+    foreach ($f in $failed) { Write-Host "    $f" -ForegroundColor Red }
+}
+if ($RestoreFrom) {
+    $running = Get-Process Blacklist_game, Blacklist_DX11_game, Blacklist_Launcher, NvRemixBridge -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($running) { throw "$($running.Name) is running (pid $($running.Id)): close it first." }
+    $failed = @(Restore-AfterRun $RestoreFrom)
+    if ((Test-Path $GameLock) -and (Get-Content $GameLock -Raw).Contains($RestoreFrom)) { Remove-Item -LiteralPath $GameLock; Write-Step 'Game lock of that run removed.' }
+    Show-PutBackFailures $failed
+    if ($failed.Count) { exit 3 }
+    Write-Step "Put back from $RestoreFrom; play-setup mismatches: $(@(Get-PlayMismatches) -join ', ')"
+    exit 0
+}
 $config = Get-Content (Join-Path $Runtime 'spots.json') -Raw | ConvertFrom-Json
 $hashArgs = @($GameExeHashes | ForEach-Object { '--exe-hash'; $_ })
 
@@ -132,11 +181,14 @@ public static class GateInput {
 # Also waits for the Play script of the previous launch to finish (it waits 30 s after the game quits, then puts the
 # launcher setting back to DX11; overlapping the next launch with that would start the DX11 exe).
 $script:PlayProcess = $null
+# A process that exits between Get-Process and the kill is fine (Stop-Process and Kill() threw there before).
 function Stop-Game {
-    Get-Process Blacklist_game, NvRemixBridge -ErrorAction SilentlyContinue | Stop-Process -Force
+    Get-Process Blacklist_game, NvRemixBridge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     $t = [Diagnostics.Stopwatch]::StartNew()
     while ((Get-RunningGame) -and $t.Elapsed.TotalSeconds -lt 30) { Start-Sleep 1 }
-    if ($script:PlayProcess -and -not $script:PlayProcess.WaitForExit(120000)) { $script:PlayProcess.Kill() }
+    if ($script:PlayProcess) {
+        try { if (-not $script:PlayProcess.WaitForExit(120000)) { $script:PlayProcess.Kill() } } catch { Write-Step "Play script: $($_.Exception.Message)" }
+    }
     $script:PlayProcess = $null
 }
 
@@ -190,9 +242,11 @@ function Start-GameAtCheckpoint {
     while (-not (Test-LevelLive $game.Id)) {
         if ($t.Elapsed.TotalSeconds -gt 480) { throw 'The game did not reach the level within 8 minutes.' }
         if ($game.HasExited) { throw 'The game exited while loading.' }
-        if ($NoRemix -and ((Select-String -LiteralPath $log -Pattern "\[pid $($game.Id)\] chained RTX Remix DLL" -Quiet -ErrorAction SilentlyContinue) -or
-                (Get-Process NvRemixBridge -ErrorAction SilentlyContinue))) {
-            throw 'No-Remix run, but the game loaded Remix (proxy log or NvRemixBridge running).'
+        # Only a bridge started after this game counts: on Nov 16 a bridge from elsewhere stopped con_bright_hall
+        # although the proxy log showed the game chained the Windows d3d9.
+        $bridge = Get-Process NvRemixBridge -ErrorAction SilentlyContinue | Where-Object { $_.StartTime -ge $game.StartTime } | Select-Object -First 1
+        if ($NoRemix -and ((Select-String -LiteralPath $log -Pattern "\[pid $($game.Id)\] chained RTX Remix DLL" -Quiet -ErrorAction SilentlyContinue) -or $bridge)) {
+            throw "No-Remix run, but the game loaded Remix (proxy log, or NvRemixBridge $(if ($bridge) { "pid $($bridge.Id) $($bridge.Path) started $($bridge.StartTime)" }))."
         }
         $game.Refresh()
         [void][GateInput]::Front($game.MainWindowHandle)
@@ -268,7 +322,9 @@ if (-not $selected.Count -and -not $CaptureCheckpoint) { throw "No spots selecte
 $runs = @(if ($sweep) {
     foreach ($v in $sweep.variants) {
         $copy = $selected[0] | ConvertTo-Json -Depth 6 | ConvertFrom-Json
-        $copy | Add-Member bench $sweep.bench -Force
+        $bench = $sweep.bench | ConvertTo-Json -Depth 6 | ConvertFrom-Json   # a variant's own bench keys win
+        foreach ($p in @(if ($v.bench) { $v.bench.PSObject.Properties })) { $bench | Add-Member $p.Name $p.Value -Force }
+        $copy | Add-Member bench $bench -Force
         [pscustomobject]@{ dir = $v.name; spot = $copy; variant = $v }
     }
 } else { foreach ($one in $selected) { [pscustomobject]@{ dir = $one.name; spot = $one; variant = $null } } })
@@ -277,25 +333,46 @@ $running = Get-Process Blacklist_game, Blacklist_DX11_game, Blacklist_Launcher, 
 if ($running) { throw "$($running.Name) is already running (pid $($running.Id), started $($running.StartTime.ToString('HH:mm:ss'))). Close it yourself or wait: this script does not close a game it did not start." }
 $otherLock = 'D:\BlacklistOverhaul\experiments\GAME_IN_USE.txt'
 if (Test-Path $otherLock) { throw "Someone else has the game: $(Get-Content $otherLock -Raw)" }
+if (Test-Path $GameLock) { throw "Someone else has the game: $(Get-Content $GameLock -Raw)" }
+# A killed run leaves its marker line in the setup ini (its finally block never ran): its "before" files are in its
+# file-backup folder, and this run would otherwise take the changed ini as its own "before".
+$leftOver = @(Get-LeftOverRuns @((Join-Path $Setup 'd3d9_proxy.ini'), "$S\d3d9_proxy.ini"))
+if ($leftOver.Count) { throw ("A gate run did not put its files back:`n  " + ($leftOver -join "`n  ")) }
 New-Item -ItemType Directory -Force $runDir | Out-Null
 # Each launch rotates the session logs and keeps only the newest 10 folders: copy any not yet kept out of rotation.
 $evidence = 'D:\BlacklistOverhaul\experiments\playtest-evidence\play-setup-logs'
 Get-ChildItem (Join-Path $Setup 'logs') -Directory -Filter 'before-*' -ErrorAction SilentlyContinue |
     Where-Object { -not (Test-Path (Join-Path $evidence $_.Name)) } |
     ForEach-Object { Copy-Item $_.FullName (Join-Path $evidence $_.Name) -Recurse; Write-Step "Kept session logs $($_.Name) in $evidence" }
-@{ spots = @($selected | ForEach-Object name); started = $Stamp; noRemix = [bool]$NoRemix
+# Which builds this run used, so a run can always be tied to a build (coordinator, Nov 16). The dxvk-remix commit
+# comes from the record written when pkg was staged, and only counts while pkg's runtime still has the recorded hash.
+$runtimeHash = Get-Hash (Join-Path $RuntimeSource 'd3d9.dll')
+$staged = Join-Path $Setup 'STAGED_REMIX.json'
+$stagedRec = if (Test-Path $staged) { Get-Content $staged -Raw | ConvertFrom-Json } else { $null }
+$remixCommit = if (-not $stagedRec) { 'unknown: no play-setup\STAGED_REMIX.json' }
+               elseif ($stagedRec.runtimeSha256 -ne $runtimeHash) { "unknown: pkg\.trex\d3d9.dll is not the build STAGED_REMIX.json records ($($stagedRec.commit))" }
+               else { $stagedRec.commit }
+$build = [ordered]@{ remixCommit = $remixCommit; remixRuntimeSha256 = $runtimeHash; remixClientSha256 = $RemixClientHash
+                     proxySha256 = Get-Hash (Join-Path $Setup 'd3d9.dll') }
+@{ spots = @($selected | ForEach-Object name); started = $Stamp; noRemix = [bool]$NoRemix; build = $build
    variants = @(if ($sweep) { $runs | ForEach-Object dir }) } | ConvertTo-Json | Set-Content (Join-Path $runDir 'manifest.json')
+Write-Step "Builds: dxvk-remix $remixCommit, proxy $($build.proxySha256.Substring(0, 12))"
 
-try { New-Item -ItemType File -Path $GameLock -Value "verify_runtime.ps1 runtime gate $([DateTime]::UtcNow.ToString('u'))" | Out-Null }
+try { New-Item -ItemType File -Path $GameLock -Value "verify_runtime.ps1 runtime gate $([DateTime]::UtcNow.ToString('u')) run $runDir" | Out-Null }
 catch { throw "Someone else has the game: $(Get-Content $GameLock -Raw)" }
 $saveBackup = Join-Path $runDir 'save-backup'
 $iniBackup = $null; $inputBackup = $null; $setupIniBackup = $null; $setupIniPath = Join-Path $Setup 'd3d9_proxy.ini'
 # -Variants changes rtx.conf: the setup copy and both game copies get each variant, and the setup text back after it.
 $rtxPaths = @((Join-Path $Setup 'rtx.conf')) + @($Configs.Keys | Where-Object { $Configs[$_] -eq 'rtx.conf' }); $rtxBackup = $null
+$putBackFailed = @()
 try {
     Stop-Game
-    New-Item -ItemType Directory -Force $saveBackup | Out-Null
-    Copy-Item (Join-Path $SaveDir '*') $saveBackup
+    # Copies on disk before the first change (the text copies below are only what this run works from).
+    $gameIni = "$S\d3d9_proxy.ini"
+    $targets = [ordered]@{ $setupIniPath = $setupIniPath; $InputIni = $InputIni
+                           $gameIni = $(if ($SkipInstall -and (Test-Path -LiteralPath $gameIni)) { $gameIni } else { $setupIniPath }) }
+    if ($sweep) { foreach ($p in $rtxPaths) { $targets[$p] = $rtxPaths[0] } }
+    Save-RunFiles $runDir $targets $SaveDir
     $inputBackup = [IO.File]::ReadAllText($InputIni)
     $setupIniBackup = [IO.File]::ReadAllText($setupIniPath)
     if ($sweep) { $rtxBackup = [IO.File]::ReadAllText($rtxPaths[0]) }
@@ -309,6 +386,7 @@ try {
            restore = 'both ini copies are written back from the backups taken at the start; see restored below' } |
             ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDir 'reference.json')
     }
+    $gateIni = Add-RunMarker $gateIni $runDir
     [IO.File]::WriteAllText($setupIniPath, $gateIni)
     if (-not $SkipInstall) {
         $left = @(Get-PlayMismatches)
@@ -338,6 +416,7 @@ try {
     foreach ($run in $runs) {
         $spot = $run.spot
         $spotDir = Join-Path $runDir $run.dir
+        $smi = $null
         $cp = Join-Path $Library $(if ($spot.checkpoint) { $spot.checkpoint } else { $spot.name })
         New-Item -ItemType Directory -Force $spotDir | Out-Null
         if (-not (Test-Path (Join-Path $cp 'checkpoint.json')) -or -not (Get-ChildItem $cp -Filter '*.save' -ErrorAction SilentlyContinue)) {
@@ -368,7 +447,15 @@ try {
                     '--log', "$S\d3d9_proxy.log", '--frames', "$S\d3d9_proxy_frames.csv", '--out', (Join-Path $spotDir 'cinematic')) +
                     @(if ($NoRemix) { '--signal', 'camera' }) |
                     ForEach-Object { '"' + $_ + '"' }) }
+            # GPU clocks, temperature, power, clock-limit reasons and memory once a second for the whole launch
+            # (worker C, Nov 16: what puts a launch in the slow Ray Reconstruction mode).
+            # Stdout, not -f: nvidia-smi buffers -f and the kill below loses everything.
+            $smi = Start-Process nvidia-smi -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $spotDir 'gpu_run.csv') -ArgumentList @(
+                '--query-gpu=timestamp,clocks.gr,clocks.mem,clocks.sm,temperature.gpu,power.draw,power.limit,clocks_throttle_reasons.active,memory.used,memory.total,pstate',
+                '--format=csv', '-lms', '1000')
             $game = Start-GameAtCheckpoint
+            # Other programs holding the GPU (Windows reports their names; per-process memory reads N/A).
+            & nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv 2>&1 | Set-Content (Join-Path $spotDir 'gpu_apps.csv')
             if ($cine) {
                 if (-not $cine.WaitForExit(120000)) { $cine.Kill(); Write-Step "$($spot.name): cutscene recorder timed out" }
                 Write-Step "$($spot.name): $((Get-Content (Join-Path $spotDir 'cinematic.log') -Tail 1))"
@@ -392,9 +479,24 @@ try {
                         ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -Unique })
                 }
                 $ok = -not @($loaded.Keys | Where-Object { $loaded[$_].Count -ne 1 -or $loaded[$_][0] -ne [string]$run.variant.rtx.$_ }).Count
+                # Proxy keys: this launch's proxy.log prints its settings ("diagnostics: EnableDebuggingTelemetry=0
+                # ... CallTiming=0", "features: ... HitchSampler=0"). A key it does not print is "not proven", never
+                # true (coordinator review, Nov 16: 12_telemetry_off was reported loaded with nothing checked).
+                $proxyLog = Join-Path $spotDir 'proxy.log'
+                $proxySeen = [ordered]@{}
+                foreach ($p in @(if ($run.variant.proxy) { $run.variant.proxy.PSObject.Properties })) {
+                    $proxySeen[$p.Name] = @(if (Test-Path $proxyLog) { Select-String -LiteralPath $proxyLog -Pattern "\b$([Regex]::Escape($p.Name))=(\S+)" |
+                        ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -Unique })
+                }
+                $proxyOk = if (-not $proxySeen.Count) { $true }
+                           elseif (@($proxySeen.Keys | Where-Object { -not $proxySeen[$_].Count }).Count) { 'not proven' }
+                           else { -not @($proxySeen.Keys | Where-Object { $proxySeen[$_].Count -ne 1 -or $proxySeen[$_][0] -ne [string]$run.variant.proxy.$_ }).Count }
+                # Which Ray Reconstruction mode this launch got (worker C, Nov 16: launches run RR at ~11.1 or ~13.3 ms).
+                $rrCreated = @(if (Test-Path $remixLog) { Select-String -LiteralPath $remixLog -SimpleMatch '[RTX Ray Reconstruction] created' | ForEach-Object Line })
                 [ordered]@{ name = $run.dir; rtx = $run.variant.rtx; proxy = $run.variant.proxy; remixLogValues = $loaded; rtxLoaded = $ok
+                            proxyLogValues = $proxySeen; proxyLoaded = $proxyOk; rrCreated = $rrCreated; build = $build
                             proxyIni = $spotIni } | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $spotDir 'variant.json')
-                Write-Step "$($run.dir): $(if ($ok) { 'remix-dxvk.log lists the new values' } else { "NOT LOADED as asked: $($loaded | ConvertTo-Json -Compress)" })"
+                Write-Step "$($run.dir): rtx $(if ($ok) { 'keys listed with the new values in remix-dxvk.log' } else { "NOT LOADED as asked: $($loaded | ConvertTo-Json -Compress)" }); proxy keys $(if ($proxyOk -eq $true) { 'as asked' } elseif ($proxyOk -eq 'not proven') { "NOT PROVEN (no log line): $($proxySeen | ConvertTo-Json -Compress)" } else { "NOT LOADED as asked: $($proxySeen | ConvertTo-Json -Compress)" }); RR: $($rrCreated -join ' | ')"
             } elseif ($spot.switchTest -or $spot.lightSwitch) {
                 & $Py (Join-Path $Runtime 'switch_report.py') $spotDir | Out-Null
                 Write-Step "$($spot.name): switch test numbers in $(Join-Path $spotDir 'switch.md')"
@@ -406,6 +508,7 @@ try {
                 @{ name = $spot.name; error = $_.Exception.Message; windows = @() } | ConvertTo-Json | Set-Content (Join-Path $spotDir 'spot.json')
             }
         } finally {
+            if ($smi) { try { if (-not $smi.HasExited) { $smi.Kill() } } catch { }; $smi = $null }
             if ($run.variant) {   # back to the baseline before the next variant (the game is closed by now)
                 Stop-Game
                 foreach ($p in $rtxPaths) { [IO.File]::WriteAllText($p, $rtxBackup) }
@@ -414,18 +517,10 @@ try {
         }
     }
 } finally {
-    Stop-Game
-    if ($rtxBackup) { foreach ($p in $rtxPaths) { [IO.File]::WriteAllText($p, $rtxBackup) } }
-    if (Test-Path $saveBackup) {
-        Get-ChildItem $SaveDir -Filter '*.save' | Remove-Item
-        Copy-Item (Join-Path $saveBackup '*') $SaveDir -Force
-    }
-    if ($inputBackup) { [IO.File]::WriteAllText($InputIni, $inputBackup) }
-    if ($setupIniBackup) { [IO.File]::WriteAllText($setupIniPath, $setupIniBackup) }
-    if ($iniBackup) { [IO.File]::WriteAllText("$S\d3d9_proxy.ini", $(if ($SkipInstall) { $iniBackup } else { $setupIniBackup })) }
-    $restored = Restore-LauncherApi
-    if ($restored) { Write-Step "Launcher setting put back: $restored" }
-    if (Resume-Dx11Mod) { Write-Step 'DX11 lighting mod put back.' }
+    # Each step on its own: one that throws (a game exiting mid-kill, a locked save) must not skip the rest, and the
+    # lock goes last. Before the backups exist nothing was changed, so there is nothing to put back.
+    try { Stop-Game } catch { $putBackFailed += "closing the game: $($_.Exception.Message)" }
+    if (Test-Path (Join-Path $runDir 'file-backup\restore.json')) { $putBackFailed += @(Restore-AfterRun $runDir) }
     if ($NoRemix -and (Test-Path (Join-Path $runDir 'reference.json'))) { try {
         $note = Get-Content (Join-Path $runDir 'reference.json') -Raw | ConvertFrom-Json
         $note | Add-Member restored ([ordered]@{
@@ -435,8 +530,12 @@ try {
         $note | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDir 'reference.json')
         Write-Step "Remix settings put back: $(($note.restored | ConvertTo-Json -Compress))"
     } catch { Write-Step "Could not record the restore check: $($_.Exception.Message)" } }
+    Show-PutBackFailures $putBackFailed
+    if ($putBackFailed.Count) { Write-Step "Put the rest back with: verify_runtime.ps1 -RestoreFrom $runDir" }
     Remove-Item -LiteralPath $GameLock -ErrorAction SilentlyContinue
 }
+if ($putBackFailed.Count -and -not $sweep -and -not $CaptureCheckpoint) { [void](Gate $runDir); exit 3 }
+if ($putBackFailed.Count) { exit 3 }
 if ($CaptureCheckpoint) { exit 0 }
 if ($sweep) {   # numbers for the requester to weigh, not a pass/fail
     & $Py (Join-Path $Runtime 'settings_report.py') $runDir | Out-Host

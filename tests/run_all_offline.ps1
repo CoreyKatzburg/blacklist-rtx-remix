@@ -38,8 +38,15 @@ Step 'C++ replay suite (build + run)' {
     if ($LASTEXITCODE -ne 0) { throw "compile failed (exit $LASTEXITCODE)" }
     Native $exePath @()
 }
+$gateLock = Join-Path $remixDir 'play-setup\AGENT_GAME_LOCK.txt'
 foreach ($name in 'verify_config.py', 'verify_lights_and_materials.py') {
     Step $name { Native $py @((Join-Path $testsDir $name), '--self-test') }
+    # A gate run (verify_runtime.ps1) changes play-setup\d3d9_proxy.ini while it holds the game lock and puts it back
+    # at the end: a verify_config failure then is the run's temporary ini, not settings left behind (Nov 16).
+    if ($name -eq 'verify_config.py' -and $results[-1].Result -eq 'FAIL' -and (Test-Path $gateLock)) {
+        $results[-1].Note = "a gate run holds the game lock ($((Get-Content $gateLock -Raw).Trim())), the setup ini is temporarily changed; rerun after it ends. $($results[-1].Note)"
+        Write-Host "   $($results[-1].Note)" -ForegroundColor Yellow
+    }
 }
 foreach ($file in Get-ChildItem $testsDir -Filter 'verify_materials_*.py' | Sort-Object Name) {
     Step $file.Name { Native $py @($file.FullName) }

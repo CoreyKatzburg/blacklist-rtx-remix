@@ -1,0 +1,10 @@
+{
+ "about": "Worker E, problem 5 (flat-black surfaces), approved by the coordinator Nov 16: three extra launches at con_boiler after its Remix run and no-Remix reference. One rtx.conf change each against the play-setup baseline. albedo: Remix's primary albedo debug view. direct_diffuse: demodulated (divided by albedo) noisy primary direct diffuse radiance, so it shows light reaching the surface whatever its albedo. no_mod_materials: the mod's replacement materials off, game materials only.",
+ "spot": "con_boiler",
+ "bench": {"settle": 5, "frames": 150},
+ "variants": [
+  {"name": "01_debug_albedo", "rtx": {"rtx.debugView.debugViewIdx": "23"}},
+  {"name": "02_debug_direct_diffuse", "rtx": {"rtx.debugView.debugViewIdx": "102"}},
+  {"name": "03_no_mod_materials", "rtx": {"rtx.enableReplacementMaterials": "False"}}
+ ]
+}

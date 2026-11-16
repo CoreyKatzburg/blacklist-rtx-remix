@@ -96,6 +96,49 @@ class Steering(unittest.TestCase):
         self.assertAlmostEqual(s.counts_per_deg_y, -9.0, delta=0.3)
         self.assertGreater(s.calibration["warmupX"], 7.0 * 1.25)
 
+    def test_calibration_drops_one_move_the_game_ate_after_the_warm_up(self):
+        # No-Remix Custodial, Nov 16: counts per degree 4.7, 47.8, 32.1, 39.3, 41.1 raised "inconsistent" and the
+        # spot was lost. Fake: the game drops 90% of the second x move (the first one counted).
+        s = self.run_with(60, 7.0, -9.0, 14.0, -14.0)
+        mouse, n = self.game.mouse, [0]
+
+        def eat_second_x(dx, dy):
+            n[0] += bool(dx)
+            mouse(int(dx * 0.1) if n[0] == 2 else dx, dy)
+        with mock.patch.object(drive, "mouse_move_rel", eat_second_x):
+            s._calibrate_mouse()
+        self.assertAlmostEqual(s.counts_per_deg_x, 7.0, delta=0.3)
+        self.assertEqual(len(s.calibration["droppedX"]), 1)
+        self.assertGreater(s.calibration["droppedX"][0], 7.0 * 5)
+
+    def test_calibration_still_fails_when_the_moves_disagree(self):
+        s = self.run_with(60, 7.0, -9.0, 14.0, -14.0)
+        mouse, n = self.game.mouse, [0]
+
+        def wild_x(dx, dy):   # every counted x move lands at a different rate: nothing to agree on
+            n[0] += bool(dx)
+            mouse(int(dx * (1.0, 1.0, 0.2, 1.0, 0.45, 1.0)[n[0] - 1] * (2.2 if n[0] == 4 else 1.0)) if dx else 0, dy)
+        with mock.patch.object(drive, "mouse_move_rel", wild_x), self.assertRaisesRegex(RuntimeError, "inconsistent"):
+            s._calibrate_mouse()
+
+    def test_snap_pose_writes_the_stop_into_game_memory(self):
+        # No-Remix Paladin, Nov 16: mouse steering left y0_p0 at yaw -63, pitch 30 and y0_p-30 at yaw 156.
+        s = self.run_with(178, 45.0, -26.0, 45.0, -26.0)
+        s.yaw, s.pitch = 90.0, -30.0
+        game = self.game
+
+        def set_rotation(controller, yaw, pitch):
+            with game.lock:
+                game.yaw, game.pitch = yaw, pitch
+        game.set_rotation = set_rotation
+        self.assertEqual(s.snap_pose(), 1)
+        yaw, pitch, _ = game.rotation(0)
+        self.assertLess(abs(gate.wrap(yaw - (s.base_yaw + 90.0))), 0.3)
+        self.assertLess(abs(pitch + 30.0), 0.3)
+        game.set_rotation = lambda controller, yaw, pitch: None   # fake: the game ignores the write
+        s.yaw = 0.0
+        self.assertEqual(s.snap_pose(), -1)   # three writes and still off: recorded as poseWrites -1
+
     def test_stop_waits_out_a_stall_before_capturing(self):
         # Paladin, Nov 15: frames of 0.5 to 1.6 s for several seconds after the full turn.
         s = self.run_with(22, 7.0, -9.0, 7.0, -9.0)

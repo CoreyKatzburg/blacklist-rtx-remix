@@ -346,6 +346,8 @@ class Spot:
         self.proxy = Tail([os.path.join(s, "d3d9_proxy_frames.csv")], False)
         self.pgate = Tail([os.path.join(s, "d3d9_proxy_gate.csv")], False)
         self.log = Tail([os.path.join(s, "d3d9_proxy.log")], False)
+        # worker B's light publishing trace (frame,node,id,change,old,new), one file per game session
+        self.lptrace = Tail([os.path.join(s, "lightpub_trace.csv")], False)
         self.dump_dirs = [os.path.join(d, "gate") for d in (s, os.path.join(s, ".trex"), r)]
         self.windows: list[dict] = []
         self.game, self.process = blmem.attach(a.pid, a.exe_hash)
@@ -467,11 +469,16 @@ class Spot:
         # Nov 16); steering and the pan correct from game memory, so only the rough rate is needed there.
         spread = 2.0 if getattr(self, "no_remix", False) else 1.25
         self.calibration["spreadLimit"] = spread
+        # One move the game partly ate is dropped (Custodial reference, Nov 16: 4.7 counts per degree, then 32 to 48
+        # four times); only one may be dropped, and at least three must still agree within the spread.
         for axis in ("x", "y"):
             vals = samples[axis]
-            if len(vals) < 3 or min(vals) * max(vals) <= 0 or max(map(abs, vals)) / min(map(abs, vals)) > spread:
+            mid = float(np.median(vals)) if vals else 0.0
+            kept = [v for v in vals if mid and v * mid > 0 and max(abs(v), abs(mid)) / min(abs(v), abs(mid)) <= spread]
+            if len(kept) < 3 or len(vals) - len(kept) > 1 or max(map(abs, kept)) / min(map(abs, kept)) > spread:
                 raise RuntimeError(f"mouse calibration on {axis} is inconsistent: counts per degree {vals}")
-            setattr(self, f"counts_per_deg_{axis}", float(np.median(vals)))
+            self.calibration[f"dropped{axis.upper()}"] = [round(v, 3) for v in vals if v not in kept]
+            setattr(self, f"counts_per_deg_{axis}", float(np.median(kept)))
         self.calibration.update(countsPerDegX=round(self.counts_per_deg_x, 3), countsPerDegY=round(self.counts_per_deg_y, 3))
 
     def pose(self, yaw: float, pitch: float) -> bool:
@@ -593,8 +600,24 @@ class Spot:
         finally:
             self.set_rt(True)
 
+    def snap_pose(self) -> int:
+        """Without Remix the game runs at ~178 FPS and eases each mouse input over several frames, so mouse steering
+        left reference stops 4 to 28 degrees off (Custodial and bright hall, Nov 16) and Paladin stops up to 157 off.
+        There the stop's exact direction is written into the controller's rotation in game memory, and checked again
+        once the camera is still. Returns how many writes it took (0: the mouse already got there), or -1 when the
+        camera was still off after three."""
+        for writes in range(4):
+            yaw, pitch = self._settled()
+            if abs(gate.wrap(self.base_yaw + self.yaw - yaw)) < 0.3 and abs(self.base_pitch + self.pitch - pitch) < 0.3:
+                return writes
+            if writes < 3:
+                self.game.set_rotation(self.controller, self.base_yaw + self.yaw, self.base_pitch + self.pitch)
+                time.sleep(0.1)
+        return -1
+
     def stop(self, name: str, outline: str | None = None) -> None:
         rel = f"frames/{name}.gray"
+        snapped = self.snap_pose() if self.no_remix else None
         self.hold(0.5)
         waited = self.steady()
         self.window(name + "_settle", "settle", lambda: self.hold(0.5), steadyWait=waited)
@@ -608,6 +631,8 @@ class Spot:
                         frames=rel, frameSize=[CAP_W, CAP_H], **({"outline": outline} if outline else {}))
         w.update(got)
         w["gamePose"] = [before, self.rel_pose()]   # [yaw, pitch] from game memory at the start and end of the stop
+        if snapped is not None:
+            w["poseWrites"] = snapped
         w["samMoved"] = self.sam_moved(name)
         if not self.no_remix and name in self.spot.get("rasterStops", ["y0_p0"]):
             self.raster_rt_off(name)
@@ -681,19 +706,47 @@ class Spot:
         """Settings sweep (verify_runtime.ps1 -Variants): one launch per setting, so this only has to measure the
         reference pose. Face y0_p0, let textures and the radiance cache settle, then one "still" window of at least
         cfg["frames"] game frames (proxy frame log, which stays on when Remix telemetry is off) while nvidia-smi
-        samples video memory every 200 ms into gpu_mem.csv, then one GateDump of the same pose."""
+        samples video memory every 200 ms into gpu_mem.csv, then one GateDump of the same pose.
+        cfg["revisit"] (worker C, Nov 16, to tell warm-up from memory pressure): afterwards look once round the room
+        (yawStops stops, 1 s each, so more of it streams in), come back to y0_p0 and measure it again as the separate
+        window "bench_y0_p0_end" (gpu_mem_end.csv)."""
+        settle, want = float(cfg.get("settle", 5.0)), int(cfg.get("frames", 150))
         self.move("to_bench", 0.0, 0.0, 1.0)
-        self.hold(float(cfg.get("settle", 5.0)))
-        want, rel = int(cfg.get("frames", 150)), "frames/bench.gray"
-        smi = subprocess.Popen(["nvidia-smi", "--query-gpu=timestamp,memory.total,memory.used,memory.free,clocks.gr,"
-                                "clocks.mem,pstate,utilization.gpu", "--format=csv", "-lms", "200",
-                                "-f", os.path.join(self.out, "gpu_mem.csv")],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.hold(settle)
+        self.bench_window("bench_y0_p0", want, "bench", "gpu_mem.csv")
+        self.window("y0_p0", "dump", lambda: self.dump("y0_p0"), dump="y0_p0")
+        if cfg.get("revisit"):
+            n = int(self.spot.get("yawStops", 8))
+            for i in range(1, n):
+                self.move(f"look_y{i * 360.0 / n:.0f}", i * 360.0 / n, 0.0, 0.5)
+                self.hold(1.0)
+            self.move("to_bench_end", 0.0, 0.0, 1.0)
+            self.hold(settle)
+            self.bench_window("bench_y0_p0_end", want, "bench_end", "gpu_mem_end.csv")
+        # cfg["liveSteps"] (worker C, Nov 16, to separate memory from launch-to-launch variation): rtx keys changed
+        # live through [RemixConfig] while holding y0_p0, one window of liveStepSeconds per step. Whether Remix took a
+        # change is read afterwards from textureBudgetMB in each window's telemetry, not assumed.
+        if cfg.get("liveSteps"):
+            self.move("to_live", 0.0, 0.0, 1.0)
+            seconds = float(cfg.get("liveStepSeconds", 60))
+            for i, keys in enumerate(cfg["liveSteps"]):
+                for k, v in keys.items():
+                    set_ini(self.ini, "RemixConfig", k, str(v))
+                self.window(f"live_step{i + 1}", "still", lambda: self.hold(seconds), liveRtx=keys)
+
+    def bench_window(self, name: str, want: int, tag: str, smi_file: str) -> dict:
+        """One still window of at least `want` game frames with nvidia-smi sampling into `smi_file`."""
+        rel = f"frames/{tag}.gray"
+        # Stdout, not -f: nvidia-smi buffers -f and the terminate below (a kill on Windows) loses all of it.
+        with open(os.path.join(self.out, smi_file), "wb") as smi_out:
+            smi = subprocess.Popen(["nvidia-smi", "--query-gpu=timestamp,memory.total,memory.used,memory.free,clocks.gr,"
+                                    "clocks.mem,pstate,utilization.gpu", "--format=csv", "-lms", "200"],
+                                   stdout=smi_out, stderr=subprocess.DEVNULL)
         cap = start_capture(os.path.join(self.out, rel), fps=30, seconds=60.0)
         start = self.proxy.last_frame()
         try:
-            w = self.window("bench_y0_p0", "still", lambda: self.hold(60.0, until=lambda: self.proxy.last_frame() - start >= want),
-                            frames=rel, frameSize=[CAP_W, CAP_H], benchFrames=want)
+            w = self.window(name, "still", lambda: self.hold(60.0, until=lambda: self.proxy.last_frame() - start >= want),
+                            frames=rel, frameSize=[CAP_W, CAP_H], benchFrames=want, gpuMem=smi_file)
         finally:
             for p in (cap, smi):
                 p.terminate()
@@ -703,8 +756,8 @@ class Spot:
                     p.kill(); p.wait()
         w["gameFrames"] = self.proxy.last_frame() - start
         w["gamePose"] = [self.rel_pose()]
-        w["samMoved"] = self.sam_moved("bench")
-        self.window("y0_p0", "dump", lambda: self.dump("y0_p0"), dump="y0_p0")
+        w["samMoved"] = self.sam_moved(tag)
+        return w
 
     def light_dump(self, dest: str) -> str | None:
         """One frame of the proxy's light and flare dump (framedump\\f<frame>_lights.tsv, written when
@@ -765,8 +818,29 @@ class Spot:
         hwnd = game_window(self.a.pid)
         if hwnd:
             front(hwnd)
-        self.window("light_switch", "switch", lambda: (tap(key), self.capture(rel, int(30 * flip.get("seconds", 20)))),
-                    frames=rel, frameSize=[CAP_W, CAP_H], switch={"name": "light_switch", "key": key})
+        frames = int(30 * flip.get("seconds", 20))
+        dumps: list[dict] = []
+
+        def body():
+            # Light dumps during and after the fade (worker B, Nov 16: the last run had none after the press), each
+            # at flip["dumpsAt"] seconds after the key; "at" records when it really landed.
+            proc = start_capture(os.path.join(self.out, rel), frames)
+            try:
+                tap(key)
+                t0 = time.monotonic()
+                os.makedirs(os.path.join(self.out, "switch"), exist_ok=True)
+                for at in flip.get("dumpsAt", []):
+                    self.hold(max(0.0, t0 + at - time.monotonic()))
+                    frame, sent = self.proxy.last_frame(), round(time.monotonic() - t0, 2)
+                    got = self.light_dump(os.path.join(self.out, "switch", f"light_switch_{at:g}s_lights.tsv"))
+                    dumps.append({"asked": at, "at": sent, "proxyFrameAtAsk": frame, "lights": got})
+                self.hold(frames / 30.0 + 10.0, until=lambda: proc.poll() is not None)
+            finally:
+                if proc.poll() is None:
+                    proc.kill(); proc.wait()
+        w = self.window("light_switch", "switch", body, frames=rel, frameSize=[CAP_W, CAP_H],
+                        switch={"name": "light_switch", "key": key})
+        w["lightDumps"] = dumps
 
     def mouse_lag(self, trials: int = 20, degrees: float = 5.0) -> dict:
         """Mouse-to-screen time, measured the same way with and without Remix: at a still camera, a quick turn of
@@ -798,7 +872,9 @@ class Spot:
         results, sign = [], 1
         try:
             self.hold(1.5)
-            for _ in range(trials):
+            # Until `trials` turns showed on screen (gate.py needs 20 samples), at most 2x trials turns: in the Paladin
+            # its moving screens hid 9 of 20 turns in the noise (no-Remix reference, Nov 16).
+            while sum(r.get("screenMs") is not None for r in results) < trials and len(results) < 2 * trials:
                 self.hold(0.5)
                 tq = time.perf_counter() * 1000.0
                 self.hold(0.3)
@@ -828,7 +904,8 @@ class Spot:
         after = [r["screenMs"] - r["gameMs"] for r in results if r.get("screenMs") is not None and r.get("gameMs") is not None]
         med = lambda v: round(float(np.median(v)), 1) if v else None
         return {"samples_ms": screen, "game_share_ms": med(game), "after_game_ms": med(after),
-                "method": f"{degrees:g} degree mouse turn at a still camera, {trials} turns alternating left/right; time "
+                "method": f"{degrees:g} degree mouse turn at a still camera, alternating left/right until {trials} turns "
+                          f"showed on screen (at most {2 * trials} turns); time "
                           "from SendInput to the first gdigrab shot (480x270 patch, ~120/s, arrival-stamped with "
                           "perf_counter) that differs by > 3x still noise; game share = to the first proxy-logged "
                           "frame with the turned camera (same clock)",
@@ -892,7 +969,8 @@ class Spot:
         files = {"telemetry": self.telemetry.copy_to(os.path.join(self.out, "telemetry.jsonl")),
                  "proxyFrames": self.proxy.copy_to(os.path.join(self.out, "proxy_frames.csv")),
                  "proxyGate": self.pgate.copy_to(os.path.join(self.out, "proxy_gate.csv")),
-                 "proxyLog": self.log.copy_to(os.path.join(self.out, "proxy.log"))}
+                 "proxyLog": self.log.copy_to(os.path.join(self.out, "proxy.log")),
+                 "lightpubTrace": self.lptrace.copy_to(os.path.join(self.out, "lightpub_trace.csv"))}
         self.process.close()
         return files
 
