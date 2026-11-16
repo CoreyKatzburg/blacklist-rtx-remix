@@ -112,7 +112,11 @@ static void FakeCases() {
     unplaced.peakIntensity = 3.5f;
     unplaced.peakSize = 120.0f;
     StandInOptions today;
-    CHECK(lightcal::WantsStandIn(unplaced, today), "defaults must keep today's choice: a ball on the unplaced flare");
+    CHECK(!lightcal::WantsStandIn(unplaced, today),
+          "the default must drop the unplaced flare (StandInSkipUnplaced defaults to 1 since the 2026-11-16 test)");
+    StandInOptions keepUnplaced;
+    keepUnplaced.skipUnplaced = false;
+    CHECK(lightcal::WantsStandIn(unplaced, keepUnplaced), "StandInSkipUnplaced=0 must bring the unplaced ball back");
     StandInOptions skipUnplaced;
     skipUnplaced.skipUnplaced = true;
     CHECK(!lightcal::WantsStandIn(unplaced, skipUnplaced), "StandInSkipUnplaced=1 must drop the unplaced flare");
@@ -236,18 +240,22 @@ static void Run20(const std::filesystem::path& folder) {
     const Dump camOn = Load(folder / "cam_on_lights.tsv");
     CHECK(camOn.flares.size() == 185, "cam_on: %zu flares, want 185", camOn.flares.size());
     size_t unplaced = 0;
-    const size_t today = Picked(camOn, StandInOptions{}, &unplaced);
-    CHECK(today == 109 && unplaced == 15, "cam_on defaults: %zu balls, %zu on unplaced flares, want 109 and 15",
-          today, unplaced);
-    StandInOptions skipUnplaced;
-    skipUnplaced.skipUnplaced = true;
-    const size_t skipped = Picked(camOn, skipUnplaced, &unplaced);
-    CHECK(skipped == 94 && unplaced == 0, "cam_on StandInSkipUnplaced: %zu balls, %zu on unplaced, want 94 and 0",
-          skipped, unplaced);
-    size_t atOrigin = 0;
-    for (const auto& [node, f] : camOn.flares)
-        atOrigin += lightcal::WantsStandIn(f, StandInOptions{}) && f.pos[0] == 0 && f.pos[1] == 0 && f.pos[2] == 0;
-    CHECK(atOrigin == 15, "cam_on: %zu balls drawn at the world origin today, want 15", atOrigin);
+    StandInOptions keepUnplaced;
+    keepUnplaced.skipUnplaced = false;
+    const size_t before = Picked(camOn, keepUnplaced, &unplaced);
+    CHECK(before == 109 && unplaced == 15, "cam_on StandInSkipUnplaced=0: %zu balls, %zu on unplaced, want 109 and 15",
+          before, unplaced);
+    const size_t defaults = Picked(camOn, StandInOptions{}, &unplaced);
+    CHECK(defaults == 94 && unplaced == 0, "cam_on defaults: %zu balls, %zu on unplaced flares, want 94 and 0",
+          defaults, unplaced);
+    size_t atOrigin = 0, atOriginDefault = 0;
+    for (const auto& [node, f] : camOn.flares) {
+        const bool origin = f.pos[0] == 0 && f.pos[1] == 0 && f.pos[2] == 0;
+        atOrigin += lightcal::WantsStandIn(f, keepUnplaced) && origin;
+        atOriginDefault += lightcal::WantsStandIn(f, StandInOptions{}) && origin;
+    }
+    CHECK(atOrigin == 15 && atOriginDefault == 0, "cam_on: %zu balls at the world origin with StandInSkipUnplaced=0, "
+          "%zu by default, want 15 and 0", atOrigin, atOriginDefault);
 
     std::vector<FlareData> flares;
     for (const auto& p : camOn.flares) flares.push_back(p.second);

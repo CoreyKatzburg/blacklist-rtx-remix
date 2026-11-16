@@ -534,15 +534,18 @@ inline bool IsSamGearFlare(const FlareData& f) {
     return false;
 }
 
+// These defaults are also lightpub's ini defaults. StandInSkipUnplaced is on by default since the live switch test of
+// 2026-11-16: it removed the 15 balls on unplaced flares (109 -> 94 at con_custodial and con_bright_hall) and nothing
+// else in the stray counts or the picture moved beyond base-to-base noise.
 struct StandInOptions {
     bool enabled = true;         // [Lights] FlareStandIns
-    bool skipUnplaced = false;   // [Lights] StandInSkipUnplaced: no ball on flares with +0x2C bit 0
+    bool skipUnplaced = true;    // [Lights] StandInSkipUnplaced: no ball on flares with +0x2C bit 0
     bool skipMoving = false;     // [Lights] StandInSkipMoving: no ball on flares that move
     bool skipSamGear = false;    // [Lights] StandInSkipSamGear: no ball on Sam's own gear flares (IsSamGearFlare)
 };
 
-// A glowing ball goes on a flare that has a bright element and is not a camera-space or sky-sized flare. The
-// skips are off by default, which keeps the choice made before they existed.
+// A glowing ball goes on a flare that has a bright element and is not a camera-space or sky-sized flare, and that
+// no enabled skip removes.
 inline bool WantsStandIn(const FlareData& f, const StandInOptions& o) {
     if (!o.enabled || (f.word34 & 0x2) || !(f.peakIntensity > 0.0f) || !(f.peakSize < 400.0f)) return false;
     if (o.skipUnplaced && (f.nodeFlags & kFlareNodeUnplaced)) return false;

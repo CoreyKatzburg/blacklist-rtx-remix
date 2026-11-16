@@ -61,11 +61,11 @@ struct Settings {
     // FlareStandIns=1: a small glowing sphere at every game lens flare (lamp glow cards, gear and flashlight flares),
     // so bulbs and rifle-mounted flashlight lenses are visible in ray tracing.
     bool flareStandIns = true;
-    // StandInSkipUnplaced=1: no sphere on flares with node flag +0x2C bit 0 (16 of 17 such flares sit at the world
-    // origin). StandInSkipMoving=1: no sphere on flares that move (Sam's gear, guards' and drones' lights).
-    // StandInSkipSamGear=1: no sphere on Sam's own gear flares only (lightcal::IsSamGearFlare); guards' and drones'
-    // lights keep theirs.
-    bool standInSkipUnplaced = false;
+    // StandInSkipUnplaced=1 (default, lightcal::StandInOptions): no sphere on flares with node flag +0x2C bit 0 (16
+    // of 17 such flares sit at the world origin). StandInSkipMoving=1: no sphere on flares that move (Sam's gear,
+    // guards' and drones' lights). StandInSkipSamGear=1: no sphere on Sam's own gear flares only
+    // (lightcal::IsSamGearFlare); guards' and drones' lights keep theirs.
+    bool standInSkipUnplaced = lightcal::StandInOptions{}.skipUnplaced;
     bool standInSkipMoving = false;
     bool standInSkipSamGear = false;
     float standInRadius = 2.5f;       // max bulb radius in game units (cm), scaled per flare element size
@@ -117,7 +117,8 @@ void LoadSettings(const wchar_t* ini) {
     s.hidePostFx = GetPrivateProfileIntW(L"Proxy", L"HidePostFx", 0, ini) != 0;
     s.autoRaytracing = GetPrivateProfileIntW(L"Lights", L"AutoRaytracing", 1, ini) != 0;
     s.flareStandIns = GetPrivateProfileIntW(L"Lights", L"FlareStandIns", 1, ini) != 0;
-    s.standInSkipUnplaced = GetPrivateProfileIntW(L"Lights", L"StandInSkipUnplaced", 0, ini) != 0;
+    s.standInSkipUnplaced =
+        GetPrivateProfileIntW(L"Lights", L"StandInSkipUnplaced", lightcal::StandInOptions{}.skipUnplaced, ini) != 0;
     s.standInSkipMoving = GetPrivateProfileIntW(L"Lights", L"StandInSkipMoving", 0, ini) != 0;
     s.standInSkipSamGear = GetPrivateProfileIntW(L"Lights", L"StandInSkipSamGear", 0, ini) != 0;
     s.standInRadius = IniFloat(ini, L"StandInRadius", 2.5f);
