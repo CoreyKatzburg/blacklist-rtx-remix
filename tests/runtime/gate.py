@@ -120,6 +120,9 @@ THRESHOLDS = {
     "compile_stall_min_frames": 300,       # GUESS. Consecutive rayTraced=false frames with 25-40 ms CPU wait.
     "compile_stall_wait_min_ms": 25.0,     # GUESS.
     "compile_stall_wait_max_ms": 40.0,     # GUESS.
+    "compile_wait_stuck_s": 20.0,          # GUESS. Seconds in compile wait with no rayTraced=true frame.
+    "compile_wait_min_ms": 28.0,           # GUESS. Fallback when remixShaderCompiles is absent.
+    "compile_wait_max_ms": 40.0,           # GUESS. Fallback when remixShaderCompiles is absent.
     "min_scene_rt_share": 0.99,            # GUESS. Non-goggles scene RT share (con_custodial measured 100.0%).
     }
 SOFT_NM = frozenset({"frame_join_clock"})  # NOT MEASURED does not fail the gate for these checks yet
@@ -747,6 +750,11 @@ def ray_tracing_checks(run: Run, good: list[dict], tsrc: str) -> None:
     if not good:
         run.add("remix_ray_tracing", NOT_MEASURED, None, rt_thresh, "no spot ran far enough to judge", tsrc)
         run.add("remix_compile_stall", NOT_MEASURED, None, cs_thresh, "no spot ran far enough to judge", tsrc)
+        run.add("compile_wait_stuck", NOT_MEASURED, None,
+                f"< {THRESHOLDS['compile_wait_stuck_s']:g} s in compile wait without rayTraced=true (GUESS)",
+                "no spot ran far enough to judge", tsrc)
+        run.add("never_ray_traced", NOT_MEASURED, None, "0 spots with rayTraced=false and remixShaderCompiles==0",
+                "no spot ran far enough to judge", tsrc)
         return
 
     # 1. remix_ray_tracing
@@ -775,28 +783,30 @@ def ray_tracing_checks(run: Run, good: list[dict], tsrc: str) -> None:
                 ok_rt, _ = stop_all_ray_traced(s, w)
                 if not ok_rt:
                     bad_stops.append(f"{s['name']}/{w['name']}")
-        # Seconds from first telemetry frame of the launch (telemetry_launch.jsonl if present, else spot telemetry)
+        # timeToFirstRayTracedS & preRtCompiles from whole-launch telemetry (telemetry_launch.jsonl);
+        # never report 0 when only spot telemetry exists ("not measured").
         launch_path = spot_path(s, s.get("telemetryLaunch")) or os.path.join(s["_dir"], "telemetry_launch.jsonl")
         if os.path.exists(launch_path):
             ltel, _ = read_telemetry(launch_path)
-            lt_label = "from launch start"
+            t_ms = 0.0
+            first_rt_s = None
+            pre_compiles: int | None = None
+            for fr in sorted(ltel):
+                r = ltel[fr]
+                cval = r.get("remixShaderCompiles")
+                if first_rt_s is None and isinstance(cval, (int, float)):
+                    pre_compiles = max(pre_compiles or 0, int(cval))
+                if r.get("rayTraced") is True:
+                    first_rt_s = t_ms / 1000.0
+                    break
+                ft = r.get("frameTimeMs")
+                if isinstance(ft, (int, float)):
+                    t_ms += float(ft)
+            pc_str = str(pre_compiles) if pre_compiles is not None else "-"
+            tt_str = f"{first_rt_s:.1f}s" if first_rt_s is not None else "never RT"
+            launch_times.append(f"{s['name']} timeToFirstRayTracedS={tt_str} preRtCompiles={pc_str}")
         else:
-            ltel = tel
-            lt_label = "from spot start"
-        t_ms = 0.0
-        first_rt_s = None
-        for fr in sorted(ltel):
-            r = ltel[fr]
-            if r.get("rayTraced") is True:
-                first_rt_s = t_ms / 1000.0
-                break
-            ft = r.get("frameTimeMs")
-            if isinstance(ft, (int, float)):
-                t_ms += float(ft)
-        launch_times.append(
-            f"{s['name']} " + (f"{first_rt_s:.1f}s to RT ({lt_label})" if first_rt_s is not None
-                               else f"never RT ({lt_label})")
-        )
+            launch_times.append(f"{s['name']} timeToFirstRayTracedS=not measured preRtCompiles=-")
 
     if missing_rt or not shares:
         run.add("remix_ray_tracing", NOT_MEASURED, None, rt_thresh,
@@ -848,6 +858,58 @@ def ray_tracing_checks(run: Run, good: list[dict], tsrc: str) -> None:
     else:
         run.add("remix_compile_stall", PASS, worst_run, cs_thresh,
                 f"longest rayTraced=false 25..40ms-wait run: {worst_run} frames", tsrc)
+
+    # 3. compile_wait_stuck & never_ray_traced
+    stuck_lim_s = THRESHOLDS["compile_wait_stuck_s"]
+    cw_lo, cw_hi = THRESHOLDS["compile_wait_min_ms"], THRESHOLDS["compile_wait_max_ms"]
+    cw_thresh = f"< {stuck_lim_s:g} s in compile wait without rayTraced=true (GUESS)"
+    stuck_spots, never_rt_spots, missing_cw = [], [], []
+    worst_wait_s = 0.0
+    for s in good:
+        launch_path = spot_path(s, s.get("telemetryLaunch")) or os.path.join(s["_dir"], "telemetry_launch.jsonl")
+        ltel = read_telemetry(launch_path)[0] if os.path.exists(launch_path) else s["_data"]["telemetry"]
+        frames = sorted(ltel)
+        valid = [fr for fr in frames if isinstance(ltel[fr].get("rayTraced"), bool)
+                 and isinstance(ltel[fr].get("frameTimeMs"), (int, float))
+                 and isinstance(ltel[fr].get("gpuTimeMs"), (int, float))]
+        if not frames or len(valid) < len(frames):
+            missing_cw.append(s["name"])
+            continue
+        has_rt = any(ltel[fr]["rayTraced"] is True for fr in frames)
+        if has_rt:
+            continue
+        comp_vals = [int(ltel[fr]["remixShaderCompiles"]) for fr in frames
+                     if isinstance(ltel[fr].get("remixShaderCompiles"), (int, float))]
+        has_comp_field = len(comp_vals) == len(frames)
+        if has_comp_field and max(comp_vals, default=0) == 0:
+            never_rt_spots.append(f"{s['name']} (0 compiles)")
+            continue
+        wait_s = 0.0
+        for fr in frames:
+            r = ltel[fr]
+            ft, gt = float(r["frameTimeMs"]), float(r["gpuTimeMs"])
+            if has_comp_field:
+                if int(r["remixShaderCompiles"]) > 0:
+                    wait_s += ft / 1000.0
+            else:
+                if cw_lo <= (ft - gt) <= cw_hi and not is_proxy_loading(s, fr):
+                    wait_s += ft / 1000.0
+        worst_wait_s = max(worst_wait_s, wait_s)
+        if wait_s >= stuck_lim_s:
+            stuck_spots.append(f"{s['name']} ({wait_s:.1f}s)")
+    if missing_cw:
+        run.add("compile_wait_stuck", NOT_MEASURED, None, cw_thresh,
+                "missing rayTraced/frameTimeMs/gpuTimeMs for: " + ", ".join(missing_cw), tsrc)
+        run.add("never_ray_traced", NOT_MEASURED, None, "rayTraced=true when remixShaderCompiles==0",
+                "missing rayTraced/frameTimeMs/gpuTimeMs for: " + ", ".join(missing_cw), tsrc)
+    else:
+        run.add("compile_wait_stuck", PASS if not stuck_spots else FAIL, round(worst_wait_s, 1), cw_thresh,
+                f"compile-wait hang: {', '.join(stuck_spots)}" if stuck_spots
+                else f"no compile-wait hang (max {worst_wait_s:.1f}s)", tsrc)
+        run.add("never_ray_traced", PASS if not never_rt_spots else FAIL, len(never_rt_spots),
+                "0 spots with rayTraced=false and remixShaderCompiles==0",
+                f"never ray traced with 0 compiles: {', '.join(never_rt_spots)}" if never_rt_spots
+                else "no 0-compile non-RT launch", tsrc)
 
 
 def lightpub_checks(run: Run, good: list[dict], reference: dict[str, dict] | None) -> None:

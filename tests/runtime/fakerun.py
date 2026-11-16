@@ -52,7 +52,8 @@ FRAME_TIMES = {
     "low_fps": (14.0, 12.0),           # 71 FPS: WARN under the 90 target, the gate still passes
     "near_target_fps": (1000.0 / 89.96, 8.0),    # 89.96 FPS: WARN, must print "89.96 FPS" not "90.0 FPS"
     "near_target_89_996": (1000.0 / 89.996, 8.0), # 89.996 FPS: WARN, must print "89.996 FPS" not "90.00 FPS"
-    "never_ray_traced": (35.0, 5.0),               # 28.6 FPS, 30 ms CPU wait with rayTraced=false -> compile stall
+    "never_ray_traced": (35.0, 5.0),               # 28.6 FPS, 30 ms CPU wait with rayTraced=false -> compile_wait_stuck
+    "never_rt_no_compiles": (35.0, 5.0),           # same frames with remixShaderCompiles=0 -> fails never_ray_traced
     "high_latency": (17.5, 9.0),       # 57 FPS, CPU wait 8.5 ms -> fails latency_overhead_ms
     "fps_regression": (11.8, 8.0),     # 84.7 FPS: 15% below the 100 FPS previous run: FAIL
     "fps_drop_9pct": (10.98, 8.0),     # 91 FPS: 9% below the previous run: passes
@@ -95,8 +96,10 @@ class Builder:
                     "passMs": {"InjectRTX": [10.0, 4.0, 1], "InjectRTX/Ray Reconstruction": [5.0, 0.2, 1],
                                "InjectRTX/Ray Reconstruction/Prepare DLSS": [0.3, 0.02, 1]}})
         c = self.case
-        if c == "never_ray_traced":
+        if c in ("never_ray_traced", "never_rt_no_compiles"):
             rec["rayTraced"] = False
+        if c == "never_rt_no_compiles":
+            rec["remixShaderCompiles"] = 0
         if c == "one_stop_not_ray_traced" and wname == "y0_p0":
             rec["rayTraced"] = False
         if c == "pan_not_ray_traced" and kind == "pan":
@@ -312,8 +315,10 @@ class Builder:
                 w["proxy"] = [w["proxy"][0] + 1, w["proxy"][1] + 1]
         gate.save_text(os.path.join(self.dir, "telemetry.jsonl"), "".join(json.dumps(r) + "\n" for r in self.telemetry))
         if self.case == "launch_rt_delay":
-            lrecs = [{"frame": k, "frameTimeMs": 100.0, "rayTraced": False} for k in range(1, 21)]
-            lrecs.append({"frame": 21, "frameTimeMs": 10.0, "rayTraced": True})
+            lrecs = [{"frame": k, "frameTimeMs": 100.0, "gpuTimeMs": 5.0, "rayTraced": False,
+                      "remixShaderCompiles": 3} for k in range(1, 21)]
+            lrecs.append({"frame": 21, "frameTimeMs": 10.0, "gpuTimeMs": 8.0, "rayTraced": True,
+                          "remixShaderCompiles": 0})
             gate.save_text(os.path.join(self.dir, "telemetry_launch.jsonl"),
                            "".join(json.dumps(r) + "\n" for r in lrecs))
         gate.save_text(os.path.join(self.dir, "proxy_frames.csv"), "\n".join(self.proxy) + "\n")
@@ -372,10 +377,14 @@ CASES = {
     "zero_normal_inst": (("zero_normal_instances",), ()),
     "zero_normal_static_tris": (("zero_normal_static_triangles",), ()),
     "zero_normal_static_inst": (("zero_normal_static_instances",), ()),
-    "never_ray_traced": (("remix_ray_tracing", "remix_compile_stall", "latency_overhead_ms"),
+    "never_ray_traced": (("remix_ray_tracing", "remix_compile_stall", "compile_wait_stuck", "latency_overhead_ms"),
                          ("nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
                           "outline_overlap", "flashes", "still_flicker",
                           "goggles_toggle_rebuilds", "goggles_dark_frame")),
+    "never_rt_no_compiles": (("remix_ray_tracing", "remix_compile_stall", "never_ray_traced", "latency_overhead_ms"),
+                             ("nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
+                              "outline_overlap", "flashes", "still_flicker",
+                              "goggles_toggle_rebuilds", "goggles_dark_frame")),
     "goggles_off_only": ((), ()),
     "one_stop_not_ray_traced": (("remix_ray_tracing",),
                                 ("nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
@@ -434,7 +443,7 @@ CASES = {
     "no_telemetry": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms",
                           "skinned_min", "remix_dropped_character_frames", "static_blas_rebuilds",
                           "inward_fraction", "nonfinite_thumb_pixels", "frame_join_clock",
-                          "remix_ray_tracing", "remix_compile_stall",
+                          "remix_ray_tracing", "remix_compile_stall", "compile_wait_stuck", "never_ray_traced",
                           "nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
                           "outline_overlap", "flashes", "still_flicker",
                           "goggles_toggle_rebuilds", "goggles_dark_frame", *_ZERO_NORMALS, *RECORDER)),
@@ -446,7 +455,8 @@ CASES = {
                               "nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
                               "outline_overlap", "flashes", "still_flicker",
                               "goggles_toggle_rebuilds", "goggles_dark_frame", *_ZERO_NORMALS, *RECORDER)),
-    "renamed_fields": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms", "remix_compile_stall")),
+    "renamed_fields": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms",
+                            "remix_compile_stall", "compile_wait_stuck", "never_ray_traced")),
     "no_dumps": ((), ("nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness", "outline_overlap")),
     "no_proxy_gate": ((), ("raster_fallback_frames", "skinned_min", "remix_dropped_character_frames",
                            "remix_ray_tracing")),
@@ -455,7 +465,7 @@ CASES = {
     "spot_error": (("s1: setup",), ("frames_over_50ms", "present_stalls", "min_median_fps", "latency_overhead_ms",
                                     "input_latency_ms", "skinned_min", "remix_dropped_character_frames",
                                     "static_blas_rebuilds", "inward_fraction", "frame_join_clock",
-                                    "remix_ray_tracing", "remix_compile_stall",
+                                    "remix_ray_tracing", "remix_compile_stall", "compile_wait_stuck", "never_ray_traced",
                                     "nonfinite_thumb_pixels", "raster_fallback_frames", "flashes", "still_flicker",
                                     "nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
                                     "outline_overlap", "pose", "goggles", "goggles_toggle_rebuilds",
@@ -484,6 +494,7 @@ CASES = {
 # case -> checks that must WARN (shown in the result; the gate still passes)
 WARNS = {"low_fps": ("min_median_fps",), "near_target_fps": ("min_median_fps",),
          "near_target_89_996": ("min_median_fps",), "never_ray_traced": ("min_median_fps",),
+         "never_rt_no_compiles": ("min_median_fps",),
          "high_latency": ("min_median_fps",), "fps_regression": ("min_median_fps",)}
 PREVIOUS = {"fps_regression", "fps_drop_9pct"}    # judged against a previous run: the healthy 100 FPS run
 NO_REFERENCE = {"no_reference"}                  # run without --reference
