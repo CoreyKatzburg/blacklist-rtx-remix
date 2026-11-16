@@ -2,6 +2,7 @@
 
 #include "lightpub.h"
 #include "proxy_log.h"
+#include "texture_fill.h"
 
 #include <psapi.h>
 #include <tlhelp32.h>
@@ -518,8 +519,10 @@ void CaptureDrawFull(IDirect3DDevice9* device,
         else if (type == D3DRTYPE_CUBETEXTURE) static_cast<IDirect3DCubeTexture9*>(texture)->GetLevelDesc(0, &d);
         DWORD srgb = 0;
         device->GetSamplerState(i, D3DSAMP_SRGBTEXTURE, &srgb);
-        DumpAppend("\tt%lu=%p,ty%u,%ux%u,f%u,u%lX,l%lu,srgb%lu", i, texture, static_cast<UINT>(type), d.Width, d.Height,
-                   static_cast<UINT>(d.Format), d.Usage, texture->GetLevelCount(), srgb);
+        char fill[48];
+        proxy::FormatTextureFill(texture, fill, sizeof fill);
+        DumpAppend("\tt%lu=%p,ty%u,%ux%u,f%u,u%lX,l%lu,srgb%lu%s", i, texture, static_cast<UINT>(type), d.Width, d.Height,
+                   static_cast<UINT>(d.Format), d.Usage, texture->GetLevelCount(), srgb, fill);
         texture->Release();
     }
     {

@@ -24,6 +24,7 @@
 #include "proxy_diagnostics.h"
 #include "proxy_log.h"
 #include "proxy_types.h"
+#include "texture_fill.h"
 
 #pragma intrinsic(_ReturnAddress)
 
@@ -315,6 +316,9 @@ bool LoadRealD3D9(HINSTANCE proxyInstance) {
                     GetPrivateProfileIntW(L"Proxy", L"PresentHook", 0, iniPath) != 0;
     g_queryMode = GetPrivateProfileIntW(L"Proxy", L"QueryMode", 1, iniPath);
     g_formatGuard = GetPrivateProfileIntW(L"Proxy", L"FormatGuard", 1, iniPath) != 0;
+    proxy::SetTextureFillCounts(GetPrivateProfileIntW(L"Proxy", L"TextureFillCounts", debuggingTelemetry, iniPath) != 0);
+    WriteLog("Proxy keys: EnableDebuggingTelemetry %d, TextureFillCounts %d", debuggingTelemetry,
+             proxy::TextureFillCountsEnabled() ? 1 : 0);
 
     // Decal hashes are pre-populated offline in rtx.conf (build_materials.py); runtime LockRect tagging stays off unless requested.
     const bool decalTag = GetPrivateProfileIntW(L"Proxy", L"DecalTag", 0, iniPath) != 0;
@@ -919,10 +923,11 @@ void HookShaderRelease(void* shader, bool vertex) {
 HRESULT WINAPI HookLockRect(IDirect3DTexture9* self, UINT level, D3DLOCKED_RECT* locked,
                             const RECT* rect, DWORD flags) {
     CallTimer timer(proxy::kTextureLock);
-    if (!proxy::IsTexStatsEnabled()) return g_lockRect(self, level, locked, rect, flags);
+    const auto lock = [&] { return g_lockRect(self, level, locked, rect, flags); };
+    if (!proxy::IsTexStatsEnabled()) return proxy::LockRectCounted(self, lock);
     LARGE_INTEGER start, end;
     QueryPerformanceCounter(&start);
-    const HRESULT result = g_lockRect(self, level, locked, rect, flags);
+    const HRESULT result = proxy::LockRectCounted(self, lock);
     QueryPerformanceCounter(&end);
     proxy::RecordTextureLock(_ReturnAddress(), self, level, rect, flags,
                              proxy::QpcToMilliseconds(end.QuadPart - start.QuadPart), g_presentCount);
@@ -1138,7 +1143,9 @@ HRESULT WINAPI HookCreateTexture(IDirect3DDevice9* self, UINT width, UINT height
     QueryPerformanceCounter(&start);
     {
         CallTimer timer(proxy::kCreateTexture);
-        result = g_createTexture(self, width, height, levels, usage, format, pool, texture, shared);
+        result = proxy::CreateTextureCounted(pool, texture, [&] {
+            return g_createTexture(self, width, height, levels, usage, format, pool, texture, shared);
+        });
     }
     QueryPerformanceCounter(&end);
     if (SUCCEEDED(result) && texture && *texture) {
@@ -1225,7 +1232,7 @@ HRESULT WINAPI HookUpdateSurface(IDirect3DDevice9* self, IDirect3DSurface9* sour
 
 HRESULT WINAPI HookUpdateTexture(IDirect3DDevice9* self, IDirect3DBaseTexture9* source, IDirect3DBaseTexture9* destination) {
     CallTimer timer(proxy::kUpdateTexture);
-    return g_updateTexture(self, source, destination);
+    return proxy::UpdateTextureCounted(destination, [&] { return g_updateTexture(self, source, destination); });
 }
 
 HRESULT WINAPI HookGetRenderTargetData(IDirect3DDevice9* self, IDirect3DSurface9* target, IDirect3DSurface9* destination) {
@@ -1375,6 +1382,13 @@ bool PatchDevice(IDirect3DDevice9* device) {
             {36, reinterpret_cast<void*>(&HookCreateOffscreenPlainSurface), reinterpret_cast<void**>(&g_createOffscreenPlainSurface)},
         };
         HookObjectMethods(device, guardSlots, ARRAYSIZE(guardSlots));
+    }
+    if (proxy::TextureFillCountsEnabled()) {
+        const MethodSlot fillSlots[] = {
+            {23, reinterpret_cast<void*>(&HookCreateTexture), reinterpret_cast<void**>(&g_createTexture)},
+            {31, reinterpret_cast<void*>(&HookUpdateTexture), reinterpret_cast<void**>(&g_updateTexture)},
+        };
+        HookObjectMethods(device, fillSlots, ARRAYSIZE(fillSlots));
     }
     if (proxy::IsTexStatsEnabled()) {
         const MethodSlot statSlots[] = {
