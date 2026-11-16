@@ -615,24 +615,52 @@ class Spot:
                 time.sleep(0.1)
         return -1
 
+    OFF_POSE_DEG = 1.0   # a stop further than this from the asked view (yaw or pitch) is off-pose
+    POSE_TRIES = 3
+
+    def pose_error(self, poses: list[list[float]]) -> float:
+        """Largest yaw or pitch distance, in degrees, of the game-memory poses from the stop's asked view."""
+        return round(max(max(abs(gate.wrap(y - self.yaw)), abs(p - self.pitch)) for y, p in poses), 2)
+
     def stop(self, name: str, outline: str | None = None) -> None:
+        """One still stop. The camera direction is read from game memory before and after the capture; a stop more
+        than OFF_POSE_DEG from the asked view is renamed <name>_offpose<n> (kind "off_pose", which no check
+        reads), steered back and taken again, up to POSE_TRIES times (worker F2, Nov 16: 24 of 25 Paladin reference
+        stops were off by up to 69.5 degrees). The kept window records offPoseDeg, poseTries and, when every try
+        missed, offPose true so a check can refuse it."""
         rel = f"frames/{name}.gray"
-        snapped = self.snap_pose() if self.no_remix else None
-        self.hold(0.5)
-        waited = self.steady()
-        self.window(name + "_settle", "settle", lambda: self.hold(0.5), steadyWait=waited)
-        before = self.rel_pose()
-        got: dict = {}
-        if self.no_remix:   # no Remix dumps to ask for; the reference picture is the screen itself
-            grab = lambda: got.update(self._try_raster(name, "no_remix"))
-        else:
-            grab, got = (lambda: self.dump(name)), {"dump": name}
-        w = self.window(name, "still", lambda: (self.capture(rel, 20), grab()),
-                        frames=rel, frameSize=[CAP_W, CAP_H], **({"outline": outline} if outline else {}))
-        w.update(got)
-        w["gamePose"] = [before, self.rel_pose()]   # [yaw, pitch] from game memory at the start and end of the stop
-        if snapped is not None:
-            w["poseWrites"] = snapped
+        missed: list[dict] = []
+        for attempt in range(1, self.POSE_TRIES + 1):
+            if attempt > 1:
+                self.move(f"to_{name}_retry{attempt}", self.yaw, self.pitch, 0.3)
+            snapped = self.snap_pose() if self.no_remix else None
+            self.hold(0.5)
+            waited = self.steady()
+            settle = self.window(name + "_settle", "settle", lambda: self.hold(0.5), steadyWait=waited)
+            before = self.rel_pose()
+            got: dict = {}
+            if self.no_remix:   # no Remix dumps to ask for; the reference picture is the screen itself
+                grab = lambda: got.update(self._try_raster(name, "no_remix"))
+            else:
+                grab, got = (lambda: self.dump(name)), {"dump": name}
+            w = self.window(name, "still", lambda: (self.capture(rel, 20), grab()),
+                            frames=rel, frameSize=[CAP_W, CAP_H], **({"outline": outline} if outline else {}))
+            w.update(got)
+            w["gamePose"] = [before, self.rel_pose()]   # [yaw, pitch] from game memory at the start and end
+            if snapped is not None:
+                w["poseWrites"] = snapped
+            w["offPoseDeg"] = self.pose_error(w["gamePose"])
+            if w["offPoseDeg"] <= self.OFF_POSE_DEG or attempt == self.POSE_TRIES:
+                break
+            for x in (settle, w):   # kept for the record under another name; no check reads kind "off_pose"
+                x["name"], x["kind"] = f"{x['name']}_offpose{attempt}", "off_pose"
+            missed.append({"try": attempt, "offPoseDeg": w["offPoseDeg"], "gamePose": w["gamePose"]})
+        w["poseTries"] = attempt
+        if missed:
+            w["offPoseTries"] = missed
+        if w["offPoseDeg"] > self.OFF_POSE_DEG:
+            w["offPose"] = True
+            print(f"OFF POSE {name}: {w['offPoseDeg']} degrees from the asked view after {attempt} tries")
         w["samMoved"] = self.sam_moved(name)
         if not self.no_remix and name in self.spot.get("rasterStops", ["y0_p0"]):
             self.raster_rt_off(name)

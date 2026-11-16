@@ -139,6 +139,43 @@ class Steering(unittest.TestCase):
         s.yaw = 0.0
         self.assertEqual(s.snap_pose(), -1)   # three writes and still off: recorded as poseWrites -1
 
+    def test_off_pose_stop_is_retried_and_marked(self):
+        # Paladin reference, Nov 16: stops were captured 4 to 157 degrees from the asked view and nothing said so.
+        def run(poses_per_try, no_remix=True):
+            s = drive.Spot.__new__(drive.Spot)
+            s.yaw, s.pitch, s.no_remix, s.windows, s.spot = 90.0, -30.0, no_remix, [], {}
+            s.counters = lambda: {"telemetry": 0, "proxy": 0}
+            seq = iter([p for pair in poses_per_try for p in pair])
+            s.rel_pose = lambda: next(seq)
+            moves = []
+            s.move = lambda name, yaw, pitch, seconds: moves.append((name, yaw, pitch))
+            s.snap_pose = lambda: 0
+            s.hold = lambda seconds, until=None: None
+            s.steady = lambda: 0.0
+            s.capture = lambda rel, frames: None
+            s._try_raster = lambda name, how: {}
+            s.dump = lambda tag: None
+            s.sam_moved = lambda name: 0.0
+            s.stop("y90_p-30")
+            return s, moves
+        on, off = [90.2, -30.1], [-91.0, -30.0]   # -91 is 179 degrees from 90 once wrapped, not 181
+        s, moves = run([[off, on], [on, [91.6, -30.0]], [on, on]])
+        kept = [w for w in s.windows if w["kind"] == "still"]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["name"], "y90_p-30")
+        self.assertEqual(kept[0]["poseTries"], 3)
+        self.assertEqual([t["offPoseDeg"] for t in kept[0]["offPoseTries"]], [179.0, 1.6])
+        self.assertNotIn("offPose", kept[0])
+        self.assertEqual([w["name"] for w in s.windows if w["kind"] == "off_pose"],
+                         ["y90_p-30_settle_offpose1", "y90_p-30_offpose1", "y90_p-30_settle_offpose2", "y90_p-30_offpose2"])
+        self.assertEqual([m[1:] for m in moves], [(90.0, -30.0), (90.0, -30.0)])   # steered back to the asked view
+        s, _ = run([[on, [90.0, -31.2]]] * 3)   # off on every try: kept, but marked
+        kept = [w for w in s.windows if w["kind"] == "still"]
+        self.assertTrue(kept[0]["offPose"])
+        self.assertEqual(kept[0]["offPoseDeg"], 1.2)
+        s, moves = run([[on, [90.9, -29.1]]], no_remix=False)   # 0.9 degrees: on pose, one try
+        self.assertEqual((s.windows[-1]["poseTries"], moves), (1, []))
+
     def test_stop_waits_out_a_stall_before_capturing(self):
         # Paladin, Nov 15: frames of 0.5 to 1.6 s for several seconds after the full turn.
         s = self.run_with(22, 7.0, -9.0, 7.0, -9.0)
