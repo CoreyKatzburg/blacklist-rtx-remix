@@ -322,7 +322,9 @@ function Get-DisplayDuring([string]$csv) {
     $rows = @(if (Test-Path -LiteralPath $csv) { Import-Csv -LiteralPath $csv })
     $off = @($rows | Where-Object display -ne 'on')
     [ordered]@{ samples = $rows.Count; awakeThroughout = ($rows.Count -gt 0 -and $off.Count -eq 0); notAwake = $off.Count
-                keptAwakeSamples = @($rows | Where-Object displayRequired -eq '1').Count
+                # System-wide flag: set by any program, not only the gate's hold. Run 20261116-171502 did not ask for the
+                # hold, yet 158 of 183 samples had it set while the game ran, so this cannot prove whose hold it is.
+                displayRequiredSamples = @($rows | Where-Object displayRequired -eq '1').Count
                 firstNotAwake = $(if ($off) { "$($off[0].time) $($off[0].display)" } else { $null })
                 maxIdleSeconds = $(if ($rows) { ($rows | ForEach-Object { [double]$_.idleSeconds } | Measure-Object -Maximum).Maximum } else { $null }) }
 }
@@ -749,7 +751,7 @@ try {
                 if (-not $man.PSObject.Properties['displayDuring']) { $man | Add-Member displayDuring ([pscustomobject]@{}) }
                 $man.displayDuring | Add-Member $run.dir ([pscustomobject]$d) -Force
                 $man | ConvertTo-Json -Depth 6 | Set-Content $path
-                Write-Step "$($run.dir): displays awake throughout: $($d.awakeThroughout) ($($d.samples) samples, $($d.notAwake) not awake$(if ($d.firstNotAwake) { ', first ' + $d.firstNotAwake }), longest without input $($d.maxIdleSeconds) s, kept awake by the gate in $($d.keptAwakeSamples) samples$(if (-not $keepAwake) { ', not asked: this launch sleeps them on purpose' }))"
+                Write-Step "$($run.dir): displays awake throughout: $($d.awakeThroughout) ($($d.samples) samples, $($d.notAwake) not awake$(if ($d.firstNotAwake) { ', first ' + $d.firstNotAwake }), longest without input $($d.maxIdleSeconds) s, display-required flag set by some program in $($d.displayRequiredSamples) samples$(if (-not $keepAwake) { ', not asked: this launch sleeps them on purpose' }))"
             } catch { Write-Step "$($run.dir): display log not read: $($_.Exception.Message)" } }
             $smi = $null; $mem = $null; $disp = $null
             if ($run.variant) {   # back to the baseline before the next variant (the game is closed by now)
