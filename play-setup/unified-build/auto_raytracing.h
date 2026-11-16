@@ -5,8 +5,9 @@
 // Why the scene matters: with ray tracing off, Remix clears its whole scene (every BLAS, instance and texture
 // binding, after a GPU wait) once more than rtx.sceneKeepAliveFrames frames go by (rtx_context.cpp, default 0, so
 // at the first frame). Goggles switch ray tracing off only to show the game's own picture, so a clear there made
-// every goggle toggle rebuild the level when ray tracing came back. Now Remix keeps the scene during that pause
-// and clears it only when the level itself goes away (loading, menus without a level).
+// every goggle toggle rebuild the level when ray tracing came back. Now Remix keeps the scene while a level is
+// loaded, through the pause and after it, and clears it only when the level itself goes away (loading, menus
+// without a level).
 
 #include <cstdint>
 
@@ -14,7 +15,7 @@ namespace proxy {
 
 constexpr uint32_t kLevelOnFrames = 60;          // frames of game lights before a level counts as loaded
 constexpr uint32_t kLevelOffFrames = 30;         // frames without lights before it counts as gone
-constexpr uint32_t kKeepSceneFrames = 1000000;   // rtx.sceneKeepAliveFrames during a pause (4.6 h at 60 FPS)
+constexpr uint32_t kKeepSceneFrames = 1000000;   // rtx.sceneKeepAliveFrames while a level is loaded (4.6 h at 60 FPS)
 
 struct AutoRtAction {
     bool send = false;        // send both options below this frame (keep-alive first, then enableRaytracing)
@@ -39,9 +40,12 @@ public:
 
         AutoRtAction action;
         action.raytracing = levelLoaded_ && !showGamePicture;
-        action.keepScene = levelLoaded_ && showGamePicture;   // a pause inside a loaded level
+        // Keep the scene for as long as the level is loaded, not only during the pause. Dropping the keep-alive to 0
+        // when goggles come off landed a Remix frame before ray tracing did (or on a frame without a valid camera),
+        // so Remix cleared and rebuilt every mesh and showed one dark frame on each goggles-off.
+        action.keepScene = levelLoaded_;
         const int want = action.raytracing ? 1 : 0;
-        action.send = want != state_ || (!action.raytracing && action.keepScene != keepScene_);
+        action.send = want != state_ || action.keepScene != keepScene_;
         // Before any level has loaded there is nothing to switch off (rtx.conf starts with ray tracing off).
         if (state_ < 0 && !action.raytracing && !levelLoaded_) action.send = false;
         if (action.send) {

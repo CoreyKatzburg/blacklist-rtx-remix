@@ -917,6 +917,8 @@ struct GoggleReplay {
     bool keptSceneForGoggles = false;
     bool clearedSceneOnUnload = false;
     uint64_t skippedWhileGoggles = 0;
+    int remixClearsInLevel = 0;      // Remix scene clears while the level is loaded (each one rebuilds every mesh)
+    int remixClearsAfterUnload = 0;
 };
 
 // Replays the proxy's per-frame order (HookPresent): SetShowGamePicture(GogglesActive) -> lightpub::OnPresent
@@ -936,8 +938,28 @@ GoggleReplay ReplayGoggles(const fs::path& tsvPath, const ShaderBank& bank) {
     GoggleReplay out;
     constexpr int kLevelStart = 0, kGogglesOn = 120, kGogglesOff = 240, kUnload = 300, kEnd = 360;
     int rtState = 0;  // what Remix has (rtx.conf starts with ray tracing off)
+    // Remix's side (rtx_context.cpp, the branch that calls SceneManager::clear): an option sent at a Present lands on a
+    // later Remix frame, the keep-alive first and enableRaytracing one frame after it (lightpub sends them in that
+    // order). The first frame back with ray tracing counts as having no valid camera, which Remix also counts as a frame
+    // without a scene. Every goggles-off in the Nov 14 recordings rebuilt the whole scene this way
+    // (tests/analysis/goggles_off_frames.py: 26 of 26 at 14:35, 29 of 32 at 18:55).
+    int64_t keepNext = -1, rtNext = -1, rtAfter = -1;
+    uint32_t remixKeepAlive = 0, framesWithoutScene = 0;
+    bool remixRt = false;
     for (int f = kLevelStart; f < kEnd; ++f) {
         const bool inLevel = f < kUnload;
+        const bool rtBefore = remixRt;
+        if (rtNext >= 0) remixRt = rtNext != 0;
+        rtNext = std::exchange(rtAfter, -1);
+        if (keepNext >= 0) remixKeepAlive = static_cast<uint32_t>(std::exchange(keepNext, -1));
+        if (!remixRt || !rtBefore) {
+            if (++framesWithoutScene > remixKeepAlive) {
+                if (f >= static_cast<int>(proxy::kLevelOnFrames) + 3 && f < kUnload) ++out.remixClearsInLevel;
+                if (f >= kUnload) ++out.remixClearsAfterUnload;
+            }
+        } else {
+            framesWithoutScene = 0;
+        }
         const bool goggleFrame = f >= kGogglesOn && f < kGogglesOff;
         // The draws of frame f run with the state decided at the previous Present.
         bool gogglesAtPresent = false;
@@ -949,6 +971,8 @@ GoggleReplay ReplayGoggles(const fs::path& tsvPath, const ShaderBank& bank) {
         const proxy::AutoRtAction a = autoRt.Update(inLevel, gogglesAtPresent);
         if (!a.send) continue;
         rtState = a.raytracing ? 1 : 0;
+        keepNext = a.keepScene ? proxy::kKeepSceneFrames : 0;
+        rtAfter = rtState;
         if (!a.raytracing && a.keepScene && f >= kGogglesOn && out.framesToRtOff < 0) {
             out.framesToRtOff = f - kGogglesOn;
             out.keptSceneForGoggles = true;
@@ -1148,6 +1172,10 @@ int main() {
     TEST_ASSERT(g.skippedWhileGoggles == 0, "Goggles: %llu game draws skipped while the game's picture shows",
                 g.skippedWhileGoggles);
     TEST_ASSERT(g.clearedSceneOnUnload, "Level unload: Remix scene not cleared");
+    TEST_ASSERT(g.remixClearsInLevel == 0,
+                "Goggles off: Remix cleared its scene %d times inside the level (sceneKeepAliveFrames dropped to 0 while "
+                "ray tracing was not yet back, so every mesh is rebuilt and the first frame is dark)", g.remixClearsInLevel);
+    TEST_ASSERT(g.remixClearsAfterUnload > 0, "Level unload: the Remix model never cleared, so the check above proves nothing");
 
     // 8. Every recorded game light through light_calibration.h, as lightpub publishes it.
     const fs::path publishedTsv = remixRoot / "tests" / "lightcal_published.tsv";
