@@ -22,8 +22,8 @@ $SteamGameUrl = 'steam://rungameid/235600'
 
 # Original exe, and the same exe with the Large Address Aware flag set (one header byte, 2026-10-26).
 $GameExeHashes = @('158EFC5D0940FCAF3E4B16952C8F8861E16061509D9EB8EB5FF4AE3249BB5A05', 'EF8088D6676310F4B1DA2958C76524EE748B0043DE4B795254ECBBCEB5B77540')
-# Camera proxy: verified d3d9.dll SHA-256 (2026-11-16, tools\remix aeb614f StandInSkipUnplaced default 1 and StandInSkipSamGear, built from a clean export of aeb614f).
-$ProxyHash = 'D26A1906B1D960C5FD086C3ECB68860783FEA037CACD53BFC2A0B0FB4D6BE5AD'
+# Camera proxy: verified d3d9.dll SHA-256 (2026-11-16, tools\remix bcf9fb4 WeaponSpotByShape and KeepTrackedLights keys and the ini write-time reload check, built from a clean export of bcf9fb4).
+$ProxyHash = '61390EF0AFBAEFABECFD95EBCB55ED608CBA0C65F4A64540DFB2845D748AFF1C'
 # Proxy build that sits disabled as d3d9.dll.off when Remix is off.
 $RestingProxyHash = '593F0D47E95DDB768EC087636FA78E07FADBB600BD6EBB617D7714D4ADD2C18E'
 
