@@ -125,7 +125,7 @@ void LoadSettings(const wchar_t* ini) {
         GetPrivateProfileIntW(L"Lights", L"StandInSkipUnplaced", lightcal::StandInOptions{}.skipUnplaced, ini) != 0;
     s.standInSkipMoving = GetPrivateProfileIntW(L"Lights", L"StandInSkipMoving", 0, ini) != 0;
     s.standInSkipSamGear = GetPrivateProfileIntW(L"Lights", L"StandInSkipSamGear", 0, ini) != 0;
-    s.tuning.weaponSpotByShape = GetPrivateProfileIntW(L"Lights", L"WeaponSpotByShape", 0, ini) != 0;
+    s.tuning.weaponSpotByShape = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Lights", L"WeaponSpotByShape", 0, ini)), 0, 2);
     s.keepTrackedLights = GetPrivateProfileIntW(L"Lights", L"KeepTrackedLights", 0, ini) != 0;
     s.standInRadius = IniFloat(ini, L"StandInRadius", 2.5f);
     s.standInIntensity = IniFloat(ini, L"StandInIntensity", 20.0f);
@@ -580,7 +580,7 @@ void LogSettings(const char* what) {
                      "skip sam gear %d, stand-in skip unplaced %d, skip moving %d)", what,
                      g_settings.tuning.radianceScale, g_settings.tuning.sunRadianceScale, g_settings.includeFill ? 1 : 0,
                      g_settings.maxLights, g_settings.flareStandIns ? 1 : 0, g_settings.trace ? 1 : 0,
-                     g_settings.tuning.weaponSpotByShape ? 1 : 0, g_settings.keepTrackedLights ? 1 : 0,
+                     g_settings.tuning.weaponSpotByShape, g_settings.keepTrackedLights ? 1 : 0,
                      g_settings.standInSkipSamGear ? 1 : 0, g_settings.standInSkipUnplaced ? 1 : 0,
                      g_settings.standInSkipMoving ? 1 : 0);
 }

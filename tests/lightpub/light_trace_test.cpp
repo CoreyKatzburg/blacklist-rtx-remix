@@ -167,12 +167,12 @@ static void KeyCases() {
     // WeaponSpotByShape: a guard flashlight at range 545 is weapon class by shape; the range rule (<= 100) says no.
     {
         lightcal::Tuning shape;
-        shape.weaponSpotByShape = true;
+        shape.weaponSpotByShape = 1;
         lightcal::PublishedLight byShape, byRange;
         CHECK(lightcal::ConvertGameLight(GuardFlashlight(545.0f), shape, &byShape) &&
                   lightcal::ConvertGameLight(GuardFlashlight(545.0f), lightcal::Tuning{}, &byRange),
               "guard flashlight must convert");
-        CHECK(lightcal::IsWeaponSpotlight(GuardFlashlight(545.0f), true) && byShape.radius == lightcal::kWeaponSpotRadiusCm,
+        CHECK(lightcal::IsWeaponSpotlight(GuardFlashlight(545.0f), 1) && byShape.radius == lightcal::kWeaponSpotRadiusCm,
               "by shape: guard flashlight at range 545 is not weapon class (radius %g)", byShape.radius);
         CHECK(!lightcal::IsWeaponSpotlight(GuardFlashlight(545.0f)) && byRange.radius != lightcal::kWeaponSpotRadiusCm,
               "range rule: guard flashlight at range 545 should be a ball, as today");
@@ -182,16 +182,29 @@ static void KeyCases() {
         lightcal::NodeData n = Light(2, 1.0f, 550.0f);
         n.nearSize[0] = n.nearSize[1] = 100.0f;
         n.nearDistance = 80.0f;
-        CHECK(!lightcal::IsWeaponSpotlight(n, true) && !lightcal::IsWeaponSpotlight(n),
+        CHECK(!lightcal::IsWeaponSpotlight(n, 1) && !lightcal::IsWeaponSpotlight(n, 2) && !lightcal::IsWeaponSpotlight(n),
               "architectural spot 550 / 100x100 at 80 classified as a weapon light");
     }
+    // WeaponSpotByShape=2 never publishes a guard flashlight as weapon class, at any range, including the range 50 that
+    // the range rule (value 0) sends to weapon class.
+    {
+        lightcal::Tuning ball;
+        ball.weaponSpotByShape = 2;
+        for (const float range : {50.0f, 80.0f, 155.0f, 545.0f, 1000.0f}) {
+            lightcal::PublishedLight p;
+            CHECK(lightcal::ConvertGameLight(GuardFlashlight(range), ball, &p) && p.radius != lightcal::kWeaponSpotRadiusCm &&
+                      p.volumetricRadianceScale != lightcal::kWeaponSpotVolumetricScale,
+                  "by shape 2: guard flashlight at range %g published as weapon class (radius %g)", range, p.radius);
+        }
+        CHECK(lightcal::IsWeaponSpotlight(GuardFlashlight(50.0f)), "range rule: guard flashlight at range 50 is weapon");
+    }
     // The "weapon flips" count: a guard flashlight whose range crosses 100 between frames flips under today's rule
-    // and never by shape.
-    for (const bool byShape : {false, true}) {
+    // and never by shape, with either class.
+    for (const int byShape : {0, 1, 2}) {
         Lifecycle s;
         s.tuning.weaponSpotByShape = byShape;
         for (int f = 0; f < 6; ++f) s.Step({{7, GuardFlashlight(f % 2 ? 545.0f : 80.0f)}});
-        CHECK(s.weaponFlips == (byShape ? 0u : 5u), "weapon flips by %s: %u, want %u", byShape ? "shape" : "range",
+        CHECK(s.weaponFlips == (byShape ? 0u : 5u), "weapon flips with WeaponSpotByShape=%d: %u, want %u", byShape,
               s.weaponFlips, byShape ? 0u : 5u);
     }
 }

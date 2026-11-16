@@ -48,7 +48,9 @@ constexpr float kWeaponSpotVolumetricScale = 2.0f;
 // The guard flashlight's beam shape: near plane 50 x 50 at 150. In 46 saved dumps (Nov 16) it appears 447 times as
 // type 2, always with flags 58B2, and no other light has it. Its range is not stable: lit rows run 50 to 1000 (median
 // 155), so the range rule above sends one flashlight in and out of weapon class (3 cm lens vs a 20-35 cm ball with
-// 1/11-1/98 of the power). [Lights] WeaponSpotByShape=1 classifies on this shape instead; off by default.
+// 1/11-1/98 of the power). [Lights] WeaponSpotByShape classifies on this shape instead: 1 makes every guard flashlight
+// weapon class, 2 makes every one a ball (no other light passes the range rule in those dumps, so 2 means no weapon
+// class at all). 0, the default, is the range rule.
 constexpr float kWeaponSpotNearWidthCm = 50.0f, kWeaponSpotNearHeightCm = 50.0f, kWeaponSpotNearDistanceCm = 150.0f;
 
 // ---- Room fill (game type 4, SH probes) -------------------------------------------------------------------------
@@ -80,7 +82,7 @@ struct Tuning {
     float spotSoftness = 0.1f;       // [Lights] SpotSoftness
     float sunAngularDiameter = 0.53f;// [Lights] SunAngularDiameter, degrees
     float shScale = 1.0f;            // the game's cSHScale, read from its character draws (1 until one is seen)
-    bool weaponSpotByShape = false;  // [Lights] WeaponSpotByShape: guard flashlights by beam shape, not range
+    int weaponSpotByShape = 0;       // [Lights] WeaponSpotByShape: 0 range rule, 1 guard shape -> weapon, 2 -> ball
 };
 
 enum class Kind : uint8_t { None, Sphere, Distant, Dome };
@@ -245,11 +247,13 @@ inline bool Qualifies(const NodeData& n, bool alreadyTracked = false) {
     const float v = MaxComponent(n.color) * n.intensity;
     return alreadyTracked ? v >= 0.0f : v > 1e-4f;  // both reject NaN
 }
-inline bool IsWeaponSpotlight(const NodeData& n, bool byShape = false) {
-    if (byShape)
-        return n.type == 2 && std::fabs(n.nearSize[0] - kWeaponSpotNearWidthCm) < 0.5f &&
-               std::fabs(n.nearSize[1] - kWeaponSpotNearHeightCm) < 0.5f &&
-               std::fabs(n.nearDistance - kWeaponSpotNearDistanceCm) < 0.5f;
+// byShape: the WeaponSpotByShape value (see kWeaponSpotNearWidthCm).
+inline bool IsWeaponSpotlight(const NodeData& n, int byShape = 0) {
+    const bool guardShape = n.type == 2 && std::fabs(n.nearSize[0] - kWeaponSpotNearWidthCm) < 0.5f &&
+                            std::fabs(n.nearSize[1] - kWeaponSpotNearHeightCm) < 0.5f &&
+                            std::fabs(n.nearDistance - kWeaponSpotNearDistanceCm) < 0.5f;
+    if (byShape == 1) return guardShape;
+    if (byShape == 2 && guardShape) return false;
     return n.type == 2 && n.range > 0.0f && n.range <= kWeaponSpotMaxGameRangeCm &&
            n.nearDistance > n.range && n.nearSize[0] > 0.0f && n.nearSize[1] > 0.0f;
 }
