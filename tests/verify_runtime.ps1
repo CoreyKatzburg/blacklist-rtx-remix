@@ -671,19 +671,20 @@ try {
             # Memory, page file and C: every 2 s for the whole launch (coordinator, Nov 16: lined up against freezes).
             $mem = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
                 '-File', ('"' + (Join-Path $Runtime 'mem_sampler.ps1') + '"'), '-Out', ('"' + (Join-Path $spotDir 'memory.csv') + '"'))
-            # Display state and time since the last input every 2 s (coordinator, Nov 16: a launch whose displays fall
-            # asleep halfway must be marked; manifest displayDuring.<launch>). The same process keeps the displays awake
-            # for the launch (ES_DISPLAY_REQUIRED, dropped by Windows when it is killed below), except in a launch whose
-            # live steps put them to sleep on purpose.
-            $keepAwake = -not (Test-SleepsDisplays $spot)
-            $disp = Start-Process $Py -WindowStyle Hidden -PassThru -ArgumentList (@('-I', ('"' + (Join-Path $Runtime 'display.py') + '"'),
-                'watch', '--out', ('"' + (Join-Path $spotDir 'display.csv') + '"')) + @(if ($keepAwake) { '--keep-awake' }))
             # The proxy appends its hitch list across launches (worker C, Nov 16): each launch starts it empty, and one
             # left from outside this run is kept beside this launch.
             if (Test-Path -LiteralPath $hitchList) { Move-Item -LiteralPath $hitchList (Join-Path $spotDir 'proxy_hitches_before_launch.txt') -Force }
             $cSpace = Get-LaunchProblem (Add-CDriveSample $runDir $run.dir 'before')
             if ($cSpace) { throw $cSpace }
             Add-MachineState $runDir $run.dir $spotDir
+            # Display state and time since the last input every 2 s (coordinator, Nov 16: a launch whose displays fall
+            # asleep halfway must be marked; manifest displayDuring.<launch>). The same process keeps the displays awake
+            # for the launch (ES_DISPLAY_REQUIRED, dropped by Windows when it is killed below), except in a launch whose
+            # live steps put them to sleep on purpose. It starts after Add-MachineState's wake, so its first sample is not the idle
+            # time from before the launch (run 20261116-174116 began with 1235.6 s, then 1.9 s).
+            $keepAwake = -not (Test-SleepsDisplays $spot)
+            $disp = Start-Process $Py -WindowStyle Hidden -PassThru -ArgumentList (@('-I', ('"' + (Join-Path $Runtime 'display.py') + '"'),
+                'watch', '--out', ('"' + (Join-Path $spotDir 'display.csv') + '"')) + @(if ($keepAwake) { '--keep-awake' }))
             $game = Start-GameAtCheckpoint
             # Other programs holding the GPU (Windows reports their names; per-process memory reads N/A).
             & nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv 2>&1 | Set-Content (Join-Path $spotDir 'gpu_apps.csv')

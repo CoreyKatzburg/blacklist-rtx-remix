@@ -186,6 +186,17 @@ for ($m = 0; $m -lt $mutantNames.Count; $m++) {
 }
 . Use-LockFns $lockFns
 Stop-Process -Id $live.Id -Force -ErrorAction SilentlyContinue
+# The display watcher starts after the pre-launch wake (run 20261116-174116 started it before, and its first sample,
+# 1235.6 s without input from before the launch, became the launch's "longest without input").
+function WatchAfterWake([string]$text) {
+    $wake = $text.IndexOf('Add-MachineState $runDir $run.dir $spotDir'); $watch = $text.IndexOf("'watch', '--out'")
+    $wake -ge 0 -and $watch -gt $wake
+}
+$gateText = Get-Content -Raw $Gate
+Check 'display watcher starts after the pre-launch wake' (WatchAfterWake $gateText)
+$i = $gateText.IndexOf('Add-MachineState $runDir $run.dir $spotDir')
+Check 'rule broken (watcher moved before the wake): the order check fails' `
+    (-not (WatchAfterWake ($gateText.Substring(0, $i) + "'watch', '--out' " + $gateText.Substring($i).Replace("'watch', '--out'", "'w'"))))
 "failures $fail"
 exit [int]($fail -gt 0)
 
