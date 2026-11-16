@@ -37,6 +37,14 @@ class Span(unittest.TestCase):
         start, _ = cinematic.find_span(rows, 1.0, rows[100][1])
         self.assertEqual(start[0], 100)
 
+    def test_letterbox_is_rows_black_in_every_frame(self):
+        import numpy as np
+        f = np.full((3, 10, 4), 200, np.uint8)
+        f[:, :2] = 0; f[:, -3:] = 0      # bars: 2 rows on top, 3 at the bottom
+        f[1, 2] = 3                       # one dark frame in the picture's first row is not a bar
+        self.assertEqual(cinematic.letterbox(f), (2, 3))
+        self.assertEqual(cinematic.letterbox(np.full((2, 6, 4), 90, np.uint8)), (0, 0))
+
     def test_camera_row_reads_the_proxy_frame_log(self):
         line = "5288,110659068.244,347.310,166.463,1292,8,G:0:0:3783.534:3067.816:225.799:0.15:0.07:-0.98:0.0|G:84:1:1:2:3"
         self.assertEqual(cinematic.camera_row(line), (5288, 110659068.244, (3783.534, 3067.816, 225.799)))

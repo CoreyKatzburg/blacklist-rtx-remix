@@ -89,6 +89,14 @@ def find_span(rows: list, settle_s: float, after_ms: float):
     return cams[0], None
 
 
+def letterbox(frames: np.ndarray) -> tuple[int, int]:
+    """(top, bottom) rows that are near-black in every frame: the cutscene's letterbox bars."""
+    dark = frames.max(axis=(0, 2)) < NEAR_BLACK
+    top = int(np.argmin(dark)) if not dark.all() else len(dark)
+    bottom = int(np.argmin(dark[::-1])) if not dark.all() else 0
+    return top, bottom
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--pid", type=int, default=0, help="the game; 0 = whichever game logs the line first (one game "
@@ -168,6 +176,17 @@ def main() -> int:
                          "brightness": round(mean, 4), "nearBlack": round(nb, 4), "nearWhite": round(nw, 4),
                          "fullWhite": round(fw, 4),
                          "inCutscene": bool(start and end and start[1] <= t < end[1])})
+    # The stats above are full-frame. Letterbox bars (rows black in every cutscene frame) would sit in nearBlack and
+    # dilute the others, so the same stats are also given for the active picture between the bars.
+    frames_raw = np.fromfile(os.path.join(a.out, "cinematic.raw"), np.uint8)
+    frames_raw = frames_raw[: frames_raw.size // (W * H) * W * H].reshape(-1, H, W)
+    ids = [r["shot"] for r in out_rows if r["inCutscene"] and r["shot"] < len(frames_raw)]
+    top, bottom = letterbox(frames_raw[ids]) if ids else (0, 0)
+    for r in out_rows:
+        if r["shot"] < len(frames_raw):
+            act = frames_raw[r["shot"], top:H - bottom]
+            r.update(activeBrightness=round(float(act.mean()) / 255.0, 4), activeNearBlack=round(float((act < NEAR_BLACK).mean()), 4),
+                     activeNearWhite=round(float((act >= NEAR_WHITE).mean()), 4), activeFullWhite=round(float((act >= FULL_WHITE).mean()), 4))
     with open(os.path.join(a.out, "cinematic.csv"), "w", newline="") as fh:
         wr = csv.DictWriter(fh, fieldnames=list(out_rows[0]) if out_rows else ["shot"])
         wr.writeheader(); wr.writerows(out_rows)
@@ -179,11 +198,15 @@ def main() -> int:
         "seconds": round((end[1] - start[1]) / 1000.0, 2) if start and end else None,
         "startShot": inside[0]["shot"] if inside else None, "endShot": inside[-1]["shot"] if inside else None,
         "shots": len(out_rows), "shotsInCutscene": len(inside), "frameSize": [W, H],
+        "region": "brightness/nearBlack/nearWhite/fullWhite: full frame (whole screen, any letterbox bars included); "
+                  "active*: rows between the letterbox bars only",
+        "letterboxRows": {"top": top, "bottom": bottom, "activeFraction": round((H - top - bottom) / H, 4)},
         "thresholds": {"nearBlack": f"< {NEAR_BLACK}/255", "nearWhite": f">= {NEAR_WHITE}/255",
                        "fullWhite": f">= {FULL_WHITE}/255"},
     }
     if inside:
-        for k in ("brightness", "nearWhite", "fullWhite", "nearBlack"):
+        for k in ("brightness", "nearWhite", "fullWhite", "nearBlack",
+                  "activeBrightness", "activeNearWhite", "activeFullWhite", "activeNearBlack"):
             v = np.array([r[k] for r in inside])
             summary[k] = {"mean": round(float(v.mean()), 4), "median": round(float(np.median(v)), 4),
                           "max": round(float(v.max()), 4), "min": round(float(v.min()), 4)}
