@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 
 import numpy as np
 
@@ -351,7 +352,9 @@ class Spot:
         self.dump_dirs = [os.path.join(d, "gate") for d in (s, os.path.join(s, ".trex"), r)]
         self.windows: list[dict] = []
         self.game, self.process = blmem.attach(a.pid, a.exe_hash)
-        self.controller, self.pawn = self.game.player()
+        self.relinks: list[dict] = []
+        self._link_lock = threading.Lock()
+        self.controller, self.pawn = self.wait_player(checkpoint)
         self.base_yaw = float(spot.get("baseYaw", checkpoint["yaw"]))
         self.base_pitch = float(spot.get("basePitch", checkpoint["pitch"]))
         self.yaw = self.pitch = 0.0       # requested, relative to the base
@@ -394,8 +397,49 @@ class Spot:
         self.home = got
         return info
 
+    def wait_player(self, cp: dict, timeout: float = 90.0, steady: int = 3) -> tuple[int, int]:
+        """(controller, pawn) once `steady` reads one second apart find the same pair, in the checkpoint's map,
+        with Sam within 150 units of the checkpoint position. Without Remix the gate starts drive.py as soon as a
+        camera is published, which can be mid-load: con_mall (Nov 16) failed on its first read ("read 4 bytes at
+        0x45") with 1 MB of textures loaded, and con_green_hall's controller was replaced after the first window."""
+        last, same, why, end = None, 0, "no read yet", time.monotonic() + timeout
+        while True:
+            pair = None
+            try:
+                pair = self.game.player()
+                where = self.game.map_name(pair[0])
+                gap = float(np.linalg.norm(np.subtract(self.game.location(pair[1]), cp["location"])))
+                why = f"map {where!r} (checkpoint {cp['map']!r}), Sam {gap:.0f} units from the checkpoint position"
+                if where != cp["map"] or gap > 150:
+                    pair = None
+            except Exception as e:   # noqa: BLE001 - a half-loaded level; read again
+                why, pair = f"{type(e).__name__}: {e}", None
+            same = same + 1 if pair is not None and pair == last else int(pair is not None)
+            last = pair
+            if same >= steady:
+                return pair
+            if time.monotonic() > end:
+                raise RuntimeError(f"the level did not settle within {timeout:.0f} s; last read: {why}")
+            time.sleep(1.0)
+
+    def relink(self) -> None:
+        """The controller read failed: the game replaced the player objects (checkpoint reload, or a level that was
+        still loading). Find them again and record it in spot.json; sam_moved still catches a Sam put elsewhere."""
+        with self._link_lock:
+            old = (self.controller, self.pawn)
+            self.controller, self.pawn = self.game.player()
+            self.relinks.append({"at": time.strftime("%H:%M:%S"), "afterWindow": len(self.windows),
+                                 "old": [hex(v) for v in old], "new": [hex(self.controller), hex(self.pawn)]})
+            print("RELINK", self.relinks[-1], flush=True)
+
     def _rot(self) -> tuple[float, float]:
-        yaw, pitch, _ = self.game.rotation(self.controller)
+        controller = self.controller
+        try:
+            yaw, pitch, _ = self.game.rotation(controller)
+        except blmem.MemoryError_:
+            if controller == self.controller:   # another thread may have relinked already
+                self.relink()
+            yaw, pitch, _ = self.game.rotation(self.controller)
         return yaw, pitch
 
     def rel_pose(self) -> list[float]:
@@ -497,6 +541,8 @@ class Spot:
         w = {"name": name, "kind": kind, "yaw": self.yaw, "pitch": self.pitch,
              "telemetry": [start["telemetry"], end["telemetry"]], "proxy": [start["proxy"], end["proxy"]], **extra}
         self.windows.append(w)
+        if getattr(self, "save_partial", None):
+            self.save_partial()
         return w
 
     def move(self, name: str, yaw: float, pitch: float, seconds: float) -> None:
@@ -550,7 +596,7 @@ class Spot:
         if not hwnd:
             raise RuntimeError("no game window to grab")
         x, y, w, h = client_rect(hwnd)
-        rot, loc = self.game.rotation(self.controller), self.game.location(self.pawn)
+        rot, loc = self._rot(), self.game.location(self.pawn)
         t0 = time.monotonic()
         out = subprocess.run([FFMPEG, "-v", "error", "-f", "gdigrab", "-framerate", "25", "-draw_mouse", "0",
                               "-offset_x", str(x), "-offset_y", str(y), "-video_size", f"{w}x{h}", "-i", "desktop",
@@ -618,6 +664,26 @@ class Spot:
     OFF_POSE_DEG = 1.0   # a stop further than this from the asked view (yaw or pitch) is off-pose
     POSE_TRIES = 3
 
+    def pose_trace(self, body) -> list[list[float]]:
+        """Runs body() while reading the camera direction from game memory every 50 ms; returns the readings."""
+        seen: list[list[float]] = []
+        done = threading.Event()
+
+        def sample():
+            while not done.is_set():
+                try:
+                    seen.append(self.rel_pose())
+                except Exception:
+                    pass
+                done.wait(0.05)
+        t = threading.Thread(target=sample, daemon=True)
+        t.start()
+        try:
+            body()
+        finally:
+            done.set(); t.join(1.0)
+        return seen
+
     def pose_error(self, poses: list[list[float]]) -> float:
         """Largest yaw or pitch distance, in degrees, of the game-memory poses from the stop's asked view."""
         return round(max(max(abs(gate.wrap(y - self.yaw)), abs(p - self.pitch)) for y, p in poses), 2)
@@ -643,13 +709,18 @@ class Spot:
                 grab = lambda: got.update(self._try_raster(name, "no_remix"))
             else:
                 grab, got = (lambda: self.dump(name)), {"dump": name}
-            w = self.window(name, "still", lambda: (self.capture(rel, 20), grab()),
+            trace: list = []
+            w = self.window(name, "still", lambda: trace.extend(self.pose_trace(lambda: (self.capture(rel, 20), grab()))),
                             frames=rel, frameSize=[CAP_W, CAP_H], **({"outline": outline} if outline else {}))
             w.update(got)
             w["gamePose"] = [before, self.rel_pose()]   # [yaw, pitch] from game memory at the start and end
+            if trace:   # the direction every 50 ms during the capture, at most 20 of them kept
+                w["poseTrace"] = trace[::max(1, len(trace) // 20)]
             if snapped is not None:
                 w["poseWrites"] = snapped
-            w["offPoseDeg"] = self.pose_error(w["gamePose"])
+            w["offPoseDeg"] = self.pose_error(w["gamePose"] + trace)
+            print(f"stop {name} try {attempt}: {w['offPoseDeg']} degrees off, poseWrites {snapped}, "
+                  f"start {before} end {w['gamePose'][1]}", flush=True)
             if w["offPoseDeg"] <= self.OFF_POSE_DEG or attempt == self.POSE_TRIES:
                 break
             for x in (settle, w):   # kept for the record under another name; no check reads kind "off_pose"
@@ -765,11 +836,13 @@ class Spot:
     def bench_window(self, name: str, want: int, tag: str, smi_file: str) -> dict:
         """One still window of at least `want` game frames with nvidia-smi sampling into `smi_file`."""
         rel = f"frames/{tag}.gray"
-        # Stdout, not -f: nvidia-smi buffers -f and the terminate below (a kill on Windows) loses all of it.
-        with open(os.path.join(self.out, smi_file), "wb") as smi_out:
-            smi = subprocess.Popen(["nvidia-smi", "--query-gpu=timestamp,memory.total,memory.used,memory.free,clocks.gr,"
-                                    "clocks.mem,pstate,utilization.gpu", "--format=csv", "-lms", "200"],
-                                   stdout=smi_out, stderr=subprocess.DEVNULL)
+        # One nvidia-smi call per sample (gpu_sampler.ps1): -lms writes through a 4 KB buffer, to -f and to stdout
+        # alike, so the terminate below (a kill on Windows) lost the tail, or all of a short window (Nov 16).
+        smi = subprocess.Popen(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                                os.path.join(os.path.dirname(os.path.abspath(__file__)), "gpu_sampler.ps1"),
+                                "-Out", os.path.join(self.out, smi_file), "-IntervalMs", "200", "-Query",
+                                "timestamp,memory.total,memory.used,memory.free,clocks.gr,clocks.mem,pstate,utilization.gpu"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         cap = start_capture(os.path.join(self.out, rel), fps=30, seconds=60.0)
         start = self.proxy.last_frame()
         try:
@@ -1062,6 +1135,11 @@ def main() -> int:
     ctypes.windll.winmm.timeBeginPeriod(1)
     try:
         s = Spot(a, spot, cp)
+        # spot.json after every window, marked unfinished, so a drive.py killed at verify_runtime's time limit still
+        # leaves its stops (Paladin reference, Nov 16: a timeout lost all 24); the last write below replaces it.
+        s.save_partial = lambda: gate.save_json(os.path.join(a.out, "spot.json"), {
+            **result, "windows": s.windows, "mouseCalibration": s.calibration,
+            "error": f"drive.py did not finish: this record was written after window {len(s.windows)}"})
         with open(os.path.join(a.system, "d3d9_proxy.log"), encoding="latin-1") as f:
             chained = chained_dll(f.read(), a.pid)
         result["renderer"] = {"chained": list(chained) if chained else None, "kind": check_renderer(chained, a.no_remix)}
@@ -1108,9 +1186,11 @@ def main() -> int:
     except Exception as e:   # recorded in spot.json; gate.py fails the spot
         result["error"] = f"{type(e).__name__}: {e}"
         print("SPOT ERROR", result["error"])
+        traceback.print_exc(file=sys.stdout)   # where it failed, in drive.log
     finally:
         if s:
             result["windows"] = s.windows
+            result["relinks"] = s.relinks
             result["mouseCalibration"] = s.calibration
             result.update(s.finish())
         ctypes.windll.winmm.timeEndPeriod(1)

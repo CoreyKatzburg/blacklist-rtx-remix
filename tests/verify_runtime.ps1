@@ -473,10 +473,10 @@ try {
                     ForEach-Object { '"' + $_ + '"' }) }
             # GPU clocks, temperature, power, clock-limit reasons and memory once a second for the whole launch
             # (worker C, Nov 16: what puts a launch in the slow Ray Reconstruction mode).
-            # Stdout, not -f: nvidia-smi buffers -f and the kill below loses everything.
-            $smi = Start-Process nvidia-smi -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $spotDir 'gpu_run.csv') -ArgumentList @(
-                '--query-gpu=timestamp,clocks.gr,clocks.mem,clocks.sm,temperature.gpu,power.draw,power.limit,clocks_throttle_reasons.active,memory.used,memory.total,pstate',
-                '--format=csv', '-lms', '1000')
+            # One nvidia-smi call per sample (runtime\gpu_sampler.ps1): -lms buffers 4 KB and the kill below lost the tail.
+            $smi = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
+                '-File', ('"' + (Join-Path $Runtime 'gpu_sampler.ps1') + '"'), '-Out', ('"' + (Join-Path $spotDir 'gpu_run.csv') + '"'),
+                '-Query', 'timestamp,clocks.gr,clocks.mem,clocks.sm,temperature.gpu,power.draw,power.limit,clocks_throttle_reasons.active,memory.used,memory.total,pstate')
             $game = Start-GameAtCheckpoint
             # Other programs holding the GPU (Windows reports their names; per-process memory reads N/A).
             & nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv 2>&1 | Set-Content (Join-Path $spotDir 'gpu_apps.csv')
@@ -490,7 +490,7 @@ try {
                 '--system', $S, '--root', $Root, '--out', $spotDir) + @(if ($NoRemix) { '--no-remix' })
             $drive = Start-Process $Py -ArgumentList ($driveArgs | ForEach-Object { '"' + $_ + '"' }) -NoNewWindow -PassThru `
                 -RedirectStandardOutput (Join-Path $spotDir 'drive.log') -RedirectStandardError (Join-Path $spotDir 'drive.err')
-            if (-not $drive.WaitForExit(20 * 60 * 1000)) { $drive.Kill(); Write-Step "$($spot.name): drive.py timed out (20 min)" }
+            if (-not $drive.WaitForExit(40 * 60 * 1000)) { $drive.Kill(); Write-Step "$($spot.name): drive.py timed out (40 min)" }
             Write-Step "$($spot.name): $((Get-Content (Join-Path $spotDir 'drive.log') -Tail 1))"
             Stop-Game   # the next launch starts remix-dxvk.log over; gate.py's clean_quit reads this spot's copy
             Copy-Item -LiteralPath "$S\rtx-remix\logs\remix-dxvk.log" $spotDir -ErrorAction SilentlyContinue

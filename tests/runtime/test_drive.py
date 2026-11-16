@@ -141,12 +141,16 @@ class Steering(unittest.TestCase):
 
     def test_off_pose_stop_is_retried_and_marked(self):
         # Paladin reference, Nov 16: stops were captured 4 to 157 degrees from the asked view and nothing said so.
-        def run(poses_per_try, no_remix=True):
+        def run(poses_per_try, no_remix=True, traces=None):
             s = drive.Spot.__new__(drive.Spot)
             s.yaw, s.pitch, s.no_remix, s.windows, s.spot = 90.0, -30.0, no_remix, [], {}
             s.counters = lambda: {"telemetry": 0, "proxy": 0}
             seq = iter([p for pair in poses_per_try for p in pair])
             s.rel_pose = lambda: next(seq)
+            during = iter(traces or [])
+            s.pose_trace = lambda body: (body(), next(during, []))[1]   # the camera during each capture
+            saved = []
+            s.save_partial = lambda: saved.append(len(s.windows))
             moves = []
             s.move = lambda name, yaw, pitch, seconds: moves.append((name, yaw, pitch))
             s.snap_pose = lambda: 0
@@ -157,6 +161,7 @@ class Steering(unittest.TestCase):
             s.dump = lambda tag: None
             s.sam_moved = lambda name: 0.0
             s.stop("y90_p-30")
+            self.assertEqual(saved, list(range(1, len(s.windows) + 1)))   # spot.json rewritten after every window
             return s, moves
         on, off = [90.2, -30.1], [-91.0, -30.0]   # -91 is 179 degrees from 90 once wrapped, not 181
         s, moves = run([[off, on], [on, [91.6, -30.0]], [on, on]])
@@ -175,6 +180,10 @@ class Steering(unittest.TestCase):
         self.assertEqual(kept[0]["offPoseDeg"], 1.2)
         s, moves = run([[on, [90.9, -29.1]]], no_remix=False)   # 0.9 degrees: on pose, one try
         self.assertEqual((s.windows[-1]["poseTries"], moves), (1, []))
+        # on pose at the start and end, but the camera swung away during the capture: still off-pose
+        s, moves = run([[on, on], [on, on]], traces=[[on, [96.0, -30.0], on], [on, on]])
+        self.assertEqual(s.windows[-1]["poseTries"], 2)
+        self.assertEqual(s.windows[-1]["offPoseTries"][0]["offPoseDeg"], 6.0)
 
     def test_stop_waits_out_a_stall_before_capturing(self):
         # Paladin, Nov 15: frames of 0.5 to 1.6 s for several seconds after the full turn.
@@ -194,6 +203,45 @@ class Steering(unittest.TestCase):
         s.game = mock.Mock(location=lambda pawn: (100.0, 360.0, 50.0))   # 160 units sideways
         with self.assertRaisesRegex(RuntimeError, "Sam moved 160 units"):
             s.sam_moved("y45_p0")
+
+    def test_waits_for_the_player_to_settle_after_a_load(self):
+        # con_mall reference, Nov 16: drive.py read the player mid-load and failed on "read 4 bytes at 0x45".
+        cp = {"map": "consumption", "location": [0.0, 0.0, 0.0]}
+        reads = iter([drive.blmem.MemoryError_("read 4 bytes at 0x00000045 failed"),   # still loading
+                      (1, 2, "menu", (0.0, 0.0, 0.0)),            # the menu's world: wrong map
+                      (3, 4, "consumption", (9000.0, 0.0, 0.0)),  # right map, Sam not placed yet
+                      (5, 6, "consumption", (10.0, 0.0, 0.0)),    # a player the game replaces next second
+                      (7, 8, "consumption", (12.0, 0.0, 0.0)), (7, 8, "consumption", (12.0, 0.0, 0.0)),
+                      (7, 8, "consumption", (12.0, 0.0, 0.0))])
+        now = {}
+
+        def player():
+            r = next(reads)
+            if isinstance(r, Exception):
+                raise r
+            now.update(map=r[2], loc=r[3])
+            return r[0], r[1]
+        s = drive.Spot.__new__(drive.Spot)
+        s.game = mock.Mock(player=player, map_name=lambda c: now["map"], location=lambda p: now["loc"])
+        with mock.patch.object(drive.time, "sleep"):
+            self.assertEqual(s.wait_player(cp), (7, 8))
+            reads = iter([(1, 2, "menu", (0.0, 0.0, 0.0))] * 200)
+            with self.assertRaisesRegex(RuntimeError, "did not settle.*'menu'"):
+                s.wait_player(cp, timeout=0.0)
+
+    def test_a_replaced_controller_is_found_again(self):
+        # con_green_hall reference, Nov 16: "property Rotation not found on IntProperty" after the first window.
+        s = drive.Spot.__new__(drive.Spot)
+        s.controller, s.pawn, s.windows, s.relinks, s._link_lock = 1, 2, [{}], [], threading.Lock()
+
+        def rotation(controller):
+            if controller == 1:
+                raise drive.blmem.MemoryError_("property Rotation not found on IntProperty")
+            return 30.0, -5.0, 0
+        s.game = mock.Mock(rotation=rotation, player=lambda: (3, 4))
+        self.assertEqual(s._rot(), (30.0, -5.0))
+        self.assertEqual((s.controller, s.pawn), (3, 4))
+        self.assertEqual([(r["afterWindow"], r["old"], r["new"]) for r in s.relinks], [(1, ["0x1", "0x2"], ["0x3", "0x4"])])
 
     def test_move_lands_on_the_stop_without_swinging_past_it(self):
         s = self.run_with(22, 7.0, -9.0, 7.0, -9.0)
