@@ -586,13 +586,9 @@ void LogSettings(const char* what) {
 }
 
 uint32_t g_seenIniEpoch = 0;
-// The ini watcher's change count (proxy::PeekIniChangeEpoch) missed an edit in run 080214: StandInSkipSamGear=1 was
-// written and no reload followed for 90 s, while the edits before and after it reloaded. So the write time is also
-// checked every kReloadCheckFrames frames; a reload found that way says "after a missed notice".
 void ReloadIfChanged() {
     const uint32_t epoch = proxy::PeekIniChangeEpoch();
-    const bool notified = epoch != g_seenIniEpoch;
-    if (!notified && g_frame % kReloadCheckFrames) return;
+    if (epoch == g_seenIniEpoch) return;
     g_seenIniEpoch = epoch;
     const FILETIME now = IniWriteTime();
     if (CompareFileTime(&now, &g_iniWriteTime) == 0) return;
@@ -600,7 +596,7 @@ void ReloadIfChanged() {
     LoadSettings(g_iniPath);
     ApplyRemixConfig();
     g_autoRt.Reassert();   // the ini may have set rtx.enableRaytracing; AutoRaytracing re-asserts its state
-    LogSettings(notified ? "settings reloaded" : "settings reloaded after a missed notice");
+    LogSettings("settings reloaded");
 }
 
 // The lock pointer comes from game memory; check once per database that it reads as a
