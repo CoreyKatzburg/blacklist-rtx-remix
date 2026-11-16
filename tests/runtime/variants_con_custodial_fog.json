@@ -1,5 +1,5 @@
 {
- "about": "Worker B, custodial slow fade (coordinator approved Nov 16): one launch per rtx.volumetrics.maxAccumulationFrames value at con_custodial, set explicitly in every variant so remix-dxvk.log proves each was read (128 is Remix's default; play-setup rtx.conf does not set it). Each launch: the bench window at y0_p0 with the room lit (its frames/bench.gray gives the still-camera noise, the cost), then the light switch with dumps at 1 and 18 s (frames/light_switch.gray gives the fade). Remix blends fog history with weight 1/(age+5), age capped at N, so if fog history is the cause the fade time constant scales with N+5: 64 -> 0.52x, 32 -> 0.28x, 16 -> 0.155x the base. Scored by tools/remix/.amp/in/workerB/fog_fade.py <run folder>. 01_base only (coordinator approved, no extra launch): once the fade has settled (the switch window holds 20 s, then 5 s more), StandInSkipSamGear base / sam_gear / base_again in the dark room, each proven by its reload line and 2 stray lines.",
+ "about": "Worker B, custodial slow fade (coordinator approved Nov 16): one launch per rtx.volumetrics.maxAccumulationFrames value at con_custodial, set explicitly in every variant so remix-dxvk.log proves each was read (128 is Remix's default; play-setup rtx.conf does not set it). Each launch: the bench window at y0_p0 with the room lit (its frames/bench.gray gives the still-camera noise, the cost), then the light switch with dumps at 1 and 18 s (frames/light_switch.gray gives the fade). Remix blends fog history with weight 1/(age+5), age capped at N, so if fog history is the cause the fade time constant scales with N+5: 64 -> 0.52x, 32 -> 0.28x, 16 -> 0.155x the base. Scored by the committed tools\\remix\\tests\\analysis\\fog_fade.py (tools\\remix 4690155): fog_fade.py <run folder> --original <reference>\\con_custodial. 06_fog_off is the control (rtx.volumetrics.enable False, same bench and light switch, no Sam-gear steps): its fade t90 must be 1.0 s or less, else fog history is not the cause. Pass numbers set before the run: each N within 15% of its predicted time constant. 01_base only (coordinator approved, no extra launch): once the fade has settled (the switch window holds 20 s, then 5 s more), StandInSkipSamGear base / sam_gear / base_again in the dark room, each proven by its reload line and 2 stray lines.",
  "spot": "con_custodial",
  "bench": {"settle": 5, "frames": 150, "lightSwitch": {"key": "SPACE", "seconds": 20, "dumpsAt": [1, 18]}},
  "variants": [
@@ -7,6 +7,7 @@
   {"name": "02_acc64", "rtx": {"rtx.volumetrics.maxAccumulationFrames": "64"}},
   {"name": "03_acc32", "rtx": {"rtx.volumetrics.maxAccumulationFrames": "32"}},
   {"name": "04_acc16", "rtx": {"rtx.volumetrics.maxAccumulationFrames": "16"}},
-  {"name": "05_base_again", "rtx": {"rtx.volumetrics.maxAccumulationFrames": "128"}}
+  {"name": "05_base_again", "rtx": {"rtx.volumetrics.maxAccumulationFrames": "128"}},
+  {"name": "06_fog_off", "rtx": {"rtx.volumetrics.enable": "False", "rtx.volumetrics.maxAccumulationFrames": "128"}}
  ]
 }
