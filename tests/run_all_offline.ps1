@@ -48,7 +48,7 @@ foreach ($name in 'verify_config.py', 'verify_lights_and_materials.py') {
         Write-Host "   $($results[-1].Note)" -ForegroundColor Yellow
     }
 }
-foreach ($rel in 'analysis\brightness\pfm_brightness.py', 'analysis\brightness\align_sessions.py', 'analysis\brightness\flicker_audit.py', 'analysis\compile_wait.py', 'analysis\fog_fade.py', 'analysis\crushed_blown_vs_raster.py', 'analysis\glow_blobs.py', 'analysis\freeze_scan.py', 'analysis\picture_cost.py', 'analysis\bench_bump.py', 'analysis\capture\cap_join_material.py', 'analysis\capture\cap_replace.py', 'analysis\capture\cap_albedo_per_draw.py', 'analysis\capture\p1_insideout_depth.py', 'analysis\capture\switch_owner_blocks.py') {
+foreach ($rel in 'analysis\brightness\pfm_brightness.py', 'analysis\brightness\align_sessions.py', 'analysis\brightness\flicker_audit.py', 'analysis\compile_wait.py', 'analysis\fog_fade.py', 'analysis\crushed_blown_vs_raster.py', 'analysis\glow_blobs.py', 'analysis\freeze_scan.py', 'analysis\picture_cost.py', 'analysis\bench_bump.py', 'analysis\monitor_steps.py', 'analysis\capture\cap_join_material.py', 'analysis\capture\cap_replace.py', 'analysis\capture\cap_albedo_per_draw.py', 'analysis\capture\p1_insideout_depth.py', 'analysis\capture\switch_owner_blocks.py') {
     $p = Join-Path $testsDir $rel
     if (Test-Path $p) { Step (Split-Path $rel -Leaf) { Native $py @($p, '--self-test') } }
 }
