@@ -47,6 +47,17 @@ def view(yaw: float, pitch: float, rng) -> np.ndarray:
     return np.clip(img + rng.normal(0, 0.8, img.shape), 0, 255)
 
 
+# case -> (frame time ms, GPU time ms) for every frame. Healthy runs are 10 ms and 8 ms: 100 FPS, input latency 12 ms.
+FRAME_TIMES = {
+    "low_fps": (14.0, 12.0),           # 71 FPS: WARN under the 90 target, the gate still passes
+    "high_latency": (17.5, 9.0),       # 57 FPS, input latency 26 ms (+14 over the reference), CPU wait 8.5 ms
+    "lag_within_margin": (12.0, 7.0),  # input latency 17 ms: +5 over the reference, exactly the margin: passes
+    "lag_over_margin": (12.5, 7.5),    # input latency 17.5 ms: +5.5 over the reference: fails; CPU wait is 5 ms
+    "fps_regression": (11.8, 8.0),     # 84.7 FPS: 15% below the 100 FPS previous run: FAIL
+    "fps_drop_9pct": (10.98, 8.0),     # 91 FPS: 9% below the previous run: passes
+}
+
+
 class Builder:
     """Writes one spot: windows, telemetry, proxy trace/gate CSVs, dumps, captures."""
 
@@ -75,8 +86,7 @@ class Builder:
         c = self.case
         if c == "nan_frame" and kind == "still" and i == 3: rec["thumbNonFinite"] = 40
         if c == "slow_frame" and kind == "pan" and i == 30: rec["frameTimeMs"] = 61.0
-        if c == "low_fps": rec["frameTimeMs"], rec["gpuTimeMs"] = 14.0, 12.0   # 71 FPS: passes 55, fails 90
-        if c == "high_latency": rec["frameTimeMs"], rec["gpuTimeMs"] = 17.5, 9.0   # 57 FPS: also fails the 90 target
+        if c in FRAME_TIMES: rec["frameTimeMs"], rec["gpuTimeMs"] = FRAME_TIMES[c]
         if c == "no_skinned" and kind == "still" and i == 3: rec["skinnedInstances"] = 0
         if c == "blas_rebuild" and kind == "pan" and i == 50: rec["staticBlasRebuilds"] = 1
         if c == "inward" and kind == "move" and i == 2: rec["inwardSkinnedTriangles"] = 900
@@ -239,9 +249,13 @@ CASES = {
     "pulse_still": (("still_flicker",), ()),
     "blas_rebuild": (("static_blas_rebuilds",), ()),
     "slow_frame": (("frames_over_50ms",), ()),
-    "low_fps": (("min_median_fps",), ()),
-    # Input latency is 2 x frame - GPU, so it can only pass 25 ms at a frame time above 11.1 ms (below 90 FPS).
-    "high_latency": (("latency_overhead_ms", "input_latency_ms", "min_median_fps"), ()),
+    "low_fps": ((), ()),                                # WARN min_median_fps (WARNS); the gate passes
+    "high_latency": (("latency_overhead_ms", "input_latency_ms"), ()),
+    "lag_within_margin": ((), ()),                      # +5 ms over the reference: the margin's edge still passes
+    "lag_over_margin": (("input_latency_ms",), ()),     # +5.5 ms over the reference
+    "fps_regression": (("fps_regression",), ()),        # 15% below the previous run
+    "fps_drop_9pct": ((), ()),                          # 9% below the previous run: passes
+    "no_reference": ((), ("input_latency_ms",)),        # no --reference: NOT MEASURED, which fails the gate
     "too_dark": (("brightness_floor",), ()),
     "blurry_angles": (("angled_sharpness",), ()),
     "pose_off": (("pose",), ()),
@@ -278,6 +292,13 @@ CASES = {
 }
 
 
+# case -> checks that must WARN (shown in the result; the gate still passes)
+WARNS = {"low_fps": ("min_median_fps",), "high_latency": ("min_median_fps",), "lag_within_margin": ("min_median_fps",),
+         "lag_over_margin": ("min_median_fps",), "fps_regression": ("min_median_fps",)}
+PREVIOUS = {"fps_regression", "fps_drop_9pct"}    # judged against a previous run: the healthy 100 FPS run
+NO_REFERENCE = {"no_reference"}                  # run without --reference
+
+
 def make_run(folder: str, case: str) -> str:
     run = os.path.join(folder, case)
     shutil.rmtree(run, ignore_errors=True)
@@ -288,16 +309,23 @@ def make_run(folder: str, case: str) -> str:
 
 
 def check_case(folder: str, case: str) -> tuple[bool, dict, str]:
-    """(expectation met, result, explanation)."""
+    """(expectation met, result, explanation). Checks the case does not name must PASS, except fps_regression, which
+    only WARNs when no previous run is given (the PREVIOUS cases get one)."""
     must_fail, must_nm = CASES[case]
-    result = gate.evaluate(make_run(folder, case))
+    must_warn = WARNS.get(case, ())
+    previous = make_run(os.path.join(folder, "previous"), "good") if case in PREVIOUS else None
+    reference = None if case in NO_REFERENCE else make_run(os.path.join(folder, "reference"), "good")
+    result = gate.evaluate(make_run(folder, case), previous=previous, reference=reference)
     status = {c["check"]: c["status"] for c in result["checks"]}
+    expect = {"fps_regression": gate.PASS if case in PREVIOUS else gate.WARN}
+    expect.update({c: gate.WARN for c in must_warn})
+    expect.update({c: gate.NOT_MEASURED for c in must_nm})
+    expect.update({c: gate.FAIL for c in must_fail})
     wrong = []
     for check, st in status.items():
-        want = gate.FAIL if check in must_fail else gate.NOT_MEASURED if check in must_nm else gate.PASS
-        if st != want:
-            wrong.append(f"{check}: {st}, expected {want}")
-    for check in must_fail + must_nm:
+        if st != expect.get(check, gate.PASS):
+            wrong.append(f"{check}: {st}, expected {expect.get(check, gate.PASS)}")
+    for check in must_fail + must_nm + must_warn:
         if check not in status:
             wrong.append(f"{check}: not reported")
     if (result["status"] == gate.PASS) != (not must_fail and not must_nm):

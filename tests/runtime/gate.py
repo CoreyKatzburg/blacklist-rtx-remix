@@ -1,8 +1,8 @@
-"""Hard numeric pass/fail for one verify_runtime run.  usage: gate.py <run folder>  (exit 0 = PASS, 1 = FAIL)
+"""Hard numeric pass/fail for one verify_runtime run.  usage: gate.py <run folder> [--previous <run folder>] [--reference <run folder>]  (exit 0 = PASS, 1 = FAIL)
 
 Reads <run>/manifest.json (the spots asked for) and each <run>/<spot>/spot.json (written by drive.py: timed windows
 with frame ranges, plus the data files copied from the game), and writes <run>/result.json and <run>/result.md.
-Every check is PASS, FAIL or NOT MEASURED, and NOT MEASURED fails the gate: a check whose data is missing or
+Every check is PASS, WARN, FAIL or NOT MEASURED. WARN is shown and does not fail the gate. NOT MEASURED does: a check whose data is missing or
 incomplete never passes. Frame numbers restart at every game launch, so each spot is judged on its own files.
 
 Checks (thresholds in THRESHOLDS):
@@ -22,6 +22,11 @@ Checks (thresholds in THRESHOLDS):
                            brightness pulsing (trimmed mean-luma drift) across still camera stops
   static_blas_rebuilds     static-geometry acceleration structure rebuilds while the camera rotates (telemetry)
   frames_over_50ms         telemetry frameTimeMs > 50 in any measured window (goggle windows included: no freezes)
+  min_median_fps           median FPS over the scene windows: WARN below 90 (Corey's target: a goal, not a limit)
+  fps_regression           each spot's median FPS against the same spot in --previous: FAIL when more than 10% slower;
+                           WARN when no previous run is given
+  input_latency_ms         each spot's median mouse-to-screen time against the same spot in --reference (the no-Remix
+                           run): FAIL when more than the GUESS margin above it; NOT MEASURED without --reference
   step_timing              per-step GPU times (telemetry passMs): untimed steps, and nested steps longer than their parent
   skip_occlusion_share     worst scene window's share of draws skipped by occlusionQuery (telemetry skips / proxy draws)
   skip_other_share         worst scene window's share of draws skipped for any other reason
@@ -35,6 +40,7 @@ Every per-frame check also requires the data to cover every frame of its windows
 """
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import math
@@ -51,8 +57,13 @@ THRESHOLDS = {
     # drive.py ends a window when a level load starts, so a load during a move, pan, combat or goggles window counts
     # as a hitch here. Not verified whether the game ever loads inside one; the teleport hold is outside every window.
     "frames_over_50ms": 0,
-    "min_median_fps": 90.0,  # Corey's target, Nov 15. Median frame rate over the SCENE windows (goggles excluded).
-    "max_wait_overhead_ms": 5.0, "max_input_latency_ms": 25.0,
+    "min_median_fps": 90.0,  # Corey's target, Nov 15: WARN below it, not a fail. Median FPS over the SCENE windows (goggles excluded).
+    "max_wait_overhead_ms": 5.0,
+    # Input lag (input_latency_ms) is judged per spot against the no-Remix reference run, not a fixed limit. The margin
+    # is a GUESS until reference numbers exist (Corey, Nov 15: the original game has almost no noticeable lag).
+    "input_lag_margin_ms": 5.0,
+    # Speed FAIL (fps_regression): a spot whose median FPS is more than this below the same spot in the previous run.
+    "max_fps_drop": 0.10,  # Corey, Nov 15
     "min_scene_luma": 0.03, "min_raster_luma_ratio": 0.75, "min_angled_sharpness": 0.02,
     "pose_error_deg": 3.0, "pan_degrees": 350.0, "goggles_corr": 0.8, "goggles_mean_gap": 0.06,
     "goggles_missing_blocks": 0.02, "still_frames": 15, "pan_coverage": 0.9,
@@ -68,7 +79,7 @@ THRESHOLDS = {
 TELEMETRY_FIELDS = ("frame", "frameTimeMs", "gpuTimeMs", "instances", "skinnedInstances", "staticBlasRebuilds",
                     "cameraCut", "textureMemoryMB", "vramUsedMB")
 THUMB_W, THUMB_H = 128, 72
-PASS, FAIL, NOT_MEASURED = "PASS", "FAIL", "NOT MEASURED"
+PASS, WARN, FAIL, NOT_MEASURED = "PASS", "WARN", "FAIL", "NOT MEASURED"
 MEASURED = ("still", "settle", "move", "pan", "combat", "goggles")
 SCENE = ("still", "settle", "move", "pan", "combat")
 ROTATING = ("move", "pan")
@@ -510,16 +521,105 @@ def recorder_checks(run: Run, pick, good: list[dict], tsrc: str) -> None:
                 "remix-dxvk.log")
 
 
-def evaluate(folder: str) -> dict:
+def load_other_run(folder: str | None) -> dict[str, dict] | None:
+    """Spots of an earlier or reference run folder keyed by name: None when no folder was given, {} when the folder
+    has no manifest (so every spot is NOT MEASURED)."""
+    if folder is None:
+        return None
+    if not os.path.exists(os.path.join(folder, "manifest.json")):
+        return {}
+    return {s["name"]: s for s in load_spots(Run(folder))}
+
+
+def scene_pairs(spot: dict) -> list[tuple[dict, dict]]:
+    return [(spot, w) for w in spot["windows"] if w["kind"] in SCENE]
+
+
+def spot_fps(spot: dict) -> float | None:
+    """Median FPS over one spot's scene frames; None unless every frame has frameTimeMs."""
+    want, recs = coverage(scene_pairs(spot), "telemetry", "telemetry")
+    vals = [r["frameTimeMs"] for r in recs if isinstance(r.get("frameTimeMs"), (int, float))]
+    if want == 0 or len(vals) < want:
+        return None
+    return 1000.0 / max(float(np.median(vals)), 1e-3)
+
+
+def spot_input_latency(spot: dict) -> float | None:
+    """Median mouse-to-screen estimate (frame time + CPU/bridge wait) over one spot's scene frames; None unless every
+    frame has frameTimeMs and gpuTimeMs."""
+    want, recs = coverage(scene_pairs(spot), "telemetry", "telemetry")
+    lats = [ft + max(0.0, ft - gt) for ft, gt in ((r.get("frameTimeMs"), r.get("gpuTimeMs")) for r in recs)
+            if isinstance(ft, (int, float)) and isinstance(gt, (int, float))]
+    if want == 0 or len(lats) < want:
+        return None
+    return float(np.median(lats))
+
+
+def fps_regression_check(run: Run, good: list[dict], previous: dict[str, dict] | None) -> None:
+    """FAIL when a spot's median FPS is more than max_fps_drop below the same spot in the previous run. With no previous
+    run it only WARNs, since there is nothing to compare against."""
+    src = "previous run folder (--previous), same spot"
+    threshold = f"no spot more than {THRESHOLDS['max_fps_drop']:.0%} slower than its previous run"
+    if previous is None:
+        run.add("fps_regression", WARN, None, threshold, "no previous run given (--previous): nothing to compare", src)
+        return
+    drops, missing = [], []
+    for s in good:
+        now = spot_fps(s)
+        before = spot_fps(previous[s["name"]]) if s["name"] in previous else None
+        if now is None or before is None:
+            missing.append(s["name"])
+        else:
+            drops.append((1.0 - now / before, s["name"], before, now))
+    if not drops or missing:
+        run.add("fps_regression", NOT_MEASURED, None, threshold,
+                "no comparable FPS for: " + (", ".join(missing) or "no spot measured"), src)
+        return
+    worst = max(d[0] for d in drops)
+    detail = f"worst drop {worst:.1%}; " + "; ".join(f"{n} {b:.1f} -> {a:.1f} FPS" for _, n, b, a in drops)
+    run.add("fps_regression", PASS if worst <= THRESHOLDS["max_fps_drop"] else FAIL, round(worst, 4), threshold,
+            detail, src)
+
+
+def input_lag_check(run: Run, good: list[dict], reference: dict[str, dict] | None) -> None:
+    """Each spot's median mouse-to-screen time against the same spot in the no-Remix reference run (--reference), within
+    input_lag_margin_ms (a GUESS). Without a reference the check is NOT MEASURED: there is no fixed limit."""
+    src = "rtx_telemetry.jsonl (frameTimeMs, gpuTimeMs): this run and the reference run (--reference)"
+    margin = THRESHOLDS["input_lag_margin_ms"]
+    threshold = f"<= reference + {margin:g} ms per spot (GUESS margin)"
+    ours = {s["name"]: spot_input_latency(s) for s in good}
+    shown = "; ".join(f"{n} {v:.1f} ms" if v is not None else f"{n} not measured" for n, v in ours.items())
+    if reference is None:
+        run.add("input_latency_ms", NOT_MEASURED, None, threshold,
+                f"no reference run given (--reference), so not compared; this run: {shown or 'no spot measured'}", src)
+        return
+    diffs, missing = [], []
+    for name, now in ours.items():
+        base = spot_input_latency(reference[name]) if name in reference else None
+        if now is None or base is None:
+            missing.append(name)
+        else:
+            diffs.append((now - base, name, now, base))
+    if not diffs or missing:
+        run.add("input_latency_ms", NOT_MEASURED, None, threshold,
+                "no comparable input latency for: " + (", ".join(missing) or "no spot measured"), src)
+        return
+    worst = max(d[0] for d in diffs)
+    detail = f"worst spot {worst:+.2f} ms over reference; " + "; ".join(f"{n} {a:.1f} vs {b:.1f} ms" for _, n, a, b in diffs)
+    run.add("input_latency_ms", PASS if worst <= margin else FAIL, round(worst, 2), threshold, detail, src)
+
+
+def evaluate(folder: str, previous: str | None = None, reference: str | None = None) -> dict:
     run = Run(folder)
     if not run.manifest.get("spots"):
         run.add("spots", FAIL, 0, ">= 1", "the manifest lists no spots", "manifest.json")
     good = load_spots(run)
+    prev_spots, ref_spots = load_other_run(previous), load_other_run(reference)
     pick = lambda kinds: [(s, w) for s in good for w in s["windows"] if w["kind"] in kinds]
     tproblems = [p for s in good for p in s["_tproblems"]]
     tsrc = "rtx_telemetry.jsonl" + (f" ({'; '.join(tproblems[:3])})" if tproblems else "")
 
-    def telemetry_check(name, pairs, field, judge, threshold, describe):
+    def telemetry_check(name, pairs, field, judge, threshold, describe, bad=FAIL):
         if not pairs:
             run.add(name, NOT_MEASURED, None, threshold, "no windows of this kind were run", tsrc); return
         want, recs = coverage(pairs, "telemetry", "telemetry")
@@ -528,7 +628,7 @@ def evaluate(folder: str) -> dict:
             run.add(name, NOT_MEASURED, None, threshold, f"telemetry has {len(vals)} of {want} frames with '{field}'", tsrc)
             return
         value, ok = judge(vals)
-        run.add(name, PASS if ok else FAIL, value, threshold, describe(value, want), tsrc)
+        run.add(name, PASS if ok else bad, value, threshold, describe(value, want), tsrc)
 
     over = lambda v: sum(1 for x in v if x > 50.0)
     telemetry_check("frames_over_50ms", pick(MEASURED), "frameTimeMs",
@@ -547,8 +647,10 @@ def evaluate(folder: str) -> dict:
     telemetry_check("min_median_fps", pick(SCENE), "frameTimeMs",
                     lambda v: (round(1000.0 / max(float(np.median(v)), 1e-3), 2),
                                1000.0 / max(float(np.median(v)), 1e-3) >= THRESHOLDS["min_median_fps"]),
-                    f">= {THRESHOLDS['min_median_fps']:g} FPS",
-                    lambda v, n: f"median {v:.1f} FPS across {n} scene frames")
+                    f">= {THRESHOLDS['min_median_fps']:g} FPS (goal, WARN below)",
+                    lambda v, n: f"median {v:.1f} FPS, target is at or above {THRESHOLDS['min_median_fps']:g} FPS "
+                                 f"({n} scene frames)", bad=WARN)
+    fps_regression_check(run, good, prev_spots)
 
     # Latency checks & Top 10 Latency Contributors breakdown
     want_lat, lat_recs = coverage(pick(SCENE), "telemetry", "telemetry")
@@ -557,21 +659,14 @@ def evaluate(folder: str) -> dict:
     if want_lat == 0 or len(lat_pairs) < want_lat:
         run.add("latency_overhead_ms", NOT_MEASURED, None, f"<= {THRESHOLDS['max_wait_overhead_ms']:g} ms",
                 f"telemetry has {len(lat_pairs)} of {want_lat} frames with frameTimeMs and gpuTimeMs", tsrc)
-        run.add("input_latency_ms", NOT_MEASURED, None, f"<= {THRESHOLDS['max_input_latency_ms']:g} ms",
-                f"telemetry has {len(lat_pairs)} of {want_lat} frames with frameTimeMs and gpuTimeMs", tsrc)
     else:
         waits = [max(0.0, ft - gt) for ft, gt in lat_pairs]
-        est_lats = [ft + max(0.0, ft - gt) for ft, gt in lat_pairs]
         med_wait = round(float(np.median(waits)), 2)
         p99_wait = round(float(np.percentile(waits, 99)), 2)
-        med_lat = round(float(np.median(est_lats)), 2)
-        p99_lat = round(float(np.percentile(est_lats, 99)), 2)
         run.add("latency_overhead_ms", PASS if med_wait <= THRESHOLDS["max_wait_overhead_ms"] else FAIL, med_wait,
                 f"<= {THRESHOLDS['max_wait_overhead_ms']:g} ms",
                 f"median CPU/bridge wait {med_wait:.2f} ms (p99 {p99_wait:.2f} ms)", tsrc)
-        run.add("input_latency_ms", PASS if med_lat <= THRESHOLDS["max_input_latency_ms"] else FAIL, med_lat,
-                f"<= {THRESHOLDS['max_input_latency_ms']:g} ms",
-                f"median mouse-to-screen {med_lat:.2f} ms (p99 {p99_lat:.2f} ms)", tsrc + " + Present timing")
+    input_lag_check(run, good, ref_spots)
     latency_contributors = build_latency_contributors(good, pick(SCENE))
 
     # inward-facing character triangles: two extra telemetry fields, judged per frame
@@ -719,7 +814,7 @@ def evaluate(folder: str) -> dict:
 
     pose_check(run, good)
     goggles_check(run, good)
-    status = PASS if run.metrics and all(x["status"] == PASS for x in run.metrics) else FAIL
+    status = PASS if run.metrics and all(x["status"] in (PASS, WARN) for x in run.metrics) else FAIL
     result = {"status": status, "run": os.path.abspath(folder), "thresholds": THRESHOLDS, "checks": run.metrics,
               "latencyContributors": latency_contributors}
     save_json(os.path.join(folder, "result.json"), result)
@@ -876,9 +971,12 @@ def markdown(result: dict) -> str:
     return "\n".join(lines) + "\n"
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit(__doc__)
-    r = evaluate(sys.argv[1])
+    ap = argparse.ArgumentParser(description="Runtime gate: judge one verify_runtime run folder (see the module docstring).")
+    ap.add_argument("folder")
+    ap.add_argument("--previous", help="an earlier run folder: a spot more than 10% slower than it FAILs")
+    ap.add_argument("--reference", help="the no-Remix reference run folder: input latency is compared with it per spot")
+    a = ap.parse_args()
+    r = evaluate(a.folder, previous=a.previous, reference=a.reference)
     for c in r["checks"]:
         print(f"[{c['status']}] {c['check']}: {c['detail']}")
     print("GATE", r["status"])
