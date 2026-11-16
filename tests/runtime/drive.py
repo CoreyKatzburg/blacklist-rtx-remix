@@ -235,6 +235,51 @@ def start_capture(path: str, frames: int = 0, fps: int = 30, seconds: float = 0.
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def probe_verdict(raw: bytes, info: dict, client: tuple[int, int, int, int] | None) -> dict:
+    """Reads screen_probe.ps1's grab. The marker is a window of one known colour over the game; its colour in the grab
+    says the desktop grab works at that moment, so a black game area beside it means the game picture is lost."""
+    w, h = info["width"], info["height"]
+    if len(raw) != w * h * 3:
+        return {"verdict": "no grab", "bytes": len(raw)}
+    img = np.frombuffer(raw, np.uint8).reshape(h, w, 3).astype(float)
+    mx, my, ms, _ = info["marker"]
+    inner = img[my + 8: my + ms - 8, mx + 8: mx + ms - 8].reshape(-1, 3).mean(0)
+    marker_ok = bool(np.abs(inner - info["colour"]).max() <= 24)
+    game = np.ones((h, w), bool)
+    game[my: my + ms, mx: mx + ms] = False
+    if client:
+        x, y, cw, ch = client
+        inside = np.zeros((h, w), bool)
+        inside[max(y, 0): y + ch, max(x, 0): x + cw] = True
+        game &= inside
+    luma = img.mean(2)
+    game_max, game_mean = float(luma[game].max()), float(luma[game].mean())
+    verdict = ("display or session: the marker window is black too" if not marker_ok else
+               "game picture lost: the marker shows, the game area is black" if game_max == 0 else "ok")
+    return {"verdict": verdict, "markerRgb": [round(float(v), 1) for v in inner], "markerSeen": marker_ok,
+            "gameLumaMean": round(game_mean / 255, 4), "gameLumaMax": round(game_max / 255, 4)}
+
+
+def screen_probe(out_dir: str, hwnd: int) -> dict:
+    """Black-screen probe (coordinator, Nov 16): one desktop grab with a marker window over the game; see probe_verdict."""
+    raw = os.path.join(out_dir, "screen_probe.rgb")
+    try:
+        r = subprocess.run(["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                            os.path.join(os.path.dirname(os.path.abspath(__file__)), "screen_probe.ps1"), "-Out", raw],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode:
+            return {"verdict": "probe failed", "error": (r.stderr or r.stdout).strip()[-400:]}
+        info = json.loads(r.stdout.strip().splitlines()[-1])
+        with open(raw, "rb") as f:
+            got = probe_verdict(f.read(), info, client_rect(hwnd) if hwnd else None)
+        return {**got, "recorded": time.strftime("%H:%M:%S")}
+    except Exception as e:   # noqa: BLE001 - recorded, the spot goes on
+        return {"verdict": "probe failed", "error": f"{type(e).__name__}: {e}"}
+    finally:
+        if os.path.exists(raw):
+            os.remove(raw)
+
+
 def client_rect(hwnd: int) -> tuple[int, int, int, int]:
     """(left, top, width, height) on the screen of the window's client area: the game picture without title bar or
     borders."""
@@ -876,6 +921,11 @@ class Spot:
         self.hold(settle)
         self.bench_window("bench_y0_p0", want, "bench", "gpu_mem.csv")
         self.window("y0_p0", "dump", lambda: self.dump("y0_p0"), dump="y0_p0")
+        # cfg["screenRaster"] (worker E, Nov 16): Remix writes y0_p0_final.pfm before it draws a debug view
+        # (rtx.debugView.debugViewIdx 23 and 102 at con_boiler left final.pfm as the normal picture, while the screen
+        # showed the view), so a debug view is read from a full-size colour grab of the screen, y0_p0_screen_raster.pfm.
+        if cfg.get("screenRaster"):
+            self.window("y0_p0_screen", "raster", lambda: None, **self._try_raster("y0_p0_screen", "screen, Remix on"))
         if cfg.get("revisit"):
             n = int(self.spot.get("yawStops", 8))
             for i in range(1, n):
@@ -1246,6 +1296,9 @@ def main() -> int:
                 result["rayTracingAtStart"] = s.rt_is_on()
             if hwnd:
                 front(hwnd)
+                result["screenProbe"] = screen_probe(a.out, hwnd)
+                print("SCREEN PROBE", json.dumps(result["screenProbe"]), flush=True)
+                front(hwnd)   # the marker never takes focus, but the mouse steering below needs the game in front
                 s._calibrate_mouse()
                 if int(spot.get("mouseLag", 1)):
                     lag: dict = {}

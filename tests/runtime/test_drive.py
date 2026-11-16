@@ -395,6 +395,26 @@ class Reference(unittest.TestCase):
             with mock.patch.object(drive, "start_capture", fake_capture(bytes(57600 * 20 - 1) + b"\x07")):
                 s.capture("dark.gray", 20)   # a nearly black room is still a picture
 
+    def test_screen_probe_tells_a_lost_game_picture_from_a_dead_display(self):
+        # Nov 16: the black no-Remix runs could be the display (off after 30 min idle) or the game picture lost after
+        # Present. The marker window's colour in the same grab separates them.
+        import numpy as np
+        w, h = 64, 48
+        info = {"width": w, "height": h, "marker": [40, 24, 20, 20], "colour": [200, 40, 160]}
+
+        def grab(game_value, marker_on):
+            img = np.full((h, w, 3), game_value, np.uint8)
+            if marker_on:
+                img[24:44, 40:60] = info["colour"]
+            return img.tobytes()
+        client = (0, 0, w, h)
+        self.assertEqual(drive.probe_verdict(grab(90, True), info, client)["verdict"], "ok")
+        self.assertTrue(drive.probe_verdict(grab(0, True), info, client)["verdict"].startswith("game picture lost"))
+        self.assertTrue(drive.probe_verdict(grab(0, False), info, client)["verdict"].startswith("display or session"))
+        self.assertEqual(drive.probe_verdict(b"", info, client)["verdict"], "no grab")
+        # the marker's own pixels must not count as game picture
+        self.assertEqual(drive.probe_verdict(grab(0, True), info, client)["gameLumaMax"], 0.0)
+
     def test_old_dumps_from_an_earlier_spot_are_not_copied(self):
         # Run 063147: Remix wrote no dumps at con_bright_hall (not ray tracing), and con_custodial's files of the
         # same names were copied and scored as con_bright_hall's picture.
