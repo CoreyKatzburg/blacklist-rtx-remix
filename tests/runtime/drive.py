@@ -79,11 +79,12 @@ class Tail:
             f.seek(self._from())
             return f.read().decode("latin-1")
 
-    def copy_to(self, dest: str) -> str | None:
+    def copy_to(self, dest: str, whole: bool = False) -> str | None:
+        """This spot's part of the file, or with whole=True all of it (the files restart at each launch)."""
         if not self.path:
             return None
         with open(self.path, "rb") as f, open(dest, "wb") as out:
-            f.seek(self._from()); shutil.copyfileobj(f, out)
+            f.seek(0 if whole else self._from()); shutil.copyfileobj(f, out)
         return os.path.basename(dest)
 
 
@@ -1115,6 +1116,12 @@ class Spot:
                  "proxyGate": self.pgate.copy_to(os.path.join(self.out, "proxy_gate.csv")),
                  "proxyLog": self.log.copy_to(os.path.join(self.out, "proxy.log")),
                  "lightpubTrace": self.lptrace.copy_to(os.path.join(self.out, "lightpub_trace.csv"))}
+        if self.spot.get("cinematic"):
+            # The cutscene plays before drive.py starts, so the spot's part above misses it (run 20261115-214203:
+            # telemetry from frame 5033, the cutscene ended at 4987). These copies cover the whole launch, so
+            # Remix's own picture during the cutscene sits beside cinematic.csv (worker F2).
+            files["telemetryLaunch"] = self.telemetry.copy_to(os.path.join(self.out, "telemetry_launch.jsonl"), whole=True)
+            files["proxyFramesLaunch"] = self.proxy.copy_to(os.path.join(self.out, "proxy_frames_launch.csv"), whole=True)
         self.process.close()
         return files
 

@@ -303,6 +303,28 @@ class MouseLag(unittest.TestCase):
                 fh.write("\n".join(["header"] + rows) + "\n")
             self.assertEqual(drive.proxy_camera_dirs(p, 950.0), [(1000.5, (0.0, 1.0, 0.0))])
 
+    def test_a_cutscene_spot_keeps_the_telemetry_of_the_whole_launch(self):
+        # Benghazi, run 20261115-214203: the cutscene ended at frame 4987 and telemetry.jsonl began at 5033.
+        import json, os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "rtx_telemetry.jsonl")
+            with open(src, "w") as fh:
+                fh.writelines(json.dumps({"frame": f}) + "\n" for f in range(4778, 4988))   # the cutscene
+            s = drive.Spot.__new__(drive.Spot)
+            s.telemetry = drive.Tail([src], True)   # drive.py starts once the cutscene is over
+            with open(src, "a") as fh:
+                fh.writelines(json.dumps({"frame": f}) + "\n" for f in range(5033, 5040))
+            s.proxy = s.pgate = s.log = s.lptrace = drive.Tail([os.path.join(tmp, "absent")], False)
+            s.out, s.process = tmp, mock.Mock()
+            frames = lambda name: [json.loads(l)["frame"] for l in open(os.path.join(tmp, name))]
+            s.spot = {"cinematic": True}
+            files = s.finish()
+            self.assertEqual(frames("telemetry.jsonl")[0], 5033)
+            self.assertEqual(files["telemetryLaunch"], "telemetry_launch.jsonl")
+            self.assertEqual(frames("telemetry_launch.jsonl")[:1] + frames("telemetry_launch.jsonl")[-1:], [4778, 5039])
+            s.spot = {}
+            self.assertNotIn("telemetryLaunch", s.finish())
+
 
 class Reference(unittest.TestCase):
     """The no-Remix reference pictures: same units as Remix's final.pfm, and never recorded through the wrong renderer."""
