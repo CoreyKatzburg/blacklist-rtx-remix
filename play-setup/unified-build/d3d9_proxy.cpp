@@ -165,6 +165,84 @@ void InstallFocusGuard(HMODULE remixClient) {
     WriteLog("FocusGuard: PostThreadMessageA import not found in the chained DLL; not installed");
 }
 
+// WindowLog: every quit with ray tracing on ends in VK_ERROR_DEVICE_LOST 2.5 to 4.9 s after the game window
+// loses focus, and the logs do not say what the window did. Log the game window's focus, size, show and close
+// messages (sent and posted) with timestamps, capped so alt-tabbing cannot flood the log.
+// The proxy does not link user32 (see FocusGuard); these are resolved when the log is installed.
+HWND g_loggedWindow = nullptr;
+volatile LONG g_windowLogLines = 0;
+constexpr LONG kWindowLogMaxLines = 300;
+BOOL(WINAPI* g_isWindowVisible)(HWND) = nullptr;
+BOOL(WINAPI* g_isIconic)(HWND) = nullptr;
+LRESULT(WINAPI* g_callNextHookEx)(HHOOK, int, WPARAM, LPARAM) = nullptr;
+
+void LogWindowMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam, const char* how) {
+    if (window != g_loggedWindow) return;
+    const char* name = nullptr;
+    switch (message) {
+    case WM_ACTIVATEAPP: name = "WM_ACTIVATEAPP"; break;
+    case WM_ACTIVATE: name = "WM_ACTIVATE"; break;
+    case WM_KILLFOCUS: name = "WM_KILLFOCUS"; break;
+    case WM_SETFOCUS: name = "WM_SETFOCUS"; break;
+    case WM_SIZE: name = "WM_SIZE"; break;
+    case WM_SHOWWINDOW: name = "WM_SHOWWINDOW"; break;
+    case WM_CLOSE: name = "WM_CLOSE"; break;
+    case WM_DESTROY: name = "WM_DESTROY"; break;
+    case WM_QUIT: name = "WM_QUIT"; break;
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xFFF0) != SC_CLOSE && (wParam & 0xFFF0) != SC_MINIMIZE) return;
+        name = "WM_SYSCOMMAND";
+        break;
+    default: return;
+    }
+    if (InterlockedIncrement(&g_windowLogLines) > kWindowLogMaxLines) return;
+    WriteLog("WindowLog: %s %s wParam=0x%08lX lParam=0x%08lX visible=%d iconic=%d", how, name,
+             static_cast<unsigned long>(wParam), static_cast<unsigned long>(lParam),
+             g_isWindowVisible(window) ? 1 : 0, g_isIconic(window) ? 1 : 0);
+}
+
+LRESULT CALLBACK WindowLogCallProc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION) {
+        const auto* msg = reinterpret_cast<const CWPSTRUCT*>(lParam);
+        LogWindowMessage(msg->hwnd, msg->message, msg->wParam, msg->lParam, "sent");
+    }
+    return g_callNextHookEx(nullptr, code, wParam, lParam);
+}
+
+LRESULT CALLBACK WindowLogGetMessageProc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION && wParam == PM_REMOVE) {
+        const auto* msg = reinterpret_cast<const MSG*>(lParam);
+        // WM_QUIT is posted to the thread, not a window.
+        LogWindowMessage(msg->message == WM_QUIT ? g_loggedWindow : msg->hwnd, msg->message, msg->wParam,
+                         msg->lParam, "posted");
+    }
+    return g_callNextHookEx(nullptr, code, wParam, lParam);
+}
+
+void InstallWindowLog(HWND window) {
+    if (!window || g_loggedWindow) return;
+    const HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    const auto threadOf = reinterpret_cast<DWORD(WINAPI*)(HWND, DWORD*)>(
+        user32 ? GetProcAddress(user32, "GetWindowThreadProcessId") : nullptr);
+    const auto setHook = reinterpret_cast<HHOOK(WINAPI*)(int, HOOKPROC, HINSTANCE, DWORD)>(
+        user32 ? GetProcAddress(user32, "SetWindowsHookExW") : nullptr);
+    g_isWindowVisible = reinterpret_cast<decltype(g_isWindowVisible)>(
+        user32 ? GetProcAddress(user32, "IsWindowVisible") : nullptr);
+    g_isIconic = reinterpret_cast<decltype(g_isIconic)>(user32 ? GetProcAddress(user32, "IsIconic") : nullptr);
+    g_callNextHookEx = reinterpret_cast<decltype(g_callNextHookEx)>(
+        user32 ? GetProcAddress(user32, "CallNextHookEx") : nullptr);
+    if (!threadOf || !setHook || !g_isWindowVisible || !g_isIconic || !g_callNextHookEx) {
+        WriteLog("WindowLog: user32 functions not found; not installed");
+        return;
+    }
+    const DWORD thread = threadOf(window, nullptr);
+    g_loggedWindow = window;
+    const bool sent = setHook(WH_CALLWNDPROC, WindowLogCallProc, nullptr, thread) != nullptr;
+    const bool posted = setHook(WH_GETMESSAGE, WindowLogGetMessageProc, nullptr, thread) != nullptr;
+    WriteLog("WindowLog: window %p thread %lu, sent-message hook %d, posted-message hook %d", window, thread,
+             sent ? 1 : 0, posted ? 1 : 0);
+}
+
 HMODULE TryChainCandidate(const wchar_t* path, const char* source) {
     if (_wcsicmp(path, g_proxyPath) == 0) {
         WriteLog("ignored recursive %s chain candidate: %ls", source, path);
@@ -1391,9 +1469,13 @@ public:
                  this, real_, adapter, static_cast<unsigned>(deviceType), behaviorFlags, returnedDevice);
         const HRESULT result = real_->CreateDevice(
             adapter, deviceType, focusWindow, behaviorFlags, presentationParameters, returnedDevice);
-        WriteLog("CreateDevice returned HRESULT=0x%08lX device=%p",
-                 static_cast<unsigned long>(result), returnedDevice ? *returnedDevice : nullptr);
-        if (SUCCEEDED(result) && returnedDevice && *returnedDevice) PatchDevice(*returnedDevice);
+        WriteLog("CreateDevice returned HRESULT=0x%08lX device=%p windowed=%d",
+                 static_cast<unsigned long>(result), returnedDevice ? *returnedDevice : nullptr,
+                 presentationParameters ? presentationParameters->Windowed : -1);
+        if (SUCCEEDED(result) && returnedDevice && *returnedDevice) {
+            PatchDevice(*returnedDevice);
+            InstallWindowLog(focusWindow ? focusWindow : presentationParameters->hDeviceWindow);
+        }
         return result;
     }
 
@@ -1416,9 +1498,13 @@ public:
         if (!realEx_) return D3DERR_INVALIDCALL;
         const HRESULT result = realEx_->CreateDeviceEx(
             adapter, deviceType, focusWindow, behaviorFlags, presentationParameters, fullscreenDisplayMode, returnedDevice);
-        WriteLog("CreateDeviceEx returned HRESULT=0x%08lX device=%p",
-                 static_cast<unsigned long>(result), returnedDevice ? *returnedDevice : nullptr);
-        if (SUCCEEDED(result) && returnedDevice && *returnedDevice) PatchDevice(*returnedDevice);
+        WriteLog("CreateDeviceEx returned HRESULT=0x%08lX device=%p windowed=%d",
+                 static_cast<unsigned long>(result), returnedDevice ? *returnedDevice : nullptr,
+                 presentationParameters ? presentationParameters->Windowed : -1);
+        if (SUCCEEDED(result) && returnedDevice && *returnedDevice) {
+            PatchDevice(*returnedDevice);
+            InstallWindowLog(focusWindow ? focusWindow : presentationParameters->hDeviceWindow);
+        }
         return result;
     }
     HRESULT STDMETHODCALLTYPE GetAdapterLUID(UINT a, LUID* l) override {
