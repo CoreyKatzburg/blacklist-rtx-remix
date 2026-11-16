@@ -5,13 +5,16 @@ foreach ($fn in $ast.FindAll({ $args[0] -is [Management.Automation.Language.Func
     . ([scriptblock]::Create($fn.Extent.Text))
 }
 $ResultsRoot = Join-Path ([IO.Path]::GetTempPath()) ("refpick-" + [guid]::NewGuid())
-function Make($name, $spots, $finished, $errors = @{}) {
+function Make($name, $spots, $finished, $errors = @{}, $black = @()) {
     $d = Join-Path $ResultsRoot $name; New-Item -ItemType Directory $d | Out-Null
     @{ spots = $spots } | ConvertTo-Json | Set-Content (Join-Path $d 'manifest.json')
     if ($finished) { '{}' | Set-Content (Join-Path $d 'result.json') }
-    foreach ($s in $spots) { New-Item -ItemType Directory (Join-Path $d $s) | Out-Null
+    foreach ($s in $spots) { New-Item -ItemType Directory (Join-Path $d "$s\gate") | Out-Null
         @{ name = $s; error = $errors[$s] } | ConvertTo-Json | Set-Content (Join-Path $d "$s\spot.json")
-        'keep' | Set-Content (Join-Path $d "$s\data.txt") }
+        'keep' | Set-Content (Join-Path $d "$s\data.txt")
+        $luma = if ($s -in $black) { 0 } else { 0.12 }   # one black stop is enough to make the spot unusable
+        @{ luma = @(0.1, 0.11, 0.12) } | ConvertTo-Json | Set-Content (Join-Path $d "$s\gate\y0_p0_raster.json")
+        @{ luma = @($luma, $luma, $luma) } | ConvertTo-Json | Set-Content (Join-Path $d "$s\gate\y45_p0_raster.json") }
     $d
 }
 $fails = 0
@@ -33,6 +36,12 @@ try {
     Check 'one source gives that run itself' ((Select-Reference $run2 '20261105-000000') -eq $newBroken)
     $run3 = Make '20261100-000000' @('a') $false
     Check 'no earlier reference gives none' ($null -eq (Select-Reference $run3 '20261100-000000'))
+    # Nov 16: the newest no-Remix runs grabbed only black frames and were picked as the reference
+    $blackRef = Make 'reference-20261106-000000' @('a', 'b') $true @{} @('a')
+    $run4 = Make '20261107-000000' @('a', 'b') $false
+    $m4 = Get-Content (Join-Path (Select-Reference $run4 '20261107-000000') 'manifest.json') -Raw | ConvertFrom-Json
+    Check 'a skips the newer reference whose pictures are black' ($m4.chosenFrom.a -eq $newBroken)
+    Check 'b still takes that newer reference' ($m4.chosenFrom.b -eq $blackRef)
 } finally {
     Get-ChildItem $ResultsRoot -Recurse -Directory | Where-Object { $_.LinkType } | ForEach-Object { [IO.Directory]::Delete($_.FullName, $false) }
     Remove-Item $ResultsRoot -Recurse -Force

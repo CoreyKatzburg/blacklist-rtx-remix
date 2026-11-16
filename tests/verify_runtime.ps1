@@ -74,9 +74,13 @@ function Select-Reference($folder, $stamp) {
         ($_.Name -replace '^reference-', '') -lt $stamp -and (Test-Path (Join-Path $_.FullName 'result.json')) } | Sort-Object Name -Descending)
     $chosen = [ordered]@{}
     foreach ($spot in Get-RunSpots $folder) {
+        # ...and whose reference pictures are pictures: the no-Remix runs of Nov 16 04:58-06:22 grabbed only black
+        # frames (every <tag>_raster.json luma 0), and the next Remix run was scored against them.
         $hit = $refs | Where-Object {
             $sj = Join-Path $_.FullName "$spot\spot.json"
-            (Get-RunSpots $_.FullName) -contains $spot -and (Test-Path $sj) -and -not (Get-Content $sj -Raw | ConvertFrom-Json).error
+            $rasters = @(Get-ChildItem (Join-Path $_.FullName "$spot\gate") -Filter '*_raster.json' -ErrorAction SilentlyContinue)
+            (Get-RunSpots $_.FullName) -contains $spot -and (Test-Path $sj) -and -not (Get-Content $sj -Raw | ConvertFrom-Json).error -and
+                $rasters.Count -and -not ($rasters | Where-Object { [double](Get-Content $_.FullName -Raw | ConvertFrom-Json).luma[2] -le 0 })
         } | Select-Object -First 1
         if ($hit) { $chosen[$spot] = $hit.FullName }
     }
