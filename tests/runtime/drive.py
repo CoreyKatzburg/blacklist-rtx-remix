@@ -650,6 +650,20 @@ class Spot:
             raise RuntimeError(f"ray tracing was not off: rayTraced of the last {len(traced)} frames {traced}")
         return {"rayTracedLastFrames": traced}
 
+    def rt_is_on(self, timeout: float = 20.0) -> dict:
+        """Waits up to `timeout` s for Remix's last 10 telemetry frames to be ray traced; raises when they never are.
+        Run 20261116-063147: con_bright_hall's launch never ray traced (the proxy logged "AutoRaytracing -> on" 56
+        times, Remix created no ray tracing passes), and its 92 windows were scored as a Remix result."""
+        last: list[bool] = []
+
+        def traced() -> bool:
+            last[:] = [bool(r.get("rayTraced")) for r in recent_telemetry(self.telemetry.path, 0)[-10:]]
+            return len(last) == 10 and all(last)
+        self.hold(timeout, until=traced)
+        if not traced():
+            raise RuntimeError(f"Remix is not ray tracing at the spot: rayTraced of the last {len(last)} frames {last}")
+        return {"rayTracedLastFrames": last}
+
     def raster_rt_off(self, tag: str) -> None:
         """Method A reference picture inside a Remix run: ray tracing off (the proxy then gives the game back its own
         lighting and post effects), checked off in Remix's telemetry, grabbed, then switched back on."""
@@ -1218,6 +1232,8 @@ def main() -> int:
             s._calibrate_mouse()
             s.bench(spot["bench"])   # one pose per launch: nothing else
         else:
+            if not a.no_remix:
+                result["rayTracingAtStart"] = s.rt_is_on()
             if hwnd:
                 front(hwnd)
                 s._calibrate_mouse()

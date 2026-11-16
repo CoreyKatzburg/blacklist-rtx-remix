@@ -500,6 +500,14 @@ class Reference(unittest.TestCase):
                 drive.Spot.rt_is_off(spot_with([True] * 5 + [False] * 11 + [True]), 100)
             with self.assertRaisesRegex(RuntimeError, "last 6 frames"):   # too few frames since the switch
                 drive.Spot.rt_is_off(spot_with([False] * 20), 113)
+            # Run 20261116-063147 con_bright_hall: the whole launch drew without ray tracing and was scored as Remix
+            on = lambda flags: drive.Spot.rt_is_on(types.SimpleNamespace(
+                hold=lambda seconds, until=None: None, **vars(spot_with(flags))))
+            self.assertEqual(on([False] * 5 + [True] * 10)["rayTracedLastFrames"], [True] * 10)
+            with self.assertRaisesRegex(RuntimeError, "not ray tracing"):
+                on([False] * 40)
+            with self.assertRaisesRegex(RuntimeError, "not ray tracing"):   # one raster frame at the end
+                on([True] * 12 + [False])
 
 
 if __name__ == "__main__":
