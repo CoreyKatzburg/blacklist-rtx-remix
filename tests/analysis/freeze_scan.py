@@ -77,6 +77,37 @@ def windows(folder):
     return [(w['name'], w['proxy'][0], w['proxy'][1]) for w in spot.get('windows', []) if w.get('proxy')]
 
 
+def excluded_lines(found, frames, gate_spot):
+    """The gaps the rule leaves out, so it hides nothing: per class a count and the sizes, then the quit gap
+    (the last frame's gap, printed whatever its size). In a gate spot's trace the last frame is where the spot's
+    copy ends, not necessarily the game's quit, so it is labelled 'trace end' there."""
+    lines = []
+    for kind in ('startup', 'menu', 'end'):
+        sizes = [gap for _, gap, _, k in found if k == kind]
+        if sizes:
+            lines.append(f'excluded {kind}: {len(sizes)} gap(s), ' + ', '.join(f'{s:.0f}' for s in sizes) + ' ms')
+    last_frame, last_gap = frames[-1][0], frames[-1][1]
+    label = 'trace end (gate spot copy, not a quit)' if gate_spot else 'quit gap'
+    lines.append(f'{label}: {last_gap:.0f} ms on frame {last_frame}')
+    return lines
+
+
+def renderer(folder):
+    """Which d3d9 the proxy chained in the folder's last launch: Remix, or Windows' own (the original game)."""
+    for name in ('d3d9_proxy.log', 'proxy_launch.log', 'proxy.log'):
+        path = os.path.join(folder, name)
+        if not os.path.exists(path):
+            continue
+        last = None
+        with open(path, 'r', errors='replace') as f:
+            for line in f:
+                if 'chained ' in line and 'DLL:' in line:
+                    last = line
+        if last:
+            return 'original game (no Remix)' if 'SysWOW64' in last or 'System32' in last else 'Remix'
+    return 'renderer unknown'
+
+
 def scan(folder, limit):
     path = frames_file(folder)
     if not path:
@@ -87,10 +118,15 @@ def scan(folder, limit):
     for n, frames in enumerate(read_launches(path)):
         found = classify(frames, limit)
         play_frames = sum(1 for f in frames if f[3])
-        print(f'{folder} [{os.path.basename(path)}] launch {n}: frames {frames[0][0]}..{frames[-1][0]} '
-              f'({len(frames)}), in play {play_frames}, gaps over {limit:.0f} ms {len(found)}, '
-              f'freezes in play {sum(1 for f in found if f[3] == "play")}')
+        print(f'{folder} [{os.path.basename(path)}] launch {n} ({renderer(folder)}): '
+              f'frames {frames[0][0]}..{frames[-1][0]} ({len(frames)}), in play {play_frames}, '
+              f'gaps over {limit:.0f} ms {len(found)}, freezes in play {sum(1 for f in found if f[3] == "play")}')
+        # Only proxy_frames.csv is a copy starting and ending with the spot; the other two traces span the launch.
+        for line in excluded_lines(found, frames, os.path.basename(path) == 'proxy_frames.csv'):
+            print('    ' + line)
         for frame, gap, present, kind in found:
+            if kind != 'play':
+                continue
             if wins is None:
                 where = 'no scored windows (not a gate spot)'
             else:
@@ -130,6 +166,15 @@ def self_test():
           sum(k == 'play' for *_, k in classify(quit_only, 1000)) == 0)
     check('quit-only session: 1 freeze without the rule (the rule is load-bearing)',
           sum(k == 'play' for *_, k in classify(quit_only, 1000, edge_rule=False)) == 1)
+    # Fake case: the rule must not hide the long last gap; it has to appear in the quit line and the 'end' line.
+    lines = excluded_lines(classify(quit_only, 1000), quit_only, gate_spot=False)
+    check('quit-only session: the 2490 ms gap shows as the quit gap',
+          any(l.startswith('quit gap: 2490 ms') for l in lines))
+    check('quit-only session: the 2490 ms gap shows as an excluded end gap',
+          any(l.startswith('excluded end: 1') and '2490' in l for l in lines))
+    lines = excluded_lines(got, frames, gate_spot=False)
+    check('startup and menu gaps are listed, not dropped',
+          any(l.startswith('excluded startup: 1') for l in lines) and any(l.startswith('excluded menu: 1') for l in lines))
     print('self-test PASS' if ok else 'self-test FAIL')
     return 0 if ok else 1
 
