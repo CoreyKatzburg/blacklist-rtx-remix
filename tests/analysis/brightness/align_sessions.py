@@ -19,6 +19,7 @@ import datetime as dt
 import json
 import math
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,8 +32,9 @@ THUMB_PX = THUMB_W * THUMB_H
 HUD_MARGIN = 0.08
 NEAR_BLACK_GAMMA = 0.02
 NEAR_WHITE_GAMMA = 0.98
+MAX_ANCHOR_RESIDUAL_MS = 500.0
 
-ROOT = Path(r"D:\BlacklistOverhaul")
+DEFAULT_ROOT = Path(r"D:\BlacklistOverhaul")
 
 
 @dataclass(frozen=True)
@@ -44,29 +46,30 @@ class SessionSpec:
     video_end: str | None
 
 
-SESSIONS: dict[str, SessionSpec] = {
-    "nov13": SessionSpec(
-        key="nov13",
-        folder=ROOT / r"experiments\playtest-evidence\play-setup-logs\before-20261114-143424",
-        pid=44264,
-        video_start="2026-11-13 21:22:48",
-        video_end="2026-11-13 21:33:13",
-    ),
-    "nov14_1531": SessionSpec(
-        key="nov14_1531",
-        folder=ROOT / r"experiments\playtest-evidence\play-setup-logs\before-20261114-153109",
-        pid=23260,
-        video_start="2026-11-14 14:49:59",
-        video_end="2026-11-14 15:02:18",
-    ),
-    "nov14_1855": SessionSpec(
-        key="nov14_1855",
-        folder=ROOT / r"experiments\playtest-evidence\steam-session-20261114-1855",
-        pid=25832,
-        video_start=None,
-        video_end=None,
-    ),
-}
+def build_default_sessions(root: Path = DEFAULT_ROOT) -> dict[str, SessionSpec]:
+    return {
+        "nov13": SessionSpec(
+            key="nov13",
+            folder=root / r"experiments\playtest-evidence\play-setup-logs\before-20261114-143424",
+            pid=44264,
+            video_start="2026-11-13 21:22:48",
+            video_end="2026-11-13 21:33:13",
+        ),
+        "nov14_1531": SessionSpec(
+            key="nov14_1531",
+            folder=root / r"experiments\playtest-evidence\play-setup-logs\before-20261114-153109",
+            pid=23260,
+            video_start="2026-11-14 14:49:59",
+            video_end="2026-11-14 15:02:18",
+        ),
+        "nov14_1855": SessionSpec(
+            key="nov14_1855",
+            folder=root / r"experiments\playtest-evidence\steam-session-20261114-1855",
+            pid=25832,
+            video_start=None,
+            video_end=None,
+        ),
+    }
 
 RE_LOG_TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}) \[pid (\d+)\] (.*)$")
 RE_LIGHTPUB = re.compile(
@@ -315,9 +318,18 @@ def load_aligned_session(spec: SessionSpec) -> dict[str, Any]:
             legacy_draws[fr] = int(rec.get("legacyMaterialDraws", 0))
             instances[fr] = int(rec.get("instances", 0))
 
+    alignment = validate_session_alignment(
+        spec=spec,
+        log_info=log_info,
+        n_frames=n_proxy,
+        wall_s=wall_s,
+        anchor_residuals_ms=anchor_residuals_ms,
+    )
+
     return {
         "spec": spec,
         "log": log_info,
+        "alignment": alignment,
         "n_frames": n_proxy,
         "telem_frames": telem_count,
         "wall_s": wall_s,
@@ -340,6 +352,38 @@ def load_aligned_session(spec: SessionSpec) -> dict[str, Any]:
         "replaced_draws": replaced_draws,
         "legacy_draws": legacy_draws,
         "instances": instances,
+    }
+
+
+def validate_session_alignment(
+    spec: SessionSpec,
+    log_info: dict[str, Any],
+    n_frames: int,
+    wall_s: np.ndarray,
+    anchor_residuals_ms: list[float],
+    max_anchor_residual_ms: float = MAX_ANCHOR_RESIDUAL_MS,
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    if n_frames == 0:
+        reasons.append("no_proxy_frames")
+    if log_info["first_ts"] is None:
+        reasons.append(f"pid_{spec.pid}_missing_in_proxy_log")
+    max_res = max((abs(x) for x in anchor_residuals_ms), default=0.0)
+    if max_res > max_anchor_residual_ms:
+        reasons.append(f"anchor_residual_too_high ({max_res:.1f}ms > {max_anchor_residual_ms:.1f}ms)")
+    if spec.video_start and n_frames > 0:
+        vs = parse_wall_ts(spec.video_start)
+        ve = parse_wall_ts(spec.video_end) if spec.video_end else vs
+        overlap_s = min(float(wall_s[-1]), ve) - max(float(wall_s[0]), vs)
+        if overlap_s <= 0.0:
+            reasons.append(
+                f"video_window_no_overlap (session={fmt_wall_hms(float(wall_s[0]))}..{fmt_wall_hms(float(wall_s[-1]))}, "
+                f"video={spec.video_start}..{spec.video_end})"
+            )
+    return {
+        "aligned": len(reasons) == 0,
+        "max_anchor_residual_ms": max_res,
+        "reasons": reasons,
     }
 
 
@@ -408,6 +452,7 @@ def summarize_slice(data: dict[str, Any], mask: np.ndarray, label: str) -> dict[
         "f_range": f"{f0}..{f1}",
         "wall_range": f"{fmt_wall_hms(t0)}..{fmt_wall_hms(t1)}",
         "rt_frames": int(np.sum(rt_mask)),
+        "mean_avg": float(np.nanmean(lm)) if lm.size else float("nan"),
         "mean_med": float(np.nanmedian(lm)) if lm.size else float("nan"),
         "mean_min": float(np.nanmin(lm)) if lm.size else float("nan"),
         "mean_max": float(np.nanmax(lm)) if lm.size else float("nan"),
@@ -442,8 +487,8 @@ def print_slice_row(s: dict[str, Any]) -> None:
     print(
         f"  [{s['label']}] {s['wall_range']} f={s['f_range']} (n={s['frames']}, rt={s['rt_frames']}) "
         f"pos={pos_s} cam(G={s['cam_G_pct']:.0f}%/P={s['cam_P_pct']:.0f}%) mat={mat_s}\n"
-        f"      ROI gamma: mean={s['mean_med']:.4f} [{s['mean_min']:.4f}..{s['mean_max']:.4f}] "
-        f"p10={s['p10_med']:.4f} p90={s['p90_med']:.4f} | "
+        f"      ROI gamma: mean={s['mean_avg']:.4f} med={s['mean_med']:.4f} [{s['mean_min']:.4f}..{s['mean_max']:.4f}] "
+        f"p10_med={s['p10_med']:.4f} p90_med={s['p90_med']:.4f} | "
         f"nearBlack(med/max)={s['nb_med']*100:.1f}%/{s['nb_max']*100:.1f}% ({s['nb_gt80pct_frames']}f>80%) | "
         f"nearWhite(med/max)={s['nw_med']*100:.1f}%/{s['nw_max']*100:.1f}% ({s['nw_gt5pct_frames']}f>5%) | "
         f"thumbClipMax={clip_s}\n"
@@ -453,15 +498,15 @@ def print_slice_row(s: dict[str, Any]) -> None:
 
 def print_session_report(data: dict[str, Any], window_sec: float = 30.0) -> None:
     spec: SessionSpec = data["spec"]
-    res = data["anchor_residuals_ms"]
-    max_res = max((abs(x) for x in res), default=0.0)
+    al = data["alignment"]
+    al_str = "PASS" if al["aligned"] else f"FAIL ({'; '.join(al['reasons'])})"
     print("=" * 110)
     print(
-        f"SESSION {spec.key} (pid {spec.pid}) folder={spec.folder.name}\n"
+        f"SESSION {spec.key} (pid {spec.pid}) folder={spec.folder.name} ALIGNMENT={al_str}\n"
         f"  proxy_frames={data['n_frames']} telem_frames={data['telem_frames']} "
         f"wall={fmt_wall_hms(data['wall_s'][0])}..{fmt_wall_hms(data['wall_s'][-1])} "
         f"({(data['wall_s'][-1]-data['wall_s'][0])/60.0:.2f} min) "
-        f"QPC<->wall anchor max residual={max_res:.1f} ms"
+        f"QPC<->wall anchor max residual={al['max_anchor_residual_ms']:.1f} ms"
     )
     print("  AutoRaytracing & sky dome events:")
     events = [
@@ -498,7 +543,7 @@ def print_named_spots(sessions: dict[str, dict[str, Any]]) -> None:
 
     if "nov13" in sessions:
         d13 = sessions["nov13"]
-        vs13 = parse_wall_ts(SESSIONS["nov13"].video_start)
+        vs13 = parse_wall_ts(d13["spec"].video_start) if d13["spec"].video_start else float(d13["wall_s"][0])
         print("\n--- Nov 13 Video (21:22:48..21:33:13, pid 44264 in before-20261114-143424, pre-materials-fix) ---")
         nov13_spots = [
             ("Nov13 pre-video Paladin load/walk", -80, 0),
@@ -516,7 +561,7 @@ def print_named_spots(sessions: dict[str, dict[str, Any]]) -> None:
 
     if "nov14_1531" in sessions:
         d14 = sessions["nov14_1531"]
-        vs14 = parse_wall_ts(SESSIONS["nov14_1531"].video_start)
+        vs14 = parse_wall_ts(d14["spec"].video_start) if d14["spec"].video_start else float(d14["wall_s"][0])
         print("\n--- Nov 14 Afternoon (14:35:04..15:02:34, pid 23260 in before-20261114-153109, 0% materials mod) ---")
         nov14_spots = [
             ("Nov14 pre-vid 14:36:00..14:38:30 Paladin initial", -839, -689),
@@ -535,7 +580,6 @@ def print_named_spots(sessions: dict[str, dict[str, Any]]) -> None:
             m = (d14["wall_s"] >= vs14 + s0) & (d14["wall_s"] < vs14 + s1)
             print_slice_row(summarize_slice(d14, m, title))
 
-        # Exact search for all whiteout bursts (nearWhite > 10% or thumbClipped > 1%) across ALL 27.5 min of nov14_1531
         rt = d14["ray_traced"] == 1
         white_frames = np.flatnonzero(rt & ((d14["near_white"] > 0.10) | (d14["thumb_clipped_frac"] > 0.01)))
         print(f"\n  [nov14_1531 whiteout/clipped RT frame clusters: total={white_frames.size} frames]")
@@ -574,8 +618,221 @@ def print_frame_clusters(data: dict[str, Any], frames: np.ndarray, v_start: floa
         print_slice_row(summarize_slice(data, m, f"cluster {lbl}"))
 
 
+def _read_cutscene_rows(csv_path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not csv_path.exists():
+        return rows
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        for r in csv.DictReader(f):
+            in_cut = r.get("inCutscene", "True") in ("", "True", "true", "1")
+            b_str = r.get("activeBrightness") or r.get("brightness") or ""
+            if b_str == "":
+                continue
+            gf = int(r["gameFrame"]) if r.get("gameFrame") else None
+            cx = float(r["camX"]) if r.get("camX") else float("nan")
+            cy = float(r["camY"]) if r.get("camY") else float("nan")
+            cz = float(r["camZ"]) if r.get("camZ") else float("nan")
+            rows.append({
+                "shot": int(r["shot"]) if r.get("shot") else len(rows),
+                "game_frame": gf,
+                "in_cutscene": in_cut,
+                "cam": (cx, cy, cz),
+                "brightness": float(b_str),
+                "near_black": float(r.get("activeNearBlack") or r.get("nearBlack") or 0.0),
+                "near_white": float(r.get("activeNearWhite") or r.get("nearWhite") or 0.0),
+                "full_white": float(r.get("activeFullWhite") or r.get("fullWhite") or 0.0),
+            })
+    return rows
+
+
+def analyze_cutscene_dir(
+    spot_dir: Path,
+    ref_spot_dir: Path | None = None,
+    cross_launch_spot_dir: Path | None = None,
+    whiteout_mean_limit: float = 0.35,
+    whiteout_near_white_limit: float = 0.12,
+) -> dict[str, Any] | None:
+    """Analyzes <spot>/cinematic/cinematic.csv, checks same-launch telemetry overlap, and flags whiteout."""
+    cin_csv = spot_dir / "cinematic" / "cinematic.csv"
+    all_rows = _read_cutscene_rows(cin_csv)
+    if not all_rows:
+        return None
+    cut_rows = [r for r in all_rows if r["in_cutscene"]]
+    if not cut_rows:
+        cut_rows = all_rows
+
+    b = np.array([r["brightness"] for r in cut_rows], dtype=np.float64)
+    nw = np.array([r["near_white"] for r in cut_rows], dtype=np.float64)
+    fw = np.array([r["full_white"] for r in cut_rows], dtype=np.float64)
+    nb = np.array([r["near_black"] for r in cut_rows], dtype=np.float64)
+    gfs = [r["game_frame"] for r in cut_rows if r["game_frame"] is not None]
+    gf_min = min(gfs) if gfs else None
+    gf_max = max(gfs) if gfs else None
+
+    # Check same-launch telemetry.jsonl overlap with cutscene game frames!
+    same_launch_telem = spot_dir / "telemetry.jsonl"
+    telem_frames_all: list[int] = []
+    same_launch_overlap: list[float] = []
+    if same_launch_telem.exists():
+        with same_launch_telem.open("r", encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                rec = json.loads(ln)
+                fr = int(rec.get("frame", -1))
+                telem_frames_all.append(fr)
+                if gf_min is not None and gf_max is not None and gf_min <= fr <= gf_max:
+                    m_v, _, _, _, _, _ = decode_luma_thumb_stats(rec.get("lumaThumb"))
+                    if math.isfinite(m_v):
+                        same_launch_overlap.append(m_v)
+
+    same_launch_status = "MEASURED" if same_launch_overlap else "NOT_MEASURED"
+    ref_summary = None
+    if ref_spot_dir is not None:
+        ref_rows = [r for r in _read_cutscene_rows(ref_spot_dir / "cinematic" / "cinematic.csv") if r["in_cutscene"]]
+        if ref_rows:
+            rb = np.array([r["brightness"] for r in ref_rows], dtype=np.float64)
+            rnw = np.array([r["near_white"] for r in ref_rows], dtype=np.float64)
+            rfw = np.array([r["full_white"] for r in ref_rows], dtype=np.float64)
+            ref_summary = {
+                "shots": len(ref_rows),
+                "mean_brightness": float(rb.mean()),
+                "median_brightness": float(np.median(rb)),
+                "near_white_mean": float(rnw.mean()),
+                "full_white_mean": float(rfw.mean()),
+            }
+
+    whiteout = bool(float(b.mean()) > whiteout_mean_limit or float(nw.mean()) > whiteout_near_white_limit)
+    if ref_summary is not None and ref_summary["mean_brightness"] >= 0.02:
+        ratio = float(b.mean()) / ref_summary["mean_brightness"]
+        nw_delta = float(nw.mean()) - ref_summary["near_white_mean"]
+        whiteout = bool(ratio > 1.50 or nw_delta > 0.10)
+    else:
+        ratio = None
+        nw_delta = None
+
+    return {
+        "spot_dir": str(spot_dir),
+        "shots_in_cutscene": len(cut_rows),
+        "gf_range": [gf_min, gf_max],
+        "mean_brightness": float(b.mean()),
+        "median_brightness": float(np.median(b)),
+        "max_brightness": float(b.max()),
+        "near_black_mean": float(nb.mean()),
+        "near_white_mean": float(nw.mean()),
+        "near_white_median": float(np.median(nw)),
+        "near_white_max": float(nw.max()),
+        "full_white_mean": float(fw.mean()),
+        "full_white_max": float(fw.max()),
+        "same_launch_telemetry_frame_range": (
+            [min(telem_frames_all), max(telem_frames_all)] if telem_frames_all else None
+        ),
+        "same_launch_overlap_frames": len(same_launch_overlap),
+        "same_launch_remix_output": same_launch_status,
+        "same_launch_luma_mean": float(np.mean(same_launch_overlap)) if same_launch_overlap else None,
+        "reference": ref_summary,
+        "mean_ratio_vs_reference": ratio,
+        "near_white_delta_vs_reference": nw_delta,
+        "whiteout": whiteout,
+        "all_rows": all_rows,
+        "cross_launch_spot_dir": str(cross_launch_spot_dir) if cross_launch_spot_dir else None,
+    }
+
+
+def print_benghazi_cinematic_comparison(
+    spot_dir: Path,
+    ref_spot_dir: Path | None = None,
+    cross_launch_spot_dir: Path | None = None,
+) -> dict[str, Any] | None:
+    res = analyze_cutscene_dir(spot_dir, ref_spot_dir=ref_spot_dir, cross_launch_spot_dir=cross_launch_spot_dir)
+    if res is None:
+        return None
+    print("\n" + "=" * 110)
+    print("BENGHAZI OPENING CINEMATIC: D3D9 SCREEN (cinematic.csv) vs REFERENCE & TELEMETRY AUDIT")
+    print("=" * 110)
+    print(
+        f"  Cutscene (gf={res['gf_range'][0]}..{res['gf_range'][1]}, n={res['shots_in_cutscene']}, "
+        f"whiteout={res['whiteout']}): "
+        f"screen mean={res['mean_brightness']:.4f} med={res['median_brightness']:.4f} max={res['max_brightness']:.4f} | "
+        f"nearWhite(>=230) mean={res['near_white_mean']*100:.1f}% med={res['near_white_median']*100:.1f}% "
+        f"max={res['near_white_max']*100:.1f}% | "
+        f"fullWhite(>=250) mean={res['full_white_mean']*100:.1f}% max={res['full_white_max']*100:.1f}%"
+    )
+    if res["reference"] is not None:
+        rf = res["reference"]
+        print(
+            f"  No-Remix reference (n={rf['shots']}, not frame-aligned): "
+            f"mean={rf['mean_brightness']:.4f} med={rf['median_brightness']:.4f} | "
+            f"nearWhite mean={rf['near_white_mean']*100:.1f}% | fullWhite mean={rf['full_white_mean']*100:.1f}% "
+            f"=> ratio={res['mean_ratio_vs_reference']:.2f}x, nearWhite_delta=+{res['near_white_delta_vs_reference']:.3f}"
+        )
+    print(
+        f"  Same-launch Remix telemetry during cutscene: {res['same_launch_remix_output']} "
+        f"(telemetry frame range={res['same_launch_telemetry_frame_range']}, "
+        f"overlap={res['same_launch_overlap_frames']} frames)"
+    )
+
+    rows = res["all_rows"]
+    for label, lo, hi in [
+        ("Shot 1 fade-in (gf 4780..4800)", 4780, 4800),
+        ("Shot 1 alley guards running (gf 4808..4848)", 4808, 4848),
+        ("Shot 2 Sam approach (gf 4857..4986)", 4857, 4986),
+        ("Post-cutscene gameplay (gf 4987..5018)", 4987, 5018),
+    ]:
+        sub = [r for r in rows if r["game_frame"] is not None and lo <= r["game_frame"] <= hi]
+        if not sub:
+            continue
+        b = np.array([r["brightness"] for r in sub], dtype=np.float64)
+        nw = np.array([r["near_white"] for r in sub], dtype=np.float64)
+        fw = np.array([r["full_white"] for r in sub], dtype=np.float64)
+        print(
+            f"  [{label}] shots={len(sub)} screen mean={b.mean():.4f} med={np.median(b):.4f} "
+            f"[{b.min():.4f}..{b.max():.4f}] "
+            f"nearWhite mean={nw.mean()*100:.1f}% med={np.median(nw)*100:.1f}% (max {nw.max()*100:.1f}%) "
+            f"fullWhite mean={fw.mean()*100:.1f}% med={np.median(fw)*100:.1f}% (max {fw.max()*100:.1f}%)"
+        )
+
+    print(
+        "  NOTE (caveat & hypothesis): When same-launch cutscene telemetry overlap is 0 frames, any comparison "
+        "against ben_upstairs telemetry is cross-launch and position-matched for only the last ~37 frames of shot 2 "
+        "(0 frames for shot 1). Unskipped post-handoff D3D9 draws in play-setup\\unified-build\\draw_filter.cpp:454-455 "
+        "remain an UNPROVEN HYPOTHESIS until same-launch cutscene telemetry and draw captures are recorded."
+    )
+    return res
+
+
+def _write_synthetic_session(
+    folder: Path,
+    pid: int,
+    base_wall_str: str,
+    n_frames: int = 20,
+    anchor_jitter_s: float = 0.0,
+) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    base_ts = parse_wall_ts(base_wall_str)
+    # Write proxy log with two lightpub anchors (frame 0 and frame 10)
+    t0_dt = dt.datetime.fromtimestamp(base_ts).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    t10_dt = dt.datetime.fromtimestamp(base_ts + 1.0 + anchor_jitter_s).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    (folder / "d3d9_proxy.log").write_text(
+        f"{t0_dt} [pid {pid}] lightpub: frame 0 qualifying 80 drawn 80 (room fill 3, sky dome 1) created 80 updated 0 tracked 80\n"
+        f"{t10_dt} [pid {pid}] lightpub: frame 10 qualifying 80 drawn 80 (room fill 3, sky dome 1) created 0 updated 0 tracked 80\n",
+        encoding="utf-8",
+    )
+    # Write proxy frames (100 ms per frame -> 10 frames = 1.0 s)
+    with (folder / "d3d9_proxy_frames.csv").open("w", encoding="utf-8", newline="") as f:
+        for fr in range(n_frames):
+            f.write(f"{fr},{fr * 100.0:.1f},16.0,1.0,1200,1,G:22:0:100.0:200.0:50.0:1.0:0.0:0.0:0.0\n")
+    img = np.full((THUMB_H, THUMB_W), 64, dtype=np.uint8)
+    b64 = base64.b64encode(img.tobytes()).decode("ascii")
+    with (folder / "rtx_telemetry.jsonl").open("w", encoding="utf-8", newline="") as f:
+        for fr in range(n_frames):
+            f.write(json.dumps({"frame": fr, "rayTraced": True, "lumaThumb": b64, "thumbClipped": 0}) + "\n")
+    return folder
+
+
 def self_test() -> None:
-    # Synthetic 128x72 lumaThumb test: border = 255, interior = 51 (0.2000)
+    # 1. Synthetic 128x72 lumaThumb test: border = 255, interior = 51 (0.2000)
     img = np.full((THUMB_H, THUMB_W), 255, dtype=np.uint8)
     ys, xs = thumb_roi_slices()
     img[ys, xs] = 51
@@ -585,73 +842,101 @@ def self_test() -> None:
     assert nw_v == 0.0, f"border 255 leaked into ROI: nw={nw_v}"
     assert nb_v == 0.0
     assert abs(p10_v - p90_v) < 1e-6
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+
+        # 2. Valid aligned session -> alignment['aligned'] is True
+        ok_folder = _write_synthetic_session(tmp_path / "ok_sess", pid=1111, base_wall_str="2026-11-14 14:50:00")
+        ok_data = load_aligned_session(
+            SessionSpec("ok", ok_folder, 1111, "2026-11-14 14:49:59", "2026-11-14 14:50:05")
+        )
+        assert ok_data["alignment"]["aligned"] is True, ok_data["alignment"]
+
+        # 3. Fake misaligned sessions MUST fail alignment validation:
+        # 3a. Video window from wrong day/session (like mapping Nov 13 21:22 video onto Nov 12 23:30 logs)
+        wrong_vid_data = load_aligned_session(
+            SessionSpec("wrong_vid", ok_folder, 1111, "2026-11-13 21:22:48", "2026-11-13 21:33:13")
+        )
+        assert wrong_vid_data["alignment"]["aligned"] is False, wrong_vid_data["alignment"]
+        assert any("video_window_no_overlap" in r for r in wrong_vid_data["alignment"]["reasons"])
+
+        # 3b. Wrong PID missing from d3d9_proxy.log
+        wrong_pid_data = load_aligned_session(
+            SessionSpec("wrong_pid", ok_folder, 9999, "2026-11-14 14:49:59", "2026-11-14 14:50:05")
+        )
+        assert wrong_pid_data["alignment"]["aligned"] is False, wrong_pid_data["alignment"]
+        assert any("missing_in_proxy_log" in r for r in wrong_pid_data["alignment"]["reasons"])
+
+        # 3c. Broken QPC <-> wall-clock anchor residual (> 500 ms drift)
+        bad_qpc_folder = _write_synthetic_session(
+            tmp_path / "bad_qpc", pid=2222, base_wall_str="2026-11-14 14:50:00", anchor_jitter_s=4.0
+        )
+        bad_qpc_data = load_aligned_session(SessionSpec("bad_qpc", bad_qpc_folder, 2222, None, None))
+        assert bad_qpc_data["alignment"]["aligned"] is False, bad_qpc_data["alignment"]
+        assert any("anchor_residual_too_high" in r for r in bad_qpc_data["alignment"]["reasons"])
+
+        # 4. Fake normal-brightness cutscene vs whiteout cutscene (plus NOT_MEASURED same-launch telemetry check)
+        ref_spot = tmp_path / "ref_ben"
+        (ref_spot / "cinematic").mkdir(parents=True)
+        (ref_spot / "cinematic" / "cinematic.csv").write_text(
+            "shot,gameFrame,camX,camY,camZ,brightness,nearBlack,nearWhite,fullWhite,inCutscene\n"
+            + "".join(f"{i},{3340+i},3000,4000,-200,0.150,0.215,0.012,0.007,True\n" for i in range(10)),
+            encoding="utf-8",
+        )
+        normal_spot = tmp_path / "normal_ben"
+        (normal_spot / "cinematic").mkdir(parents=True)
+        (normal_spot / "cinematic" / "cinematic.csv").write_text(
+            "shot,gameFrame,camX,camY,camZ,brightness,nearBlack,nearWhite,fullWhite,inCutscene\n"
+            + "".join(f"{i},{4800+i},3000,4000,-200,0.175,0.180,0.022,0.009,True\n" for i in range(10)),
+            encoding="utf-8",
+        )
+        normal_cut = analyze_cutscene_dir(normal_spot, ref_spot_dir=ref_spot)
+        assert normal_cut is not None and normal_cut["whiteout"] is False, normal_cut
+
+        white_spot = tmp_path / "white_ben"
+        (white_spot / "cinematic").mkdir(parents=True)
+        (white_spot / "cinematic" / "cinematic.csv").write_text(
+            "shot,gameFrame,camX,camY,camZ,brightness,nearBlack,nearWhite,fullWhite,inCutscene\n"
+            + "".join(f"{i},{4800+i},3000,4000,-200,0.666,0.097,0.370,0.270,True\n" for i in range(10)),
+            encoding="utf-8",
+        )
+        # Telemetry starting AFTER cutscene (frames 5033..5040) -> same_launch_remix_output must be NOT_MEASURED
+        (white_spot / "telemetry.jsonl").write_text(
+            "".join(json.dumps({"frame": 5033 + i, "rayTraced": True, "lumaThumb": b64}) + "\n" for i in range(5)),
+            encoding="utf-8",
+        )
+        white_cut = analyze_cutscene_dir(white_spot, ref_spot_dir=ref_spot)
+        assert white_cut is not None and white_cut["whiteout"] is True, white_cut
+        assert white_cut["same_launch_remix_output"] == "NOT_MEASURED", white_cut
+
     print("SELF-TEST PASSED: align_sessions.py")
 
 
-def print_benghazi_cinematic_comparison() -> None:
-    cin_dir = ROOT / r"experiments\remix-gate\20261115-214203\ben_interrogation\cinematic"
-    up_dir = ROOT / r"experiments\remix-gate\20261115-214203\ben_upstairs"
-    if not (cin_dir / "cinematic.csv").exists():
-        return
-    print("\n" + "=" * 110)
-    print("BENGHAZI OPENING CINEMATIC: D3D9 SCREEN (cinematic.csv) vs REMIX m_finalOutput (lumaThumb)")
-    print("=" * 110)
-    meta = json.loads((cin_dir / "cinematic.json").read_text(encoding="utf-8"))
-    print(
-        f"  cinematic.json (gf={meta['startGameFrame']}..{meta['endGameFrame']}, {meta['seconds']}s, "
-        f"n={meta['shotsInCutscene']}): screen mean={meta['brightness']['mean']:.4f} "
-        f"med={meta['brightness']['median']:.4f} max={meta['brightness']['max']:.4f} | "
-        f"nearWhite(>=230) mean={meta['nearWhite']['mean']*100:.1f}% max={meta['nearWhite']['max']*100:.1f}% | "
-        f"fullWhite(>=250) mean={meta['fullWhite']['mean']*100:.1f}% max={meta['fullWhite']['max']*100:.1f}%"
-    )
-    rows = list(csv.DictReader((cin_dir / "cinematic.csv").open("r", encoding="utf-8")))
-    for label, lo, hi in [
-        ("Shot 1 fade-in (gf 4780..4800)", 4780, 4800),
-        ("Shot 1 alley guards running (gf 4808..4848)", 4808, 4848),
-        ("Shot 2 Sam approach (gf 4857..4986)", 4857, 4986),
-        ("Post-cutscene gameplay (gf 4987..5018)", 4987, 5018),
-    ]:
-        sub = [r for r in rows if r["gameFrame"] and lo <= int(r["gameFrame"]) <= hi]
-        if not sub:
-            continue
-        b = np.array([float(r["brightness"]) for r in sub])
-        nw = np.array([float(r["nearWhite"]) for r in sub])
-        fw = np.array([float(r["fullWhite"]) for r in sub])
-        print(
-            f"  [{label}] shots={len(sub)} screen mean={np.median(b):.4f} [{b.min():.4f}..{b.max():.4f}] "
-            f"nearWhite={np.median(nw)*100:.1f}% (max {nw.max()*100:.1f}%) "
-            f"fullWhite={np.median(fw)*100:.1f}% (max {fw.max()*100:.1f}%)"
-        )
-    # Single-frame transition at gf=4986..4987
-    trans = [r for r in rows if r["gameFrame"] in ("4986", "4987", "4988")]
-    for r in trans:
-        print(
-            f"    transition shot={r['shot']} gf={r['gameFrame']} pos=({r['camX']},{r['camY']},{r['camZ']}) "
-            f"screen_b={r['brightness']} nw={r['nearWhite']} fw={r['fullWhite']}"
-        )
-    # Compare against Remix lumaThumb on ben_upstairs overlap (f=2714..2760, 75% PBR materials active)
-    if (up_dir / "telemetry.jsonl").exists() and (up_dir / "proxy_frames.csv").exists():
-        tmap = {
-            rec["frame"]: rec
-            for rec in (json.loads(ln) for ln in (up_dir / "telemetry.jsonl").open("r") if ln.strip())
-        }
-        print("  [ben_upstairs Remix m_finalOutput overlap (75% PBR materials active, f=2714..2760)]:")
-        for row in csv.reader((up_dir / "proxy_frames.csv").open("r")):
-            fr = int(row[0])
-            if 2714 <= fr <= 2760 and fr in (2714, 2738, 2747, 2750, 2753, 2759):
-                t = tmap.get(fr, {})
-                m_v, _, _, _, _, nw_v = decode_luma_thumb_stats(t.get("lumaThumb"))
-                pub = row[6].split("|")[0][:44] if len(row) > 6 else "-"
-                print(
-                    f"    f={fr} totDrw={row[4]} rep={t.get('replacedMaterialDraws')} "
-                    f"leg={t.get('legacyMaterialDraws')} clip={t.get('thumbClipped')} "
-                    f"Remix_ROI_mean={m_v:.4f} Remix_nw={nw_v*100:.1f}% pub={pub}"
-                )
+def _parse_session_arg(raw: str) -> SessionSpec:
+    """Parses key=folder:pid[|video_start|video_end] from CLI."""
+    if "=" not in raw or ":" not in raw:
+        raise argparse.ArgumentTypeError("expected key=folder:pid[|video_start|video_end]")
+    key, rest = raw.split("=", 1)
+    parts = rest.split("|")
+    folder_pid = parts[0]
+    folder_str, pid_str = folder_pid.rsplit(":", 1)
+    v_start = parts[1] if len(parts) > 1 and parts[1] else None
+    v_end = parts[2] if len(parts) > 2 and parts[2] else None
+    return SessionSpec(key=key, folder=Path(folder_str), pid=int(pid_str), video_start=v_start, video_end=v_end)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--session", choices=["nov13", "nov14_1531", "nov14_1855", "all", "cinematic"], default="all")
+    ap.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="Workspace root directory")
+    ap.add_argument("--session", default="all",
+                    help="Session key to run (nov13, nov14_1531, nov14_1855, all, cinematic, or custom key)")
+    ap.add_argument("--session-spec", action="append", default=[], type=_parse_session_arg,
+                    help="Override or add session: key=folder:pid[|video_start|video_end]")
+    ap.add_argument("--cinematic-spot-dir", type=Path, default=None,
+                    help="Spot directory containing cinematic/cinematic.csv")
+    ap.add_argument("--reference-cinematic-dir", type=Path, default=None,
+                    help="No-Remix reference spot directory containing cinematic/cinematic.csv")
     ap.add_argument("--window-sec", type=float, default=30.0)
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
@@ -660,19 +945,30 @@ def main() -> int:
         self_test()
         return 0
 
+    sessions_map = build_default_sessions(args.root)
+    for custom in args.session_spec:
+        sessions_map[custom.key] = custom
+
+    cin_spot = args.cinematic_spot_dir or (
+        args.root / r"experiments\remix-gate\20261115-214203\ben_interrogation"
+    )
+    ref_cin_spot = args.reference_cinematic_dir or (
+        args.root / r"experiments\remix-gate\reference-20261116-000454\ben_interrogation"
+    )
+
     if args.session == "cinematic":
-        print_benghazi_cinematic_comparison()
+        print_benghazi_cinematic_comparison(cin_spot, ref_spot_dir=ref_cin_spot)
         return 0
 
-    keys = list(SESSIONS.keys()) if args.session == "all" else [args.session]
+    keys = list(sessions_map.keys()) if args.session == "all" else [args.session]
     loaded: dict[str, dict[str, Any]] = {}
     for k in keys:
-        loaded[k] = load_aligned_session(SESSIONS[k])
+        loaded[k] = load_aligned_session(sessions_map[k])
         print_session_report(loaded[k], window_sec=args.window_sec)
 
     print_named_spots(loaded)
     if args.session == "all":
-        print_benghazi_cinematic_comparison()
+        print_benghazi_cinematic_comparison(cin_spot, ref_spot_dir=ref_cin_spot)
     return 0
 
 
