@@ -938,55 +938,6 @@ def _launch_compile_state(ltel: dict[int, dict], loading) -> tuple[str, float]:
     return "wait", wait_s
 
 
-_CAPTURE_ALL_RE = re.compile(r"\brtx\.captureAllInstances\s*=\s*(\w+)")
-INSTANCED_THRESH = "0 on ray-traced scene frames with rtx.captureAllInstances on; report only with it off"
-
-
-def capture_all_instances(log_path: str | None) -> bool | None:
-    """rtx.captureAllInstances as Remix logged it at startup (it logs every non-default option as 'rtx.x = v'); no
-    line means the default, False. None when there is no remix-dxvk.log."""
-    if not log_path or not os.path.exists(log_path):
-        return None
-    on = False
-    for ln in read_lines(log_path):
-        m = _CAPTURE_ALL_RE.search(ln)
-        if m:
-            on = m.group(1).lower() in ("true", "1")
-    return on
-
-
-def instanced_capture_check(run: Run, sources: list[tuple[str, bool | None, list[tuple[int, object]]]],
-                            tsrc: str) -> None:
-    """instanced_shared_slot_draws (worker E2, dxvk-remix cb7d3b6): telemetry instancedSharedSlotDraws counts
-    hardware-instanced draws whose copies shared capture slots (only one copy ray traced). sources: (name,
-    rtx.captureAllInstances, [(frame, value)] on the ray-traced scene frames). With the option on the count must be 0
-    on every such frame; with it off it is reported, not judged. Note Remix still shares slots with the option on for
-    strips, fans and draws over kMaxInstancedCaptureVertices, so a FAIL names frames to look at, not only a bug."""
-    if not sources:
-        run.add("instanced_shared_slot_draws", NOT_MEASURED, None, INSTANCED_THRESH, "no spot ran far enough", tsrc)
-        return
-    no_log = [n for n, on, _ in sources if on is None]
-    no_rt = [n for n, _, vals in sources if not vals]
-    no_field = [n for n, _, vals in sources if vals and any(type(v) is not int for _, v in vals)]
-    if no_log or no_rt or no_field:
-        why = ([f"no remix-dxvk.log to read rtx.captureAllInstances: {', '.join(no_log)}"] if no_log else []) + (
-            [f"no ray-traced scene frame to count on: {', '.join(no_rt)}"] if no_rt else []) + (
-            [f"instancedSharedSlotDraws missing (a build before dxvk-remix cb7d3b6): {', '.join(no_field)}"]
-            if no_field else [])
-        run.add("instanced_shared_slot_draws", NOT_MEASURED, None, INSTANCED_THRESH, "; ".join(why), tsrc)
-        return
-    parts, bad = [], 0
-    for n, on, vals in sources:
-        worst = max(vals, key=lambda fv: fv[1])
-        nz = sum(1 for _, v in vals if v > 0)
-        if on:
-            bad += nz
-        parts.append(f"{n} captureAllInstances {'on' if on else 'off (report only)'}: {nz} of {len(vals)} ray-traced "
-                     f"scene frames with shared-slot draws, {sum(v for _, v in vals)} draws, max {worst[1]} at frame "
-                     f"{worst[0]}")
-    run.add("instanced_shared_slot_draws", FAIL if bad else PASS, bad, INSTANCED_THRESH, "; ".join(parts), tsrc)
-
-
 def ray_tracing_checks(run: Run, good: list[dict], tsrc: str) -> None:
     """remix_ray_tracing (non-goggles scene RT share >= 99% GUESS + every still stop 100% ray traced) and
     remix_compile_stall (>= 300 consecutive rayTraced=false frames with 25-40 ms CPU wait, GUESS)."""
@@ -1959,12 +1910,6 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
 
     recorder_checks(run, pick, good, tsrc)
     ray_tracing_checks(run, good, tsrc)
-    instanced_capture_check(run, [
-        (s["name"], capture_all_instances(_first_file(s["_dir"], ("remix-dxvk.log",))),
-         [(tf, s["_data"]["telemetry"].get(tf, {}).get("instancedSharedSlotDraws"))
-          for _, w in scene_pairs(s) for tf in frames_in(w, "telemetry")
-          if s["_data"]["telemetry"].get(tf, {}).get("rayTraced") is not False])
-        for s in good], tsrc)
     lightpub_checks(run, good, ref_spots)
 
     # goggles_toggle_rebuilds & goggles_dark_frame: first rayTraced=true frame after rayTraced=false in goggles windows.
@@ -2290,7 +2235,7 @@ def evaluate_session(folder: str) -> dict:
     goggles_dark_frame on every goggles-off (proxy goggles column 1 -> 0), remix_dropped_character_frames on every
     frame, frames_over_50ms (only loading screens excused; result["slowFrames"] lists every frame over 50 ms),
     remix_ray_tracing (scene share outside loading and goggles, time to first ray-traced frame from launch start),
-    compile_wait_stuck and never_ray_traced on the whole launch, instanced_shared_slot_draws on ray-traced scene frames,
+    compile_wait_stuck and never_ray_traced on the whole launch,
     freezes_in_play_over_1s from d3d9_proxy_frames.csv (freeze_checks), clean_quit on device loss. Telemetry is
     streamed (sessions reach 1.6 GB). Writes nothing to the folder."""
     run = Run.__new__(Run)
@@ -2305,15 +2250,14 @@ def evaluate_session(folder: str) -> dict:
     if not tel_path or not pg_path:
         for name, thr in goggle_checks + (("frames_over_50ms", "0"), ("remix_ray_tracing", "scene RT"),
                                           ("compile_wait_stuck", "no compile-wait hang"),
-                                          ("never_ray_traced", "rayTraced=true when remixShaderCompiles==0"),
-                                          ("instanced_shared_slot_draws", INSTANCED_THRESH)):
+                                          ("never_ray_traced", "rayTraced=true when remixShaderCompiles==0")):
             run.add(name, NOT_MEASURED, None, thr, "session has no telemetry or no proxy gate CSV", tsrc)
         slow = []
     else:
         pg = read_csv_frames(pg_path, 6)
         pf_path = _first_file(folder, ("d3d9_proxy_frames.csv", "proxy_frames.csv"))
         spot = {"_data": {"pgate": pg, "proxy": read_csv_frames(pf_path, 7) if pf_path else {}}}
-        keep = ("rayTraced", "frameTimeMs", "gpuTimeMs", "remixShaderCompiles", "instancedSharedSlotDraws")
+        keep = ("rayTraced", "frameTimeMs", "gpuTimeMs", "remixShaderCompiles")
         tel: dict[int, tuple] = {}   # frame -> (rayTraced, staticBlasBuilds, skinnedInstances, instances, luma)
         ltel: dict[int, dict] = {}   # frame -> the fields the launch and frame-time rules read
         with open(tel_path, "rb") as f:
@@ -2430,10 +2374,6 @@ def evaluate_session(folder: str) -> dict:
             run.add("never_ray_traced", FAIL if state == "never" else PASS, int(state == "never"), nr_thresh,
                     "never ray traced with 0 compiles" if state == "never" else "no 0-compile non-RT launch", tsrc)
 
-        # instanced_shared_slot_draws on the ray-traced scene frames
-        log_on = capture_all_instances(_first_file(folder, ("rtx-remix_logs_remix-dxvk.log", "remix-dxvk.log")))
-        instanced_capture_check(run, [("session", log_on, [(fr, ltel[fr].get("instancedSharedSlotDraws"))
-                                                           for fr in scene if ltel[fr]["rayTraced"]])], tsrc)
 
     freeze_checks(run, _first_file(folder, ("d3d9_proxy_frames.csv",)))
     dxvk = _first_file(folder, ("rtx-remix_logs_remix-dxvk.log", "remix-dxvk.log"))

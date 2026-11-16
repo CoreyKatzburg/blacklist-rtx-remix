@@ -92,7 +92,6 @@ class Builder:
                "zeroNormalStaticTriangles": 0, "zeroNormalStaticInstances": 0}
         # recorder fields (gate.recorder_checks): healthy values, with one fault per case below
         rec.update({"replacedMaterialDraws": 354, "legacyMaterialDraws": 25, "texturesDemoted": 0,
-                    "instancedSharedSlotDraws": 0, "instancedCapturedDraws": 4,
                     "skips": {"occlusionQuery": 300},
                     "passMs": {"InjectRTX": [10.0, 4.0, 1], "InjectRTX/Ray Reconstruction": [5.0, 0.2, 1],
                                "InjectRTX/Ray Reconstruction/Prepare DLSS": [0.3, 0.02, 1]}})
@@ -147,10 +146,6 @@ class Builder:
             rec["skips"]["unsupportedTopology"] = 90 if c == "other_skips_6pct" else 60   # 6% and 4% of 1500 draws
         if c == "no_mod_materials": rec["replacedMaterialDraws"], rec["legacyMaterialDraws"] = 0, 379
         if c == "demoted_textures" and kind == "still" and i % 2 == 0: rec["texturesDemoted"] = 1
-        if c in ("shared_slots_capture_on", "shared_slots_capture_off") and kind == "still" and i == 3:
-            rec["instancedSharedSlotDraws"] = 3
-        if c == "no_instanced_field":
-            del rec["instancedSharedSlotDraws"], rec["instancedCapturedDraws"]
         if c == "renamed_fields":
             rec["frameMs"] = rec.pop("frameTimeMs")
         rec["lumaThumb"] = base64.b64encode(img.astype(np.uint8).tobytes()).decode()
@@ -333,8 +328,7 @@ class Builder:
         gate.save_text(os.path.join(self.dir, "proxy_gate.csv"), "\n".join(self.pgate) + "\n")
         if self.case != "no_quit_log":
             lost = "[error] vkQueueSubmit: VK_ERROR_DEVICE_LOST\n" if self.case == "device_lost" else ""
-            opt = "[info]    rtx.captureAllInstances = True\n" if self.case == "shared_slots_capture_on" else ""
-            gate.save_text(os.path.join(self.dir, "remix-dxvk.log"), opt + "[info] Remix shutdown\n" + lost)
+            gate.save_text(os.path.join(self.dir, "remix-dxvk.log"), "[info] Remix shutdown\n" + lost)
             b32 = "[00:01:00.000] info:  Bridge client started\n"
             if self.case != "no_terminate":
                 b32 += "[00:02:00.000] info:  Sending Terminate command to server...\n"
@@ -394,8 +388,7 @@ LP_COUNTS = {"sam_gear_skip_ignored": (11, 0, 0), "sam_gear_noskip": (11, 0, 0),
 
 
 # checks that read telemetry the recorder writes per frame: NOT MEASURED whenever that telemetry is missing
-RECORDER = ("step_timing", "skip_occlusion_share", "skip_other_share", "material_share", "textures_demoted",
-            "instanced_shared_slot_draws")
+RECORDER = ("step_timing", "skip_occlusion_share", "skip_other_share", "material_share", "textures_demoted")
 
 _ZERO_NORMALS = ("zero_normal_skinned_triangles", "zero_normal_instances",
                  "zero_normal_static_triangles", "zero_normal_static_instances")
@@ -418,11 +411,11 @@ CASES = {
     "never_ray_traced": (("remix_ray_tracing", "remix_compile_stall", "compile_wait_stuck", "latency_overhead_ms"),
                          ("nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
                           "outline_overlap", "flashes", "still_flicker",
-                          "goggles_toggle_rebuilds", "goggles_dark_frame", "instanced_shared_slot_draws")),
+                          "goggles_toggle_rebuilds", "goggles_dark_frame")),
     "never_rt_no_compiles": (("remix_ray_tracing", "remix_compile_stall", "never_ray_traced", "latency_overhead_ms"),
                              ("nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
                               "outline_overlap", "flashes", "still_flicker",
-                              "goggles_toggle_rebuilds", "goggles_dark_frame", "instanced_shared_slot_draws")),
+                              "goggles_toggle_rebuilds", "goggles_dark_frame")),
     "goggles_off_only": ((), ()),
     "one_stop_not_ray_traced": (("remix_ray_tracing",),
                                 ("nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
@@ -546,10 +539,7 @@ CASES = {
     "no_mod_materials": (("material_share",), ()),        # the mod's materials never drew
     "demoted_textures": (("textures_demoted",), ()),      # half the still frames shrunk textures
     "device_lost": (("clean_quit",), ()),                 # Remix's log shows VK_ERROR_DEVICE_LOST
-    "no_quit_log": ((), ("clean_quit", "instanced_shared_slot_draws")),   # no remix-dxvk.log in the spot folder
-    "shared_slots_capture_on": (("instanced_shared_slot_draws",), ()),   # captureAllInstances on, 3 shared draws
-    "shared_slots_capture_off": ((), ()),                 # the same 3 shared draws with the option off: report only
-    "no_instanced_field": ((), ("instanced_shared_slot_draws",)),        # builds before cb7d3b6: NOT MEASURED fails the gate
+    "no_quit_log": ((), ("clean_quit",)),   # no remix-dxvk.log in the spot folder
 }
 
 
@@ -581,7 +571,7 @@ def make_run(folder: str, case: str, no_remix: bool = False) -> str:
 # every other check must PASS. 300 frames of 10 ms, goggles on at proxy frames 100..139, so the goggles-off is proxy
 # frame 140 and Remix ray traces again from frame 141 (one frame later, as in session 20261115-135449 at frame 41475).
 # The two never-ray-traced cases run 700 frames of 30 ms (21 s, past compile_wait_stuck_s) with 2 ms of GPU work.
-_NO_RT_NM = ("goggles_toggle_rebuilds", "goggles_dark_frame", "instanced_shared_slot_draws")
+_NO_RT_NM = ("goggles_toggle_rebuilds", "goggles_dark_frame")
 SESSION_CASES = {
     "session_good": ((), ()),
     "session_scene_clear": (("goggles_toggle_rebuilds",), ()),         # 94 static meshes built, as at 135449 frame 41476
@@ -595,8 +585,6 @@ SESSION_CASES = {
     "session_not_rt": (("remix_ray_tracing",), ()),                    # 10 scene frames not ray traced (~4%)
     "session_compile_stuck": (("compile_wait_stuck", "remix_ray_tracing"), _NO_RT_NM),  # never RT, compiles > 0
     "session_never_rt_no_compiles": (("never_ray_traced", "remix_ray_tracing"), _NO_RT_NM),  # never RT, 0 compiles
-    "session_capture_on_shared": (("instanced_shared_slot_draws",), ()),  # 2 shared-slot draws, captureAllInstances on
-    "session_capture_off_shared": ((), ()),                            # the same draws with the option off: report only
     "session_freeze_in_play": (("freezes_in_play_over_1s",), ()),      # 1500 ms Present-to-Present gap on frame 200
     "session_quit_gap": ((), ()),                                      # 4931 ms gap on the last frame: quit, report only
     "session_menu_gap": ((), ()),                                      # 1500 ms gap on a frame without a 'G:' publish
@@ -624,9 +612,7 @@ def make_session(folder: str, case: str) -> str:
         tel.append(json.dumps({"frame": f, "rayTraced": rt, "staticBlasBuilds": builds, "skinnedInstances": skinned,
                                "instances": 500, "lumaThumb": thumb, "frameTimeMs": ms,
                                "gpuTimeMs": 2.0 if no_rt else 8.0,
-                               "remixShaderCompiles": 5 if case == "session_compile_stuck" else 0,
-                               "instancedSharedSlotDraws": 2 if (case.startswith("session_capture") and f == 220) else 0,
-                               "instancedCapturedDraws": 4}))
+                               "remixShaderCompiles": 5 if case == "session_compile_stuck" else 0}))
     gate.save_text(os.path.join(d, "d3d9_proxy_gate.csv"), "\n".join(pg) + "\n")
     gate.save_text(os.path.join(d, "rtx_telemetry.jsonl"), "\n".join(tel) + "\n")
     # d3d9_proxy_frames.csv: frame,entryMs,gapMs,presentMs,draws,publishCount,publishes (a gameplay-camera 'G:' publish)
@@ -640,8 +626,7 @@ def make_session(folder: str, case: str) -> str:
         rows.append(f"{f},{t:.3f},{gap:.3f},2.000,400,{1 if pub else 0},{pub}")
     gate.save_text(os.path.join(d, "d3d9_proxy_frames.csv"), "\n".join(rows) + "\n")
     lost = "[error] vkQueueSubmit: VK_ERROR_DEVICE_LOST\n" if case == "session_device_lost" else ""
-    opt = "[info]   rtx.captureAllInstances = True\n" if case == "session_capture_on_shared" else ""
-    gate.save_text(os.path.join(d, "rtx-remix_logs_remix-dxvk.log"), "[info] Remix started\n" + opt + lost)
+    gate.save_text(os.path.join(d, "rtx-remix_logs_remix-dxvk.log"), "[info] Remix started\n" + lost)
     return d
 
 

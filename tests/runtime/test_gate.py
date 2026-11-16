@@ -475,7 +475,7 @@ class FakeRunTest(unittest.TestCase):
         self.assertEqual(by["remix_ray_tracing"]["status"], gate.PASS, by["remix_ray_tracing"])
         self.assertEqual(by["compile_wait_stuck"]["status"], gate.PASS)
         self.assertEqual(by["never_ray_traced"]["status"], gate.PASS)
-        self.assertEqual(by["instanced_shared_slot_draws"]["status"], gate.NOT_MEASURED)   # build before cb7d3b6
+        self.assertNotIn("instanced_shared_slot_draws", by)   # removed: the game has no hardware instancing
 
 
 class DriveHelpersTest(unittest.TestCase):
