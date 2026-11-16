@@ -30,7 +30,9 @@ which rule 2 skips as too big):
      15x15 cells (60x60 px) around it.
   6. A cell is unexplained when its Remix contrast is at least PUFF_STEPS and the original's contrast in the same cell
      stays under ORIG_STEPS (the original has no bright area there). A 4-connected group of unexplained cells
-     covering more than BLOB_MAX_PX pixels is one puff. PASS when there are at most ALLOWED puffs.
+     covering more than BLOB_MAX_PX pixels is one puff. The count is printed as report only and does not enter
+     the verdict (coordinator, Nov 16: a count that cannot separate a floating light from a lit surface in code
+     must not decide PASS or FAIL; it shows 2 puffs at con_custodial with the balls off).
   Limit: this also counts an area Remix lights that the original leaves dark (a lit room seen through a doorway),
   because pictures alone cannot tell a glow from a lit surface.
 
@@ -54,7 +56,8 @@ HUD: with --orig-spot, pixels that stand out (contrast >= ORIG_STEPS) at the sam
 the original spot's stills, although the camera turned between them, are the HUD; the mask is that set grown by 2 px
 with enclosed holes (the radar disc) filled. Blobs, puffs and glows whose peak lies on the HUD are skipped in all
 three counts. Without --orig-spot (two files) there is no HUD mask, and the output says so.
-The verdict is PASS only when all three counts pass.
+The verdict is PASS only when the orb count and the lost-glow count pass. The puff count is report only until it can
+separate a floating glow from a surface Remix lights, with a fake case for each kind.
 
   --remix-spot / --orig-spot / --still [--orig-still]: instead of the files, two gate spot folders and a window name;
             the stills and both cameras come from spot.json and proxy_frames.csv, and the pose test always runs.
@@ -288,14 +291,12 @@ def report(rows, skipped, out=print) -> bool:
     return ok
 
 
-def report_puffs(rows, skipped, out=print) -> bool:
-    ok = len(rows) <= ALLOWED
+def report_puffs(rows, skipped, out=print) -> None:
     out(f"glow_blobs: puffs {len(rows)} (bright areas over {BLOB_MAX_PX} px, Remix cell contrast >= {PUFF_STEPS:g} "
-        f"where the original's stays < {ORIG_STEPS:g}; skipped {skipped['hud']} hud): {'PASS' if ok else 'FAIL'}")
+        f"where the original's stays < {ORIG_STEPS:g}; skipped {skipped['hud']} hud): report only")
     for r in sorted(rows, key=lambda r: -r["area"]):
         out(f"  puff at x {r['x']} y {r['y']} (box {r['x0']},{r['y0']} to {r['x1']},{r['y1']}): area {r['area']} px, "
             f"Remix contrast {r['remix']:.1f}, original {r['orig']:.1f}")
-    return ok
 
 
 def report_lost(rows, skipped, out=print) -> bool:
@@ -313,17 +314,17 @@ def report_lost(rows, skipped, out=print) -> bool:
 
 
 def check_all(remix, orig, hud, out=print):
-    """All three counts; returns (verdict, orbs unmatched, puffs, lost)."""
+    """All three counts; returns (verdict, (orbs unmatched, puffs, lost)). The verdict is orbs and lost glows only."""
     out(f"glow_blobs: hud mask {'none' if hud is None else f'{int(hud.sum())} px'}")
     rows, skipped = judge(remix, orig, hud)
     ok1 = report(rows, skipped, out)
     prow, pskip = puffs(remix, orig, hud)
-    ok2 = report_puffs(prow, pskip, out)
+    report_puffs(prow, pskip, out)
     lrow, lskip = lost_glows(remix, orig, hud)
     ok3 = report_lost(lrow, lskip, out)
-    ok = ok1 and ok2 and ok3
+    ok = ok1 and ok3
     n = (sum(not r["matched"] for r in rows), len(prow), sum(r["lost"] for r in lrow))
-    out(f"glow_blobs: {'PASS' if ok else 'FAIL'} (orbs unmatched {n[0]}, puffs {n[1]}, lost glows {n[2]})")
+    out(f"glow_blobs: {'PASS' if ok else 'FAIL'} (orbs unmatched {n[0]}, lost glows {n[2]}; puffs {n[1]} report only)")
     return ok, n
 
 
@@ -413,6 +414,9 @@ def self_test() -> int:
               disc(base, 150, 90), disc(orig, 150, 90, amp=20), 0)
     puff_case("a small orb is not a puff (the orb count has it)", _dot(base, 150, 90), orig, 0)
     puff_case("no puff: Remix and original agree", base, orig, 0)
+    lines = []
+    pv, pn = check_all(disc(base, 150, 90).astype(np.float32), orig.astype(np.float32), None, out=lines.append)
+    tally("a puff alone is report only: the verdict stays PASS with puffs 1", pv and pn == (0, 1, 0), lines[-1])
 
     # Lost glows (rules 7 and 8).
     lamp = _dot(orig, 100, 60, amp=120)                       # a strong lamp glow in the original, contrast about 120
