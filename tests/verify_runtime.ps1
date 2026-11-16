@@ -19,12 +19,15 @@
 #                                          the same, launched from the .save files in <folder> (a backup) instead;
 #                                          the save folder is put back afterwards as always.
 #   verify_runtime.ps1 -Evaluate <run folder>   re-judge an existing run
+#   -Previous <run folder> / -Reference <run folder>   what gate.py compares against (default: newest earlier run with
+#                                          the same spots, and newest reference-* no-Remix run)
 # A spot in spots.json may name another spot's saves with "checkpoint" and move Sam elsewhere with "teleport"
 # ({"location": [x, y, z], "yaw": deg}); drive.py fails the spot when the game does not keep him there.
 # Needs: nobody else using the game (takes play-setup\AGENT_GAME_LOCK.txt), Steam running. Works with the monitors
 # off (screen frames come from gdigrab; the camera is set in memory). Only the goggle keys and the title-screen
 # keys need the game window in front, which this script does itself.
-param([string[]]$Spots = @(), [switch]$DryRun, [string]$CaptureCheckpoint = '', [switch]$Launch, [string]$Evaluate = '', [switch]$SkipInstall, [string]$SaveFrom = '')
+param([string[]]$Spots = @(), [switch]$DryRun, [string]$CaptureCheckpoint = '', [switch]$Launch, [string]$Evaluate = '', [switch]$SkipInstall, [string]$SaveFrom = '',
+      [string]$Previous = '', [string]$Reference = '')
 $ErrorActionPreference = 'Stop'
 $Tests = $PSScriptRoot
 $Runtime = Join-Path $Tests 'runtime'
@@ -36,7 +39,31 @@ $GameLock = Join-Path (Split-Path $Tests) 'play-setup\AGENT_GAME_LOCK.txt'
 $ResultsRoot = 'D:\BlacklistOverhaul\experiments\remix-gate'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
-function Gate($folder) { & $Py (Join-Path $Runtime 'gate.py') $folder | Out-Host; return $LASTEXITCODE }
+# gate.py compares a run with the previous run (FPS) and with the no-Remix reference (lag, brightness). Unless given,
+# --previous is the newest earlier Remix run whose manifest lists the same spots, and --reference the newest
+# reference-* run (no Remix) earlier than this one.
+function Get-RunSpots($folder) {
+    $m = Join-Path $folder 'manifest.json'
+    if (Test-Path $m) { @((Get-Content $m -Raw | ConvertFrom-Json).spots | Sort-Object) } else { @() }
+}
+function Gate($folder) {
+    $name = Split-Path $folder -Leaf
+    $stamp = $name -replace '^reference-', ''
+    $spotsHere = (Get-RunSpots $folder) -join ','
+    $prev = if ($Previous) { $Previous } else {
+        Get-ChildItem $ResultsRoot -Directory | Where-Object { $_.Name -match '^\d{8}-\d{6}$' -and $_.Name -lt $stamp -and
+            (Test-Path (Join-Path $_.FullName 'result.json')) -and ((Get-RunSpots $_.FullName) -join ',') -eq $spotsHere } |
+            Sort-Object Name | Select-Object -Last 1 -ExpandProperty FullName }
+    $ref = if ($Reference) { $Reference } elseif ($name -like 'reference-*') { $null } else {
+        Get-ChildItem $ResultsRoot -Directory -Filter 'reference-*' | Where-Object { ($_.Name -replace '^reference-', '') -lt $stamp } |
+            Sort-Object Name | Select-Object -Last 1 -ExpandProperty FullName }
+    $gateArgs = @((Join-Path $Runtime 'gate.py'), $folder)
+    if ($prev) { $gateArgs += @('--previous', $prev) }
+    if ($ref) { $gateArgs += @('--reference', $ref) }
+    Write-Host "  gate: previous run $(if ($prev) { $prev } else { '(none with the same spots)' }); no-Remix reference $(if ($ref) { $ref } else { '(none)' })"
+    & $Py @gateArgs | Out-Host
+    return $LASTEXITCODE
+}
 
 if ($DryRun) {
     $out = Join-Path $ResultsRoot "dryrun-$Stamp"
@@ -206,7 +233,17 @@ try {
             Copy-Item (Join-Path $cp '*.save') $SaveDir
             Set-GoggleBindings $InputIni $spot.goggleKeys
             [IO.File]::WriteAllText("$S\d3d9_proxy.ini", $gateIni)
+            # "cinematic": the level opens with a cutscene; cinematic.py records it as numbers before drive.py moves Sam.
+            $cine = if ($spot.cinematic) {
+                Start-Process $Py -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $spotDir 'cinematic.log') `
+                    -RedirectStandardError (Join-Path $spotDir 'cinematic.err') -ArgumentList (@((Join-Path $Runtime 'cinematic.py'),
+                    '--log', "$S\d3d9_proxy.log", '--frames', "$S\d3d9_proxy_frames.csv", '--out', (Join-Path $spotDir 'cinematic')) |
+                    ForEach-Object { '"' + $_ + '"' }) }
             $game = Start-GameAtCheckpoint
+            if ($cine) {
+                if (-not $cine.WaitForExit(120000)) { $cine.Kill(); Write-Step "$($spot.name): cutscene recorder timed out" }
+                Write-Step "$($spot.name): $((Get-Content (Join-Path $spotDir 'cinematic.log') -Tail 1))"
+            }
             $spot | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $spotDir 'spot_config.json')
             $driveArgs = @((Join-Path $Runtime 'drive.py'), 'spot', '--pid', $game.Id) + $hashArgs + @(
                 '--spot', (Join-Path $spotDir 'spot_config.json'), '--checkpoint', (Join-Path $cp 'checkpoint.json'),
@@ -222,6 +259,7 @@ try {
                 Write-Step "$($spot.name): switch test numbers in $(Join-Path $spotDir 'switch.md')"
             }
         } catch {
+            if ($cine -and -not $cine.HasExited) { $cine.Kill() }
             Write-Step "$($spot.name): $($_.Exception.Message)"
             if (-not (Test-Path (Join-Path $spotDir 'spot.json'))) {
                 @{ name = $spot.name; error = $_.Exception.Message; windows = @() } | ConvertTo-Json | Set-Content (Join-Path $spotDir 'spot.json')

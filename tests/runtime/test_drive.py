@@ -126,5 +126,35 @@ class Steering(unittest.TestCase):
         self.assertLess(abs(turned - actual), 1.0)
 
 
+class MouseLag(unittest.TestCase):
+    """The mouse-to-screen helpers: they must time the first real change, and report nothing for noise alone."""
+    def test_screen_change_is_the_first_shot_past_the_threshold(self):
+        import numpy as np
+        base = np.full((4, 4), 100, np.int16)
+        shots = [(990.0, base + 9), (1010.0, base + 1), (1027.0, base + 2), (1043.0, base + 40), (1060.0, base + 60)]
+        # the +9 shot came before the turn and must not count; +1 and +2 are noise under a 3-level threshold
+        self.assertEqual(drive.first_change(shots, 1000.0, base, 3.0), 1043.0)
+        self.assertIsNone(drive.first_change(shots[:3], 1000.0, base, 3.0))
+
+    def test_game_turn_needs_the_camera_to_point_elsewhere(self):
+        import math
+        d = lambda deg: (math.cos(math.radians(deg)), math.sin(math.radians(deg)), 0.0)
+        dirs = [(980.0, d(10)), (995.0, d(10)), (1012.0, d(10.2)), (1030.0, d(13)), (1050.0, d(15))]
+        self.assertEqual(drive.first_turned(dirs, 1000.0), 1030.0)   # 0.2 degrees of wobble is not the turn
+        self.assertIsNone(drive.first_turned(dirs[:3], 1000.0))
+        self.assertIsNone(drive.first_turned(dirs[2:], 1000.0))      # no frame before the turn to compare with
+
+    def test_proxy_rows_are_read_from_the_frame_log(self):
+        import os, tempfile
+        rows = ["0,900.0,1,1,1,1,G:0:0:1:2:3:1.0:0.0:0.0:0",
+                "1,1000.5,1,1,1,1,G:5:1:9:9:9:0:0:1:0|G:0:0:1:2:3:0.0:1.0:0.0:0",
+                "2,1016.0,1,1,1,1,"]
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "f.csv")
+            with open(p, "w") as fh:
+                fh.write("\n".join(["header"] + rows) + "\n")
+            self.assertEqual(drive.proxy_camera_dirs(p, 950.0), [(1000.5, (0.0, 1.0, 0.0))])
+
+
 if __name__ == "__main__":
     unittest.main()

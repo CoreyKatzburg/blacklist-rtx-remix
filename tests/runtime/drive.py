@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import collections
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 import numpy as np
@@ -217,6 +220,50 @@ def start_capture(path: str, frames: int = 0, fps: int = 30, seconds: float = 0.
                              "-offset_x", "0", "-offset_y", "0", "-video_size", f"{w}x{h}", "-i", "desktop", *limit,
                              "-vf", f"scale={CAP_W}:{CAP_H}:flags=area,format=gray", "-f", "rawvideo", path],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def proxy_camera_dirs(path: str, since_ms: float) -> list[tuple[float, tuple]]:
+    """(ms, camera forward vector) of the game frames the proxy logged at or after since_ms. The ms column is
+    QueryPerformanceCounter time, the same clock as time.perf_counter."""
+    with open(path, "rb") as f:
+        f.seek(max(0, os.path.getsize(path) - 524288))
+        lines = f.read().decode("latin-1").splitlines()[1:]
+    out = []
+    for line in lines:
+        row = line.split(",", 6)
+        try:
+            ms = float(row[1])
+        except (ValueError, IndexError):
+            continue
+        if ms < since_ms or len(row) < 7:
+            continue
+        for pub in row[6].split("|"):
+            p = pub.split(":")
+            if len(p) >= 9 and p[2] == "0":
+                out.append((ms, tuple(map(float, p[6:9]))))
+                break
+    return out
+
+
+def first_change(shots, t0: float, base, threshold: float) -> float | None:
+    """Arrival time of the first screen shot after t0 whose mean absolute difference from `base` exceeds `threshold`
+    (grey levels of 255)."""
+    for t, img in shots:
+        if t > t0 and float(np.abs(img - base).mean()) > threshold:
+            return t
+    return None
+
+
+def first_turned(dirs, t0: float, degrees: float = 0.5) -> float | None:
+    """Time of the first game frame after t0 whose camera points more than `degrees` away from the last one before."""
+    before = [d for t, d in dirs if t < t0]
+    if not before:
+        return None
+    ref = np.array(before[-1])
+    for t, d in dirs:
+        if t >= t0 and math.degrees(math.acos(max(-1.0, min(1.0, float(np.dot(ref, d)))))) > degrees:
+            return t
+    return None
 
 
 # --- one spot ------------------------------------------------------------------------------------------------
@@ -547,6 +594,72 @@ class Spot:
         self.window("light_switch", "switch", lambda: (tap(key), self.capture(rel, int(30 * flip.get("seconds", 20)))),
                     frames=rel, frameSize=[CAP_W, CAP_H], switch={"name": "light_switch", "key": key})
 
+    def mouse_lag(self, trials: int = 20, degrees: float = 5.0) -> dict:
+        """Mouse-to-screen time, measured the same way with and without Remix: at a still camera, a quick turn of
+        `degrees` is sent at a known moment and screen shots (a 480x270 patch up and left of centre, away from Sam,
+        grabbed by gdigrab at up to 120 per second) are timestamped as they arrive; the lag is the time until a shot
+        differs from the one before the turn by more than 3x the still-camera noise. gameMs is the time until the
+        proxy logged the first game frame with the turned camera, so screenMs - gameMs is what happens after the
+        game hands the frame on (Remix and the bridge, or the plain driver), plus the screen grab's own delay."""
+        w, h = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+        pw, ph = 480, 270
+        proc = subprocess.Popen([FFMPEG, "-v", "error", "-f", "gdigrab", "-framerate", "120", "-draw_mouse", "0",
+                                 "-offset_x", str(w // 4 - pw // 2), "-offset_y", str(h // 3 - ph // 2),
+                                 "-video_size", f"{pw}x{ph}", "-i", "desktop", "-vf", "format=gray",
+                                 "-f", "rawvideo", "-"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+        shots: collections.deque = collections.deque(maxlen=600)
+
+        def reader():
+            size = pw * ph
+            while True:
+                buf = b""
+                while len(buf) < size:
+                    chunk = proc.stdout.read(size - len(buf))
+                    if not chunk:
+                        return
+                    buf += chunk
+                shots.append((time.perf_counter() * 1000.0, np.frombuffer(buf, np.uint8).astype(np.int16)))
+        threading.Thread(target=reader, daemon=True).start()
+        counts = int(round(degrees * self.counts_per_deg_x))
+        results, sign = [], 1
+        try:
+            self.hold(1.5)
+            for _ in range(trials):
+                self.hold(0.5)
+                tq = time.perf_counter() * 1000.0
+                self.hold(0.3)
+                still = [img for t, img in list(shots) if t >= tq]
+                if len(still) < 3:
+                    results.append({"error": "screen grab delivered under 10 shots a second"}); continue
+                base = still[-1]
+                noise = max(float(np.abs(img - base).mean()) for img in still)
+                threshold = max(1.5, 3.0 * noise)
+                t0 = time.perf_counter() * 1000.0
+                mouse_move_rel(sign * counts, 0)
+                self.hold(0.6)
+                seen = first_change(list(shots), t0, base, threshold)
+                turned = first_turned(proxy_camera_dirs(self.proxy.path, t0 - 500.0), t0) if self.proxy.path else None
+                results.append({"screenMs": round(seen - t0, 1) if seen else None,
+                                "gameMs": round(turned - t0, 1) if turned else None,
+                                "noise": round(noise, 2), "threshold": round(threshold, 2)})
+                sign = -sign
+            span = list(shots)
+            fps = (len(span) - 1) * 1000.0 / (span[-1][0] - span[0][0]) if len(span) > 1 else 0.0
+        finally:
+            proc.kill(); proc.wait()
+        # Format agreed with worker A (gate.py input_latency_ms): samples_ms in turn order, only turns the screen showed;
+        # the gate takes medians and spread itself.
+        screen = [r["screenMs"] for r in results if r.get("screenMs") is not None]
+        game = [r["gameMs"] for r in results if r.get("gameMs") is not None]
+        after = [r["screenMs"] - r["gameMs"] for r in results if r.get("screenMs") is not None and r.get("gameMs") is not None]
+        med = lambda v: round(float(np.median(v)), 1) if v else None
+        return {"samples_ms": screen, "game_share_ms": med(game), "after_game_ms": med(after),
+                "method": f"{degrees:g} degree mouse turn at a still camera, {trials} turns alternating left/right; time "
+                          "from SendInput to the first gdigrab shot (480x270 patch, ~120/s, arrival-stamped with "
+                          "perf_counter) that differs by > 3x still noise; game share = to the first proxy-logged "
+                          "frame with the turned camera (same clock)",
+                "trials": results, "captureFps": round(fps, 1)}
+
     def set_rt(self, on: bool) -> None:
         set_ini(self.ini, "Lights", "AutoRaytracing", "1" if on else "0")
         if on:
@@ -650,6 +763,13 @@ def main() -> int:
         if hwnd:
             front(hwnd)
             s._calibrate_mouse()
+            if int(spot.get("mouseLag", 1)):
+                lag: dict = {}
+                s.window("mouse_lag", "lag", lambda: lag.update(s.mouse_lag()))
+                result["mouse_lag"] = lag   # top-level key worker A's gate.py reads
+                back = time.monotonic() + 3.0   # the trials alternate direction; put the camera back on the stop exactly
+                while not s.pose(s.yaw, s.pitch) and time.monotonic() < back:
+                    time.sleep(0.008)
         if spot.get("switchTest"):
             s.switch_test()
         if not spot.get("switchOnly"):
