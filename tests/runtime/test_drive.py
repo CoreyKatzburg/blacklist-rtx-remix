@@ -554,7 +554,7 @@ class Reference(unittest.TestCase):
                 s.a = mock.Mock(pid=1)
                 s.log = mock.Mock(new_text=lambda: "")
                 s.move = s.hold = lambda *a, **k: None
-                s.light_dump = lambda dest: None
+                s.light_dump = lambda dest, draws=False: None
                 s.rel_pose = lambda: [0.0, 0.0]
                 s.sam_moved = lambda tag: False
                 s._try_raster = lambda tag, label: {}
@@ -584,6 +584,119 @@ class Reference(unittest.TestCase):
                     "switch_off", ("switch_off_opaque_screen", "5"), ("switch_off_direct_screen", "100"),
                     "switch_on_again", ("switch_on_again_opaque_screen", "5"), ("switch_on_again_direct_screen", "100"),
                     ("usd", "switch_on_again")])
+
+    def test_switch_steps_take_their_own_frames_raster_and_draw_dump(self):
+        # Worker E2's con_boiler launch (Nov 16): base1 takes 60 frames and a ray-tracing-off raster, base3 keeps its
+        # draw dump (worker C's texture fill counters); a step without these keys keeps the spot's 30 frames.
+        import os, tempfile
+        steps = [{"name": "base1", "frames": 60, "rasterRtOff": True}, {"name": "hide"},
+                 {"name": "base3", "frames": 60, "rasterRtOff": True, "drawDump": True}]
+        with tempfile.TemporaryDirectory() as tmp:
+            s = drive.Spot.__new__(drive.Spot)
+            order = []
+            s.spot = {"name": "con_boiler", "teleport": {"location": [1, 2, 3], "yaw": -154}, "switches": steps}
+            s.out, s.ini = tmp, os.path.join(tmp, "d3d9_proxy.ini")
+            with open(s.ini, "w") as fh:
+                fh.write("[Proxy]\n")
+            s.a = mock.Mock(pid=1)
+            s.log = mock.Mock(new_text=lambda: "")
+            s.move = s.hold = lambda *a, **k: None
+            s.capture = lambda rel, n: order.append(("capture", rel, n))
+            s.dump = lambda tag: None
+            s.light_dump = lambda dest, draws=False: order.append(("lights", os.path.basename(dest), draws))
+            s.raster_rt_off = lambda tag: order.append(("raster", tag))
+            s.rel_pose = lambda: [0.0, 0.0]
+            s.sam_moved = lambda tag: False
+            s.window = lambda name, kind, body, **k: (body(), {})[1]
+            with mock.patch.object(drive, "set_ini", lambda *a: None):
+                s.switch_test()
+        self.assertEqual(order, [
+            ("capture", "frames/switch_base1.gray", 60), ("lights", "base1_lights.tsv", False), ("raster", "switch_base1"),
+            ("capture", "frames/switch_hide.gray", 30), ("lights", "hide_lights.tsv", False),
+            ("capture", "frames/switch_base3.gray", 60), ("lights", "base3_lights.tsv", True), ("raster", "switch_base3")])
+
+    def test_light_dump_keeps_the_same_frames_draw_dump_once_it_is_whole(self):
+        # drawDump: the proxy writes f<frame>_draws.tsv beside the light dump and it may still be growing when the
+        # light dump appears, so it is copied only once its size has held still; without draws it is not copied.
+        import os, tempfile
+        for draws in (True, False):
+            with tempfile.TemporaryDirectory() as tmp:
+                s = drive.Spot.__new__(drive.Spot)
+                s.a = mock.Mock(system=tmp)
+                s.ini = os.path.join(tmp, "x.ini")
+                fd = os.path.join(tmp, "framedump")
+                os.makedirs(fd)
+                growth = [b"a" * 10, b"b" * 10, b"c" * 10]
+
+                def set_ini(path, section, key, value):
+                    if key == "CaptureDraws" and value == "1":
+                        open(os.path.join(fd, "f10_lights.tsv"), "w").write("lights")
+                        open(os.path.join(fd, "f10_draws.tsv"), "wb").write(growth.pop(0))
+
+                def hold(seconds, until=None):
+                    for _ in range(100):
+                        if until and until():
+                            return
+                        if growth:   # still being written: grows between polls for the first few polls
+                            open(os.path.join(fd, "f10_draws.tsv"), "ab").write(growth.pop(0))
+                s.hold = hold
+                dest = os.path.join(tmp, "base3_lights.tsv")
+                with mock.patch.object(drive, "set_ini", set_ini), mock.patch.object(drive.time, "sleep", lambda t: None):
+                    self.assertEqual(s.light_dump(dest, draws=draws), "base3_lights.tsv")
+                got = os.path.join(tmp, "base3_draws.tsv")
+                self.assertEqual(os.path.exists(got), draws)
+                if draws:
+                    self.assertEqual(os.path.getsize(got), 30)   # the whole file, not the first 10 bytes
+
+    def test_live_steps_run_one_bench_load_each_for_their_own_length(self):
+        # Worker C's bench bump (Nov 16): a live step may run the bench window's capture or card sampler, started and
+        # stopped around its hold, for its own "seconds"; neither key reaches [RemixConfig], and each load leaves its
+        # proof (pictures captured, sampler rows) in the window. An unknown load stops the launch before it starts.
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            s = drive.Spot.__new__(drive.Spot)
+            s.ini, s.out, s.windows, calls = "x.ini", tmp, [], []
+            s.move = lambda *a: None
+            s.bench_window = lambda *a: None
+            s.dump = lambda tag: None
+            s.counters = lambda: {"telemetry": 0, "proxy": 0}
+            s.yaw = s.pitch = 0.0
+            s.hold = lambda seconds, until=None: calls.append(("hold", seconds))
+
+            class Proc:
+                def __init__(self, kind):
+                    self.kind = kind
+
+                def terminate(self):
+                    calls.append(("stop", self.kind))
+
+                def wait(self, timeout=None):
+                    return 0
+
+            def capture(path, frames=0, fps=30, seconds=0.0):
+                calls.append(("capture", fps, seconds))
+                open(path, "wb").write(b"\0" * drive.CAP_W * drive.CAP_H * 600)
+                return Proc("capture")
+
+            def sampler(out, name):
+                calls.append(("sampler", name))
+                open(os.path.join(out, name), "w").write("timestamp, memory.total\n" + "x, 1\n" * 100)
+                return Proc("sampler")
+            steps = [{"rtx.qualityDLSS": "3"}, {"benchLoad": "none", "seconds": 20},
+                     {"benchLoad": "capture", "seconds": 20}, {"benchLoad": "sampler", "seconds": 20}]
+            with mock.patch.object(drive, "start_capture", capture), mock.patch.object(drive, "start_gpu_sampler", sampler), \
+                    mock.patch.object(drive, "set_ini", lambda *a: calls.append(("ini",) + a[1:])):
+                s.bench({"settle": 0, "frames": 1, "liveSteps": steps, "liveStepSeconds": 10})
+                with self.assertRaisesRegex(ValueError, "benchLoad 'grab'"):
+                    s.bench({"settle": 0, "frames": 1, "liveSteps": [{"benchLoad": "grab"}]})
+        live = [w for w in s.windows if w["name"].startswith("live_step")]
+        self.assertEqual([w.get("benchLoad") for w in live], [None, "none", "capture", "sampler"])
+        self.assertEqual([w.get("benchLoadProof") for w in live], [None, None, {"captureFrames": 600}, {"samplerRows": 100}])
+        self.assertEqual([w["liveRtx"] for w in live], [{"rtx.qualityDLSS": "3"}, {}, {}, {}])
+        self.assertEqual([c for c in calls if c[0] == "ini"], [("ini", "RemixConfig", "rtx.qualityDLSS", "3")])
+        self.assertEqual([c for c in calls if c[0] in ("capture", "sampler", "stop") or c in (("hold", 10.0), ("hold", 20.0))],
+                         [("hold", 10.0), ("hold", 20.0), ("capture", 30, 20.0), ("hold", 20.0), ("stop", "capture"),
+                          ("sampler", "gpu_mem_live_step4.csv"), ("hold", 20.0), ("stop", "sampler")])
 
     def test_bench_extra_stops_debug_views_targets_then_capture(self):
         # Worker E2's rtx.captureAllInstances run: every variant measures the same windows in the same order, and

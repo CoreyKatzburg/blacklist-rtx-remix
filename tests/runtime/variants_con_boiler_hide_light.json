@@ -1,0 +1,26 @@
+{
+  "about": "Worker E2's light and materials suspects at con_boiler (coordinator approved, Nov 16). One launch at the spot's y0_p0, Sam still, five switch steps, each set explicitly and proven in proxy.log before its 60-frame still (final, depth, gamedepth) and light dump: base1 [Lights] HideLightAt empty; hide HideLightAt=-13000,-3464,-724 (spot light 73D21800 of the f5690 dump; proof 'HideLightAt hides 1 lights at 1 positions', 0 lights means NOT MEASURED); base2 empty again (the 0-lights line comes from the restore after hide, before base2 starts, and is checked in proxy.log afterwards); nomod rtx.enableReplacementMaterials False; base3 True. Live rtx keys are proven by the proxy's 'SetConfigVariable <key> = <value> -> 0' line (remix-dxvk.log lists keys only at start); Remix keeps the last value set, so nomod restores True explicitly. Ray-tracing-off raster at base1 and base3 (two grabs show the reference's drift). base3 also keeps its draw dump, which carries worker C's pool, lock and update counters when the staged proxy has d321ef6. E2 scores it with tests\\analysis switch_owner_blocks.py (tools\\remix 8496555).",
+  "spot": "con_boiler",
+  "bench": {
+    "settle": 5,
+    "frames": 30,
+    "switchesAfter": 0,
+    "switches": [
+      {"name": "base1", "ini": [["Lights", "HideLightAt", ""]], "frames": 60,
+       "expectLog": {"reloaded": "settings reloaded", "count": 0, "timeout": 90}, "rasterRtOff": true},
+      {"name": "hide", "ini": [["Lights", "HideLightAt", "-13000,-3464,-724"]], "frames": 60,
+       "expectLog": {"reloaded": "settings reloaded", "after": "HideLightAt hides 1 lights at 1 positions", "count": 1, "timeout": 90}},
+      {"name": "base2", "ini": [["Lights", "HideLightAt", ""]], "frames": 60,
+       "expectLog": {"reloaded": "settings reloaded", "count": 0, "timeout": 90}},
+      {"name": "nomod", "ini": [["RemixConfig", "rtx.enableReplacementMaterials", "False"]], "frames": 60,
+       "expectLog": {"reloaded": "SetConfigVariable rtx.enableReplacementMaterials = False -> 0", "count": 0, "timeout": 90},
+       "restore": [["RemixConfig", "rtx.enableReplacementMaterials", "True"]]},
+      {"name": "base3", "ini": [["RemixConfig", "rtx.enableReplacementMaterials", "True"]], "frames": 60,
+       "expectLog": {"reloaded": "SetConfigVariable rtx.enableReplacementMaterials = True -> 0", "count": 0, "timeout": 90},
+       "rasterRtOff": true, "drawDump": true}
+    ]
+  },
+  "variants": [
+    {"name": "01_hide_light_materials"}
+  ]
+}

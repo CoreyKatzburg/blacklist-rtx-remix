@@ -1,10 +1,13 @@
 {
- "about": "Worker C's picture cost at one held pose (Nov 16): one con_custodial launch, rtx keys changed live at y0_p0, about 10 s per step, then final and game depth dumped at the end of each step (live_stepN_final.pfm, live_stepN_gamedepth.pfm). Steps: 1 base, 2 RR CNN, 3 RR transformer with DLSS balanced, 4 DLSS performance, 5 DLSS quality (base again; step 5 against step 1 is the noise floor). A step counts only with its new '[RTX Ray Reconstruction] created: render WxH' line or RR preset change in remix-dxvk.log. Score with tests\\analysis\\picture_cost.py.",
+ "about": "Worker C's picture cost at one held pose (Nov 16): one con_custodial launch, rtx keys changed live at y0_p0, about 10 s per step, then final and game depth dumped at the end of each step (live_stepN_final.pfm, live_stepN_gamedepth.pfm). Steps: 1 base, 2 RR CNN, 3 RR transformer with DLSS balanced, 4 DLSS performance, 5 DLSS quality (base again; step 5 against step 1 is the noise floor). A step counts only with its new '[RTX Ray Reconstruction] created: render WxH' line or RR preset change in remix-dxvk.log. Score with tests\\analysis\\picture_cost.py. Steps 6 to 10 (worker C's bench bump, Nov 16; settings are base again after step 5): 20 s each, displays awake, benchLoad none / capture (the bench window's 30/s gdigrab) / none / sampler (its 200 ms gpu_sampler.ps1) / none, with each load's proof in the window; score with tests\\analysis\\bench_bump.py (89c331a).",
  "spot": "con_custodial",
  "bench": {"settle": 5, "frames": 150},
  "variants": [
   {"name": "01_live_picture_cost",
-   "bench": {"liveSteps": [{}, {"rtx.rayreconstruction.model": "0"}, {"rtx.rayreconstruction.model": "1", "rtx.qualityDLSS": "2"}, {"rtx.qualityDLSS": "1"}, {"rtx.qualityDLSS": "3"}],
+   "bench": {"liveSteps": [{}, {"rtx.rayreconstruction.model": "0"}, {"rtx.rayreconstruction.model": "1", "rtx.qualityDLSS": "2"}, {"rtx.qualityDLSS": "1"}, {"rtx.qualityDLSS": "3"},
+                           {"display": "awake", "seconds": 20, "benchLoad": "none"}, {"display": "awake", "seconds": 20, "benchLoad": "capture"},
+                           {"display": "awake", "seconds": 20, "benchLoad": "none"}, {"display": "awake", "seconds": 20, "benchLoad": "sampler"},
+                           {"display": "awake", "seconds": 20, "benchLoad": "none"}],
              "liveStepSeconds": 10, "liveStepDump": true}}
  ]
 }

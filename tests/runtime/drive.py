@@ -315,6 +315,27 @@ def start_capture(path: str, frames: int = 0, fps: int = 30, seconds: float = 0.
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def start_gpu_sampler(out_dir: str, smi_file: str) -> subprocess.Popen:
+    """The bench window's card sampler: one nvidia-smi call per sample (gpu_sampler.ps1) every 200 ms into smi_file.
+    -lms writes through a 4 KB buffer, to -f and to stdout alike, so the terminate below (a kill on Windows) lost the
+    tail, or all of a short window (Nov 16)."""
+    return subprocess.Popen(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                             os.path.join(os.path.dirname(os.path.abspath(__file__)), "gpu_sampler.ps1"),
+                             "-Out", os.path.join(out_dir, smi_file), "-IntervalMs", "200", "-Query",
+                             "timestamp,memory.total,memory.used,memory.free,clocks.gr,clocks.mem,pstate,utilization.gpu"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def stop_procs(procs: list) -> None:
+    """Stops the bench window's capture and sampler: terminate, then kill after 10 s."""
+    for p in procs:
+        p.terminate()
+        try:
+            p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            p.kill(); p.wait()
+
+
 def probe_verdict(raw: bytes, info: dict, client: tuple[int, int, int, int] | None) -> dict:
     """Reads screen_probe.ps1's grab. The marker is a window of one known colour over the game; its colour in the grab
     says the desktop grab works at that moment, so a black game area beside it means the game picture is lost."""
@@ -1105,11 +1126,39 @@ class Spot:
                     # and nothing sends input while it holds. Windows' display state is read before and after the hold.
                     keys = dict(keys)
                     want = keys.pop("display", None)
+                    # "benchLoad" none / capture / sampler and "seconds" (worker C, Nov 16: every bench window reads
+                    # 1.7 to 1.9 ms more GPU time than the same pose outside it): the step runs one of the two things
+                    # only bench_window runs, started the same way, so bench_bump.py can tell which one costs it.
+                    load = keys.pop("benchLoad", None)
+                    if load not in (None, "none", "capture", "sampler"):
+                        raise ValueError(f"live step {i + 1}: benchLoad {load!r} is not none, capture or sampler")
+                    step_seconds = float(keys.pop("seconds", seconds))
                     for k, v in keys.items():
                         set_ini(self.ini, "RemixConfig", k, str(v))
                     shown = display.wake() if want == "awake" else display.sleep() if want == "asleep" else None
                     slept = slept or want == "asleep"
-                    w = self.window(f"live_step{i + 1}", "still", lambda: self.hold(seconds), liveRtx=keys)
+                    tag = f"live_step{i + 1}"
+                    procs: list = []
+
+                    def body():
+                        if load == "capture":
+                            os.makedirs(os.path.join(self.out, "frames"), exist_ok=True)
+                            procs.append(start_capture(os.path.join(self.out, "frames", f"{tag}.gray"), fps=30,
+                                                       seconds=step_seconds))
+                        elif load == "sampler":
+                            procs.append(start_gpu_sampler(self.out, f"gpu_mem_{tag}.csv"))
+                        try:
+                            self.hold(step_seconds)
+                        finally:
+                            stop_procs(procs)
+                    w = self.window(tag, "still", body, liveRtx=keys, **({"benchLoad": load} if load else {}))
+                    if load == "capture":
+                        f = os.path.join(self.out, "frames", f"{tag}.gray")
+                        w["benchLoadProof"] = {"captureFrames": os.path.getsize(f) // (CAP_W * CAP_H) if os.path.exists(f) else 0}
+                    elif load == "sampler":
+                        f = os.path.join(self.out, f"gpu_mem_{tag}.csv")
+                        rows = [ln for ln in open(f, encoding="latin-1") if ln.strip()][1:] if os.path.exists(f) else []
+                        w["benchLoadProof"] = {"samplerRows": len(rows)}
                     if shown:
                         w["display"] = {**shown, "after": display.state(), "idleSecondsAfter": display.idle_seconds()}
                         print(f"live_step{i + 1}: display asked {want}, {shown['display']} at the start, "
@@ -1117,7 +1166,6 @@ class Spot:
                     # cfg["liveStepDump"] (worker C, Nov 16, picture cost at one held pose): final and game depth at
                     # the end of each step, as y0_p0 dumps them, so picture_cost.py can compare steps of one launch.
                     if cfg.get("liveStepDump"):
-                        tag = f"live_step{i + 1}"
                         self.window(f"{tag}_dump", "dump", lambda: self.dump(tag), dump=tag)
             finally:
                 if slept:
@@ -1157,13 +1205,7 @@ class Spot:
     def bench_window(self, name: str, want: int, tag: str, smi_file: str) -> dict:
         """One still window of at least `want` game frames with nvidia-smi sampling into `smi_file`."""
         rel = f"frames/{tag}.gray"
-        # One nvidia-smi call per sample (gpu_sampler.ps1): -lms writes through a 4 KB buffer, to -f and to stdout
-        # alike, so the terminate below (a kill on Windows) lost the tail, or all of a short window (Nov 16).
-        smi = subprocess.Popen(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                                os.path.join(os.path.dirname(os.path.abspath(__file__)), "gpu_sampler.ps1"),
-                                "-Out", os.path.join(self.out, smi_file), "-IntervalMs", "200", "-Query",
-                                "timestamp,memory.total,memory.used,memory.free,clocks.gr,clocks.mem,pstate,utilization.gpu"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        smi = start_gpu_sampler(self.out, smi_file)
         # Wall-clock span of the frame capture (worker C, Nov 16): whole-process freezes of 3 to 5 s fell inside bench
         # windows (sweep 113127: 05 frame 4012, 09 frames 4803 and 4804); these times rule the capture in or out.
         capStart = clock()
@@ -1173,12 +1215,7 @@ class Spot:
             w = self.window(name, "still", lambda: self.hold(60.0, until=lambda: self.proxy.last_frame() - start >= want),
                             frames=rel, frameSize=[CAP_W, CAP_H], benchFrames=want, gpuMem=smi_file)
         finally:
-            for p in (cap, smi):
-                p.terminate()
-                try:
-                    p.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    p.kill(); p.wait()
+            stop_procs([cap, smi])
             capEnd = clock()
             print(f"BENCH CAPTURE {tag} start {capStart} end {capEnd}", flush=True)
         w["captureClock"] = [capStart, capEnd]
@@ -1187,9 +1224,10 @@ class Spot:
         w["samMoved"] = self.sam_moved(tag)
         return w
 
-    def light_dump(self, dest: str) -> str | None:
+    def light_dump(self, dest: str, draws: bool = False) -> str | None:
         """One frame of the proxy's light and flare dump (framedump\\f<frame>_lights.tsv, written when
-        [Proxy] CaptureDraws goes from 0 to 1), copied to `dest`."""
+        [Proxy] CaptureDraws goes from 0 to 1), copied to `dest`. With draws=True the same frame's draw dump
+        (f<frame>_draws.tsv, written beside it) is copied too, as `dest` with _draws.tsv for _lights.tsv."""
         folder = os.path.join(self.a.system, "framedump")
         before = files_under(folder)
         set_ini(self.ini, "Proxy", "CaptureDraws", "1")
@@ -1200,6 +1238,15 @@ class Spot:
         if not new():
             return None
         shutil.copy2(os.path.join(folder, new()[0]), dest)
+        if draws:
+            # The draw dump is written beside the light dump in the same frame; wait until its size has held still for
+            # 1 s (20 polls of hold's 50 ms; the file only grows, so equal ends mean no growth in between).
+            src = os.path.join(folder, new()[0][:-len("_lights.tsv")] + "_draws.tsv")
+            sizes: list[int] = []
+            self.hold(15.0, until=lambda: os.path.exists(src) and
+                      (sizes.append(os.path.getsize(src)) or len(sizes) > 20 and sizes[-1] == sizes[-21] > 0))
+            if os.path.exists(src):
+                shutil.copy2(src, dest[:-len("_lights.tsv")] + "_draws.tsv")
         return os.path.basename(dest)
 
     def switch_test(self) -> None:
@@ -1228,13 +1275,25 @@ class Spot:
                 self.hold(3.0)
                 proof = self.await_log(v["expectLog"], mark) if v.get("expectLog") else None
                 rel = f"frames/switch_{name}.gray"
-                w = self.window(f"switch_{name}", "switch", lambda: (self.capture(rel, frames), self.dump(f"switch_{name}")),
+                # v["frames"] (worker E2, Nov 16): this step's screen frames, else the spot's switchFrames.
+                n = int(v.get("frames", frames))
+                w = self.window(f"switch_{name}", "switch", lambda: (self.capture(rel, n), self.dump(f"switch_{name}")),
                                 frames=rel, frameSize=[CAP_W, CAP_H], dump=f"switch_{name}", switch=v)
-                w["lights"] = self.light_dump(os.path.join(self.out, "switch", f"{name}_lights.tsv"))
+                # v["drawDump"] (worker C's texture fill counters, Nov 16): keep this step's draw dump as well.
+                w["lights"] = self.light_dump(os.path.join(self.out, "switch", f"{name}_lights.tsv"),
+                                              draws=bool(v.get("drawDump")))
+                if v.get("drawDump"):
+                    drawn = os.path.join(self.out, "switch", f"{name}_draws.tsv")
+                    w["draws"] = os.path.basename(drawn) if os.path.exists(drawn) else None
                 if proof:
                     w["logProof"] = proof
                 w["gamePose"] = [self.rel_pose()]
                 w["samMoved"] = self.sam_moved(f"switch_{name}")
+                # v["rasterRtOff"] (worker E2, Nov 16): the game's own picture in this step (ray tracing off, checked
+                # off in telemetry, grabbed, back on) as gate\\switch_<name>_raster.pfm; two such grabs in one launch
+                # show how far the reference drifts.
+                if v.get("rasterRtOff"):
+                    self.raster_rt_off(f"switch_{name}")
                 # v["debugViews"] {"label": idx} (worker B's see-through probe, Nov 16): each Remix debug view in this
                 # step from a screen grab (final.pfm does not hold a debug view), then debugViewIdx 0 again.
                 if v.get("debugViews"):
