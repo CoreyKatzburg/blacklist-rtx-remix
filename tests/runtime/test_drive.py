@@ -95,6 +95,16 @@ class Steering(unittest.TestCase):
         self.assertGreater(waited, 2.0)
         self.assertLess(waited, 4.0)
 
+    def test_spot_fails_once_sam_leaves_his_spot(self):
+        # Green hallway, Nov 15: Sam ended up 3000 units from the teleport and the stops were taken elsewhere.
+        s = drive.Spot.__new__(drive.Spot)
+        s.pawn, s.home = 0, [100.0, 200.0, 50.0]
+        s.game = mock.Mock(location=lambda pawn: (160.0, 280.0, 20.0))   # 100 units sideways
+        self.assertEqual(s.sam_moved("y0_p0"), 100.0)
+        s.game = mock.Mock(location=lambda pawn: (100.0, 360.0, 50.0))   # 160 units sideways
+        with self.assertRaisesRegex(RuntimeError, "Sam moved 160 units"):
+            s.sam_moved("y45_p0")
+
     def test_move_lands_on_the_stop_without_swinging_past_it(self):
         s = self.run_with(22, 7.0, -9.0, 7.0, -9.0)
         start = len(self.game.history)

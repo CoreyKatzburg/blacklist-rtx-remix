@@ -15,13 +15,16 @@
 #                                          records where they load (map, spawn, camera) and copies them into the run
 #                                          folder's capture-<name>\. The library is not touched: copy the folder
 #                                          into gate-checkpoints\<name> once its map is the one wanted.
+#   verify_runtime.ps1 -CaptureCheckpoint <name> -Launch -SaveFrom <folder>
+#                                          the same, launched from the .save files in <folder> (a backup) instead;
+#                                          the save folder is put back afterwards as always.
 #   verify_runtime.ps1 -Evaluate <run folder>   re-judge an existing run
 # A spot in spots.json may name another spot's saves with "checkpoint" and move Sam elsewhere with "teleport"
 # ({"location": [x, y, z], "yaw": deg}); drive.py fails the spot when the game does not keep him there.
 # Needs: nobody else using the game (takes play-setup\AGENT_GAME_LOCK.txt), Steam running. Works with the monitors
 # off (screen frames come from gdigrab; the camera is set in memory). Only the goggle keys and the title-screen
 # keys need the game window in front, which this script does itself.
-param([string[]]$Spots = @(), [switch]$DryRun, [string]$CaptureCheckpoint = '', [switch]$Launch, [string]$Evaluate = '', [switch]$SkipInstall)
+param([string[]]$Spots = @(), [switch]$DryRun, [string]$CaptureCheckpoint = '', [switch]$Launch, [string]$Evaluate = '', [switch]$SkipInstall, [string]$SaveFrom = '')
 $ErrorActionPreference = 'Stop'
 $Tests = $PSScriptRoot
 $Runtime = Join-Path $Tests 'runtime'
@@ -174,10 +177,16 @@ try {
         $dest = Join-Path $runDir "capture-$CaptureCheckpoint"
         New-Item -ItemType Directory -Force $dest | Out-Null
         [IO.File]::WriteAllText("$S\d3d9_proxy.ini", $gateIni)
+        $from = if ($SaveFrom) { $SaveFrom } else { $saveBackup }
+        if (-not (Get-ChildItem $from -Filter '*.save' -ErrorAction SilentlyContinue)) { throw "No .save files in $from" }
+        if ($SaveFrom) {
+            Get-ChildItem $SaveDir -Filter '*.save' | Remove-Item
+            Copy-Item (Join-Path $SaveFrom '*.save') $SaveDir
+        }
         $game = Start-GameAtCheckpoint
         & $Py (Join-Path $Runtime 'drive.py') capture --pid $game.Id @hashArgs --out (Join-Path $dest 'checkpoint.json')
         if ($LASTEXITCODE) { throw 'Could not read the camera/map from the game.' }
-        Copy-Item (Join-Path $saveBackup '*.save') $dest
+        Copy-Item (Join-Path $from '*.save') $dest
         Write-Step "Checkpoint recorded in $dest (not in the library)"
     }
     foreach ($spot in $selected) {
@@ -207,7 +216,7 @@ try {
             if (-not $drive.WaitForExit(20 * 60 * 1000)) { $drive.Kill(); Write-Step "$($spot.name): drive.py timed out (20 min)" }
             Write-Step "$($spot.name): $((Get-Content (Join-Path $spotDir 'drive.log') -Tail 1))"
             Stop-Game   # the next launch starts remix-dxvk.log over; gate.py's clean_quit reads this spot's copy
-            Copy-Item -LiteralPath "$S\remix-dxvk.log" $spotDir -ErrorAction SilentlyContinue
+            Copy-Item -LiteralPath "$S\rtx-remix\logs\remix-dxvk.log" $spotDir -ErrorAction SilentlyContinue
             if ($spot.switchTest -or $spot.lightSwitch) {
                 & $Py (Join-Path $Runtime 'switch_report.py') $spotDir | Out-Null
                 Write-Step "$($spot.name): switch test numbers in $(Join-Path $spotDir 'switch.md')"

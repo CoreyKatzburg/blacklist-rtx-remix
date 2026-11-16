@@ -243,6 +243,20 @@ class Spot:
         self.counts_per_deg_y = float(spot.get("mouseCountsPerDegY", -14.0))
         self.calibration: dict = {}
         self._sent: tuple | None = None   # (rotation read when the last correction was sent, time sent)
+        self.home: list[float] | None = None   # where Sam stands for this spot (spawn, or where the teleport left him)
+
+    def sam_moved(self, where: str) -> float | None:
+        """Sideways distance Sam has moved from `home`; raises past 150 units. Green hallway, Nov 15: enemies
+        found Sam after the teleport, he ended up 3000 units away, the game swung the camera mid-stop, and the
+        stops were recorded at the wrong place with a pose error of 166 degrees."""
+        if self.home is None:
+            return None
+        loc = self.game.location(self.pawn)
+        d = float(np.hypot(loc[0] - self.home[0], loc[1] - self.home[1]))
+        if d > 150:
+            raise RuntimeError(f"Sam moved {d:.0f} units from his spot by {where} (enemy contact, or the game "
+                               f"moved him); the stops after this would not be at the spot")
+        return round(d, 1)
 
     def counters(self) -> dict:
         return {"telemetry": self.telemetry.last_frame(), "proxy": self.proxy.last_frame()}
@@ -260,6 +274,7 @@ class Spot:
         if side > 150 or drop > 300:
             raise RuntimeError(f"teleport did not hold: {info}")
         self.base_yaw, self.base_pitch = float(tp["yaw"]), float(tp.get("pitch", 0.0))
+        self.home = got
         return info
 
     def _rot(self) -> tuple[float, float]:
@@ -403,6 +418,7 @@ class Spot:
         w = self.window(name, "still", lambda: (self.capture(rel, 20), self.dump(name)),
                         frames=rel, frameSize=[CAP_W, CAP_H], dump=name, **({"outline": outline} if outline else {}))
         w["gamePose"] = [before, self.rel_pose()]   # [yaw, pitch] from game memory at the start and end of the stop
+        w["samMoved"] = self.sam_moved(name)
 
     def pan(self, seconds: float) -> float:
         """One full turn in `seconds`: steady mouse motion at the calibrated rate, plus a correction once per game
@@ -509,6 +525,7 @@ class Spot:
                                 frames=rel, frameSize=[CAP_W, CAP_H], dump=f"switch_{name}", switch=v)
                 w["lights"] = self.light_dump(os.path.join(self.out, "switch", f"{name}_lights.tsv"))
                 w["gamePose"] = [self.rel_pose()]
+                w["samMoved"] = self.sam_moved(f"switch_{name}")
             finally:
                 if v.get("goggles"):
                     tap(keys["toggle"])
@@ -626,6 +643,7 @@ def main() -> int:
         gap = float(np.linalg.norm(np.subtract(loc, cp["location"])))
         if gap > 150:
             raise RuntimeError(f"Sam spawned {gap:.0f} units from the recorded checkpoint position")
+        s.home = list(loc)
         if "teleport" in spot:
             result["teleport"] = s.teleport(spot["teleport"])
         hwnd = game_window(a.pid)
