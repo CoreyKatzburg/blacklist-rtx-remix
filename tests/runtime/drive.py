@@ -168,7 +168,9 @@ def front(hwnd: int) -> bool:
     return user32.GetForegroundWindow() == hwnd
 
 
-SCAN = {"F9": 0x43, "F10": 0x44, "F11": 0x57, "F12": 0x58, "F": 0x21, "G": 0x22, "N": 0x31, "X": 0x2D, "SPACE": 0x39}
+SCAN = {"F9": 0x43, "F10": 0x44, "F11": 0x57, "F12": 0x58, "F": 0x21, "G": 0x22, "N": 0x31, "X": 0x2D, "SPACE": 0x39,
+        "ESC": 0x01, "ENTER": 0x1C, "ALT": 0x38, "F4": 0x3E, "UP": 0x48, "DOWN": 0x50, "LEFT": 0x4B, "RIGHT": 0x4D}
+EXTENDED = {"UP", "DOWN", "LEFT", "RIGHT"}   # the arrow block, not the number pad's arrows
 
 # Switch test variants (spots.json "switches" overrides): each changes exactly one thing against "base".
 SWITCHES = [
@@ -203,10 +205,28 @@ class _INPUT(ctypes.Structure):
 
 
 def tap(key: str) -> None:
-    for up in (0, 2):
-        i = _INPUT(type=1, u=_INPUT_UNION(ki=_KEYBDINPUT(0, SCAN[key], 0x8 | up, 0, None)))
-        user32.SendInput(1, ctypes.byref(i), ctypes.sizeof(_INPUT))
-        time.sleep(0.12)
+    """One key, or a chord such as "ALT+F4" (pressed in order, released in reverse)."""
+    keys = key.split("+")
+    for up, order in ((0, keys), (2, keys[::-1])):
+        for k in order:
+            i = _INPUT(type=1, u=_INPUT_UNION(ki=_KEYBDINPUT(0, SCAN[k], 0x8 | up | (1 if k in EXTENDED else 0), 0, None)))
+            user32.SendInput(1, ctypes.byref(i), ctypes.sizeof(_INPUT))
+            time.sleep(0.12)
+
+
+def wait_exit(pid: int, seconds: float) -> int | None:
+    """The process's exit code once it has exited within `seconds`, else None (still running)."""
+    h = ctypes.windll.kernel32.OpenProcess(0x00100000 | 0x1000, False, pid)   # SYNCHRONIZE | QUERY_LIMITED_INFORMATION
+    if not h:
+        return -1   # already gone and reaped: no exit code to read
+    try:
+        if ctypes.windll.kernel32.WaitForSingleObject(h, int(seconds * 1000)) != 0:
+            return None
+        code = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+        return code.value
+    finally:
+        ctypes.windll.kernel32.CloseHandle(h)
 
 
 def mouse_move_rel(dx: int, dy: int) -> None:
@@ -1219,6 +1239,48 @@ class Spot:
         n = raw.size // (CAP_W * CAP_H)
         return raw[: n * CAP_W * CAP_H].reshape(n, CAP_H, CAP_W).astype(np.float32).mean(axis=0)
 
+    def quit_test(self, cfg: dict) -> dict:
+        """Worker C's quit test (Nov 16): does the game's own quit, or Alt+F4, end in VK_ERROR_DEVICE_LOST?
+        cfg: {"goggles": bool, "keys": [[key or chord, seconds after], ...], "holdSeconds": s, "exitSeconds": s}.
+        Holds the level with ray tracing on (and the goggles on when asked), then sends the keys one by one, each
+        followed by a full-screen picture frames/quit_step<i>.png, and waits for the game to exit. Records wall-clock
+        times; the logs are read afterwards (tests\\analysis\\quit_crash.py)."""
+        out: dict = {"goggles": bool(cfg.get("goggles")), "steps": []}
+        hwnd = game_window(self.a.pid)
+        if not hwnd or not front(hwnd):
+            raise RuntimeError("no game window to bring to the front for the quit test")
+        if cfg.get("goggles"):
+            mark = len(self.log.new_text())
+            tap(self.spot.get("goggleKeys", {}).get("toggle", "F"))
+            self.hold(3.0)
+            out["gogglesOn"] = "Goggles: on" in self.log.new_text()[mark:]
+            if not out["gogglesOn"]:
+                raise RuntimeError("goggles did not turn on (no 'Goggles: on' in the proxy log)")
+        self.hold(float(cfg.get("holdSeconds", 10)))
+        last = recent_telemetry(self.telemetry.path, 0)[-10:] if self.telemetry.path else []
+        out["rayTracedBeforeQuit"] = [bool(r.get("rayTraced")) for r in last]
+        out["askedAt"] = time.strftime("%Y-%m-%d %H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
+        code = None
+        for i, (key, after) in enumerate(cfg["keys"]):
+            front(hwnd)
+            tap(key)
+            step = {"key": key, "at": time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"}
+            code = wait_exit(self.a.pid, float(after))
+            if code is None:
+                shot = os.path.join(self.out, "frames", f"quit_step{i}.png")
+                subprocess.run([FFMPEG, "-v", "error", "-y", "-f", "gdigrab", "-draw_mouse", "0", "-i", "desktop",
+                                "-frames:v", "1", "-vf", "scale=1280:-2", shot], capture_output=True, timeout=30)
+                step["shot"] = os.path.relpath(shot, self.out) if os.path.exists(shot) else None
+            out["steps"].append(step)
+            if code is not None:
+                break
+        if code is None:
+            code = wait_exit(self.a.pid, float(cfg.get("exitSeconds", 90)))
+        out["exited"] = code is not None
+        out["exitCode"] = code
+        out["exitedBy"] = time.strftime("%Y-%m-%d %H:%M:%S") if code is not None else None
+        return out
+
     def finish(self) -> dict:
         files = {"telemetry": self.telemetry.copy_to(os.path.join(self.out, "telemetry.jsonl")),
                  "proxyFrames": self.proxy.copy_to(os.path.join(self.out, "proxy_frames.csv")),
@@ -1228,6 +1290,17 @@ class Spot:
         held = self.lptrace.candidates[0]
         if not self.lptrace.path and os.path.exists(held):
             files["lightpubTraceError"] = f"{held} exists but its writer holds it without read sharing"
+        if self.spot.get("quit"):
+            # Worker C needs the whole launch: remixShaderCompiles from the first frame, and the proxy's WindowLog
+            # and CreateDevice lines, which come long before this spot starts.
+            files["telemetryLaunch"] = self.telemetry.copy_to(os.path.join(self.out, "telemetry_launch.jsonl"), whole=True)
+            files["proxyFramesLaunch"] = self.proxy.copy_to(os.path.join(self.out, "proxy_frames_launch.csv"), whole=True)
+            if self.log.path:   # d3d9_proxy.log is shared by every launch: keep this game's lines only
+                tag = f"[pid {self.a.pid}]"
+                with open(self.log.path, encoding="latin-1") as f, \
+                        open(os.path.join(self.out, "proxy_launch.log"), "w", encoding="latin-1") as out:
+                    out.writelines(ln for ln in f if tag in ln)
+                files["proxyLogLaunch"] = "proxy_launch.log"
         if self.spot.get("cinematic"):
             # The cutscene plays before drive.py starts, so the spot's part above misses it (run 20261115-214203:
             # telemetry from frame 5033, the cutscene ended at 4987). These copies cover the whole launch, so
@@ -1285,7 +1358,12 @@ def main() -> int:
         if "teleport" in spot:
             result["teleport"] = s.teleport(spot["teleport"])
         hwnd = game_window(a.pid)
-        if spot.get("bench"):
+        if spot.get("quit"):   # one quit per launch: nothing else
+            if not a.no_remix:
+                result["rayTracingAtStart"] = s.rt_is_on()
+            result["quit"] = s.quit_test(spot["quit"])
+            print("QUIT", json.dumps(result["quit"]), flush=True)
+        elif spot.get("bench"):
             if not hwnd:
                 raise RuntimeError("no game window to bring to the front for the benchmark")
             front(hwnd)

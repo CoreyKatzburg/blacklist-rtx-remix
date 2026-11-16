@@ -507,6 +507,8 @@ try {
             Write-Step "$($spot.name): $((Get-Content (Join-Path $spotDir 'drive.log') -Tail 1))"
             Stop-Game   # the next launch starts remix-dxvk.log over; gate.py's clean_quit reads this spot's copy
             Copy-Item -LiteralPath "$S\rtx-remix\logs\remix-dxvk.log" $spotDir -ErrorAction SilentlyContinue
+            # A quit spot (worker C): bridge32.log and bridge64.log show the window focus and the Terminate command.
+            if ($spot.quit) { Copy-Item "$S\rtx-remix\logs\*.log" $spotDir -ErrorAction SilentlyContinue }
             if ($run.variant) {
                 # Proof the change loaded: Remix lists every option it read ("info:    rtx.qualityDLSS = 2").
                 $remixLog = Join-Path $spotDir 'remix-dxvk.log'

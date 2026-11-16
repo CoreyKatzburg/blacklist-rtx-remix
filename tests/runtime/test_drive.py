@@ -395,6 +395,29 @@ class Reference(unittest.TestCase):
             with mock.patch.object(drive, "start_capture", fake_capture(bytes(57600 * 20 - 1) + b"\x07")):
                 s.capture("dark.gray", 20)   # a nearly black room is still a picture
 
+    def test_quit_keys_and_exit_wait(self):
+        # Worker C's quit test: Alt+F4 must be a chord (Alt held while F4 goes down and up), and the arrows must be
+        # the arrow block (extended), or the menu sees numpad keys.
+        sent = []
+        def record(n, ptr, size):
+            ki = ctypes.cast(ptr, ctypes.POINTER(drive._INPUT)).contents.u.ki
+            sent.append((ki.scan, ki.flags))
+        import ctypes
+        with mock.patch.object(drive.user32, "SendInput", record), mock.patch.object(drive.time, "sleep"):
+            drive.tap("ALT+F4")
+            drive.tap("UP")
+        alt, f4 = drive.SCAN["ALT"], drive.SCAN["F4"]
+        self.assertEqual([s for s, _ in sent[:4]], [alt, f4, f4, alt])
+        self.assertEqual([f & 2 for _, f in sent[:4]], [0, 0, 2, 2])   # down, down, up, up
+        self.assertTrue(all(f & 1 for _, f in sent[4:]))
+        import subprocess, sys
+        p = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(1.5); raise SystemExit(3)"])
+        try:
+            self.assertIsNone(drive.wait_exit(p.pid, 0.2))   # still running
+            self.assertEqual(drive.wait_exit(p.pid, 10), 3)
+        finally:
+            p.wait()
+
     def test_screen_probe_tells_a_lost_game_picture_from_a_dead_display(self):
         # Nov 16: the black no-Remix runs could be the display (off after 30 min idle) or the game picture lost after
         # Present. The marker window's colour in the same grab separates them.
