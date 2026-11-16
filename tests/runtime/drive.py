@@ -37,12 +37,22 @@ RASTER_GRABS = 10   # full-size grabs averaged per reference picture (snow, dust
 
 
 # --- append-only files the game writes ----------------------------------------------------------------------
+def readable(path: str) -> bool:
+    """False for a missing file, and for one its writer holds without read sharing: on Nov 16 06:32 the proxy opened
+    lightpub_trace.csv with _wfopen_s (no sharing), and the PermissionError ended every Remix spot at the start."""
+    try:
+        with open(path, "rb"):
+            return True
+    except OSError:
+        return False
+
+
 class Tail:
     """One growing file (telemetry JSONL, proxy CSV, proxy log): remembers where this spot started."""
 
     def __init__(self, candidates: list[str], json_lines: bool):
         self.candidates, self.json = candidates, json_lines
-        self.path = next((p for p in candidates if os.path.exists(p)), None)
+        self.path = next((p for p in candidates if readable(p)), None)
         self.start = os.path.getsize(self.path) if self.path else 0
         self.start_frame = self._newest() if self.path else 0
 
@@ -60,7 +70,7 @@ class Tail:
 
     def last_frame(self) -> int:
         if not self.path:
-            self.path = next((p for p in self.candidates if os.path.exists(p)), None)   # appeared after the start
+            self.path = next((p for p in self.candidates if readable(p)), None)   # appeared after the start
             if not self.path:
                 return 0
         return self._newest()
@@ -1116,6 +1126,9 @@ class Spot:
                  "proxyGate": self.pgate.copy_to(os.path.join(self.out, "proxy_gate.csv")),
                  "proxyLog": self.log.copy_to(os.path.join(self.out, "proxy.log")),
                  "lightpubTrace": self.lptrace.copy_to(os.path.join(self.out, "lightpub_trace.csv"))}
+        held = self.lptrace.candidates[0]
+        if not self.lptrace.path and os.path.exists(held):
+            files["lightpubTraceError"] = f"{held} exists but its writer holds it without read sharing"
         if self.spot.get("cinematic"):
             # The cutscene plays before drive.py starts, so the spot's part above misses it (run 20261115-214203:
             # telemetry from frame 5033, the cutscene ended at 4987). These copies cover the whole launch, so

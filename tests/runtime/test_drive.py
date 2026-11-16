@@ -325,6 +325,31 @@ class MouseLag(unittest.TestCase):
             s.spot = {}
             self.assertNotIn("telemetryLaunch", s.finish())
 
+    def test_a_trace_held_without_read_sharing_is_skipped_and_reported(self):
+        # Nov 16 06:32: the proxy held lightpub_trace.csv via _wfopen_s and drive.py died at its start.
+        import ctypes, os, tempfile
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        with tempfile.TemporaryDirectory() as tmp:
+            held = os.path.join(tmp, "lightpub_trace.csv")
+            h = k32.CreateFileW(held, 0x40000000, 0, None, 2, 0x80, None)   # GENERIC_WRITE, no sharing, CREATE_ALWAYS
+            self.assertNotEqual(h, wintypes.HANDLE(-1).value)
+            try:
+                s = drive.Spot.__new__(drive.Spot)
+                s.lptrace = drive.Tail([held], False)
+                self.assertIsNone(s.lptrace.path)
+                self.assertEqual(s.lptrace.last_frame(), 0)
+                s.telemetry = s.proxy = s.pgate = s.log = drive.Tail([os.path.join(tmp, "absent")], False)
+                s.out, s.process, s.spot = tmp, mock.Mock(), {}
+                files = s.finish()
+                self.assertIsNone(files["lightpubTrace"])
+                self.assertIn("without read sharing", files["lightpubTraceError"])
+            finally:
+                k32.CloseHandle(h)
+
 
 class Reference(unittest.TestCase):
     """The no-Remix reference pictures: same units as Remix's final.pfm, and never recorded through the wrong renderer."""
