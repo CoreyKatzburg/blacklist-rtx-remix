@@ -76,9 +76,10 @@ Checks (thresholds in THRESHOLDS):
   lights_orbs_unmatched    symptom checks, ledger rows 1 and 2 (worker B's glow_blobs.py, pictures only): per still and
   lights_puffs             switch stop, the Remix still against the --reference (no Remix) still at the same pose.
   lights_glows_lost        Orbs: bright blobs the original does not show. Puffs: large bright areas the original leaves
-                           dark (also surfaces Remix lights; a puff needs a look before it is called a floating light).
-                           Glows lost: lamp glows the original shows that Remix lost (what must stay). Limit 0 each per
-                           stop. Poses apart: that stop is listed, not compared. No no-Remix reference: NOT MEASURED
+                           dark (also surfaces Remix lights, so puffs are REPORT ONLY: WARN above 0, never FAIL).
+                           Glows lost: lamp glows the original shows that Remix lost (what must stay). Orbs and lost
+                           glows: limit 0 per stop. Poses apart: that stop is listed, not compared. No no-Remix
+                           reference: NOT MEASURED
   lights_dimmed_linger     report only (WARN above 600 frames, never FAIL): stray line max longest dim TM. It measures
                            the game: guard rifle flashlights dim on their own (2060 frames at con_bright_hall)
   light_switchoff_lag      report only (WARN above 1.0 s, never FAIL): longest downward brightness run before stopped
@@ -136,6 +137,8 @@ THRESHOLDS = {
     "goggles_dark_min_ratio": 0.4,     # GUESS. Same: no healthy goggles-off since the proxy fix.
     "present_stalls_max": 0,           # proxy row index 3 (time inside Present) > 50 ms in measured windows (excl. loads).
     "frame_gap_max": 0,                # proxy row index 2 (Present-to-Present gap) > 50 ms, same rule as frames_over_50ms.
+    "freeze_gap_ms": 1000.0,           # --session: a gap over this in play is a freeze (worker C's spec; Corey's 1 s).
+    "freezes_in_play_max": 0,          # Measured: 0 in sessions 135449 and 212037 (worker C's freeze_scan.py).
     "quit_present_max_ms": 1000.0,     # No proxy Present > 1000 ms in the last 10 s before Terminate.
     "flare_unplaced_max_noskip": 15,   # Measured live (worker B): 15 at both spots with SU=0, 0 with SU=1.
     "lamps_without_flare_margin": 10,  # GUESS. Max jump over --reference spot max XM.
@@ -159,8 +162,9 @@ THRESHOLDS = {
 # Checks whose NOT MEASURED does not fail the gate (a field not yet in a build that ran live). Empty since Remix
 # 0c13881 (staged in 81c0328) ran live on Nov 16 with qpcMs and instancedSharedSlotDraws (run 20261116-100605).
 # input_latency_screen_ms is always NOT MEASURED until the desktop grab works in Remix runs (coordinator, Nov 16);
-# input_latency_ms (the game share) is the judged lag check.
-SOFT_NM: frozenset[str] = frozenset({"input_latency_screen_ms"})
+# input_latency_ms (the game share) is the judged lag check. lights_puffs is report only (worker B's 9ddc95d), as
+# are the session lines freeze_gaps_excluded and quit_gap_ms.
+SOFT_NM: frozenset[str] = frozenset({"input_latency_screen_ms", "lights_puffs", "freeze_gaps_excluded", "quit_gap_ms"})
 TELEMETRY_FIELDS = ("frame", "frameTimeMs", "gpuTimeMs", "instances", "skinnedInstances", "staticBlasRebuilds",
                     "cameraCut", "textureMemoryMB", "vramUsedMB")
 THUMB_W, THUMB_H = 128, 72
@@ -1405,8 +1409,15 @@ def proxy_over_50ms(run: Run, name: str, col: int, what: str, limit_key: str, pa
         run.add(name, NOT_MEASURED, None, "0", f"proxy trace has {have} of {want} frames with column {col}", src)
         return
     over, excluded, worst_ms, worst_f = 0, 0, -1.0, 0
+    starts = []   # rows over 50 ms at a window's first frame a, which frames_in leaves out (it counts a+1..b)
     for s, w in pairs:
         prx = s["_data"]["proxy"]
+        a = (w.get("proxy") or (0, 0))[0]
+        try:
+            if float(prx[a][col]) > 50.0:
+                starts.append(f"{float(prx[a][col]):.1f} ms at frame {a}")
+        except (KeyError, IndexError, ValueError):
+            pass
         for pf in frames_in(w, "proxy"):
             try:
                 ms = float(prx[pf][col])
@@ -1420,7 +1431,8 @@ def proxy_over_50ms(run: Run, name: str, col: int, what: str, limit_key: str, pa
             if ms > 50.0:
                 over += 1
     detail = f"{over} of {want} frames with {what} > 50 ms (worst {worst_ms:.1f} ms at frame {worst_f})" + (
-        f" ({excluded} loading-screen frames excluded)" if excluded else "")
+        f" ({excluded} loading-screen frames excluded)" if excluded else "") + (
+        f"; {len(starts)} over 50 ms at window starts, not counted: {', '.join(starts)}" if starts else "")
     run.add(name, PASS if over <= THRESHOLDS[limit_key] else FAIL, over, "0", detail, src)
 
 
@@ -1477,19 +1489,24 @@ def glow_blobs_stop(remix_spot: str, orig_spot: str, still: str, orig_still: str
     return p.returncode, (p.stdout + p.stderr).strip()
 
 
-_GLOW_COUNTS = {  # check -> the glow_blobs.py line that carries its count (worker B, f56bbcc); limit 0 each
+_GLOW_COUNTS = {  # check -> the glow_blobs.py line that carries its count (worker B, 9ddc95d); limit 0, puffs none
     "lights_orbs_unmatched": re.compile(r"glow_blobs: unmatched (\d+) of (\d+) blobs"),
     "lights_puffs": re.compile(r"glow_blobs: puffs (\d+)()"),
     "lights_glows_lost": re.compile(r"glow_blobs: lost (\d+) of (\d+) original glows"),
+}
+_GLOW_REPORT_ONLY = {  # check -> why it never decides the verdict (WARN above 0; NOT MEASURED is in SOFT_NM)
+    "lights_puffs": "a puff is also a surface Remix lights that the original leaves dark, so it cannot tell a "
+                    "floating light from correct extra lighting; coordinator decision with worker B's 9ddc95d",
 }
 
 
 def glow_checks(run: Run, good: list[dict], reference: dict[str, dict] | None, ref_no_remix: bool) -> None:
     """Symptom checks for ledger rows 1 and 2 from worker B's glow_blobs.py (pictures only): per still and switch
-    stop, the Remix still against the original game's still at the same pose. Three counts, each with limit 0 per stop:
-    lights_orbs_unmatched (bright blobs the original does not show), lights_puffs (large bright areas the original
-    leaves dark; also counts surfaces Remix lights that the original leaves dark, so a puff needs a look before it is
-    called a floating light) and lights_glows_lost (the reverse: a lamp glow the original shows that Remix lost).
+    stop, the Remix still against the original game's still at the same pose. Three counts:
+    lights_orbs_unmatched (bright blobs the original does not show; limit 0 per stop), lights_puffs (large bright
+    areas the original leaves dark; also counts surfaces Remix lights that the original leaves dark, so it is report
+    only: WARN above 0, its NOT MEASURED in SOFT_NM) and lights_glows_lost (the reverse: a lamp glow the original
+    shows that Remix lost; limit 0 per stop).
     Switch stops are compared with the original's y0_p0; the pose check decides whether that is the same pose.
     Each check: FAIL when any compared stop is over 0; otherwise NOT MEASURED when a spot has no no-Remix reference,
     glow_blobs.py broke on a stop, or no stop could be compared; PASS otherwise. Stops whose poses are too far apart
@@ -1537,8 +1554,11 @@ def glow_checks(run: Run, good: list[dict], reference: dict[str, dict] | None, r
         detail = (f"{len(bad)} of {len(rows)} compared stops over 0"
                   + (": " + "; ".join(f"{lab} {n}" + (f" of {of}" if of else "") for lab, n, of in bad) if bad else "")
                   + tail)
+        if name in _GLOW_REPORT_ONLY:
+            detail = f"report only ({_GLOW_REPORT_ONLY[name]}): {detail}"
         if bad:
-            run.add(name, FAIL, sum(n for _, n, _ in bad), threshold, detail, src)
+            run.add(name, WARN if name in _GLOW_REPORT_ONLY else FAIL, sum(n for _, n, _ in bad),
+                    "none (report only)" if name in _GLOW_REPORT_ONLY else threshold, detail, src)
         elif missing or errors or not rows:
             run.add(name, NOT_MEASURED, None, threshold, detail, src)
         else:
@@ -2049,6 +2069,57 @@ def _first_file(folder: str, names: tuple[str, ...]) -> str | None:
     return next((os.path.join(folder, n) for n in names if os.path.exists(os.path.join(folder, n))), None)
 
 
+FREEZE_SCAN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "analysis", "freeze_scan.py")
+_freeze_scan = None
+
+
+def freeze_scan_module():
+    """Worker C's tests\\analysis\\freeze_scan.py, imported once (its classify() is the freeze rule; not copied)."""
+    global _freeze_scan
+    if _freeze_scan is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("freeze_scan", FREEZE_SCAN)
+        _freeze_scan = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_freeze_scan)
+    return _freeze_scan
+
+
+def freeze_checks(run: Run, path: str | None) -> None:
+    """Session freezes from d3d9_proxy_frames.csv (worker C's spec, Nov 16). freezes_in_play_over_1s: gaps over
+    1000 ms between Present entries where the frame and the one before both carry a gameplay-camera publish ('G:')
+    and draws > 0, not in a launch's first 10 frames and not on its last frame (freeze_scan.classify). Limit 0.
+    Report only, never FAIL: freeze_gaps_excluded (startup, menu and end gaps with sizes) and quit_gap_ms (each
+    launch's last gapMs; no reference number agreed: the original game's launches ended on 4-53 ms, once 172 ms)."""
+    src = "d3d9_proxy_frames.csv (freeze_scan.classify)"
+    thr = f"0 gaps over {THRESHOLDS['freeze_gap_ms']:g} ms in play"
+    if not path:
+        for name, t in (("freezes_in_play_over_1s", thr), ("freeze_gaps_excluded", "none (report only)"),
+                        ("quit_gap_ms", "none (report only)")):
+            run.add(name, NOT_MEASURED, None, t, "session has no d3d9_proxy_frames.csv", src)
+        return
+    fs = freeze_scan_module()
+    launches = [fr for fr in fs.read_launches(path) if fr]
+    if not launches:
+        for name, t in (("freezes_in_play_over_1s", thr), ("freeze_gaps_excluded", "none (report only)"),
+                        ("quit_gap_ms", "none (report only)")):
+            run.add(name, NOT_MEASURED, None, t, "d3d9_proxy_frames.csv has no readable frame rows", src)
+        return
+    found = [(n, x) for n, frames in enumerate(launches) for x in fs.classify(frames, THRESHOLDS["freeze_gap_ms"])]
+    play = [(n, x) for n, x in found if x[3] == "play"]
+    tag = lambda n: f"launch {n} " if len(launches) > 1 else ""     # noqa: E731
+    run.add("freezes_in_play_over_1s", FAIL if len(play) > THRESHOLDS["freezes_in_play_max"] else PASS, len(play), thr,
+            f"{len(play)} gap(s) over {THRESHOLDS['freeze_gap_ms']:g} ms in play over "
+            f"{sum(len(f) for f in launches)} frames"
+            + "".join(f"; {tag(n)}frame {fr}: gap {gap:.0f} ms, inside Present {pr:.0f} ms"
+                      for n, (fr, gap, pr, _) in play), src)
+    excl = [(n, x) for n, x in found if x[3] != "play"]
+    run.add("freeze_gaps_excluded", PASS, len(excl), "none (report only)",
+            "; ".join(f"{tag(n)}{k} frame {fr}: {gap:.0f} ms" for n, (fr, gap, _, k) in excl) or "none", src)
+    quits = [(n, frames[-1][0], frames[-1][1]) for n, frames in enumerate(launches)]
+    run.add("quit_gap_ms", PASS, round(max(q[2] for q in quits)), "none (report only; no reference agreed)",
+            "; ".join(f"{tag(n)}{gap:.0f} ms on last frame {fr}" for n, fr, gap in quits), src)
+
+
 def evaluate_session(folder: str) -> dict:
     """Score the logs of a free-play session (a play-setup logs folder: rtx_telemetry.jsonl, d3d9_proxy_gate.csv and
     rtx-remix_logs_remix-dxvk.log) with the gate rules that need no scripted camera: goggles_toggle_rebuilds and
@@ -2056,7 +2127,8 @@ def evaluate_session(folder: str) -> dict:
     frame, frames_over_50ms (only loading screens excused; result["slowFrames"] lists every frame over 50 ms),
     remix_ray_tracing (scene share outside loading and goggles, time to first ray-traced frame from launch start),
     compile_wait_stuck and never_ray_traced on the whole launch, instanced_shared_slot_draws on ray-traced scene frames,
-    clean_quit on device loss. Telemetry is streamed (sessions reach 1.6 GB). Writes nothing to the folder."""
+    freezes_in_play_over_1s from d3d9_proxy_frames.csv (freeze_checks), clean_quit on device loss. Telemetry is
+    streamed (sessions reach 1.6 GB). Writes nothing to the folder."""
     run = Run.__new__(Run)
     run.dir, run.manifest, run.metrics = folder, {}, []
     tel_path = _first_file(folder, ("rtx_telemetry.jsonl", "telemetry.jsonl"))
@@ -2199,6 +2271,7 @@ def evaluate_session(folder: str) -> dict:
         instanced_capture_check(run, [("session", log_on, [(fr, ltel[fr].get("instancedSharedSlotDraws"))
                                                            for fr in scene if ltel[fr]["rayTraced"]])], tsrc)
 
+    freeze_checks(run, _first_file(folder, ("d3d9_proxy_frames.csv",)))
     dxvk = _first_file(folder, ("rtx-remix_logs_remix-dxvk.log", "remix-dxvk.log"))
     if not dxvk:
         run.add("clean_quit", NOT_MEASURED, None, "no VK_ERROR_DEVICE_LOST", "no remix-dxvk.log in the session",

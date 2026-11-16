@@ -478,7 +478,7 @@ CASES = {
     "present_stall": (("present_stalls",), ()),           # 120 ms inside Present, 14 ms gap: only present_stalls
     "frame_gap": (("frame_gap_over_50ms",), ()),         # 61 ms gap, 0.5 ms Present, 10 ms telemetry: only the gap
     "orbs_unmatched": (("lights_orbs_unmatched",), ()),  # glow_blobs: 12 unmatched blobs at y0_p0
-    "glow_puffs": (("lights_puffs",), ()),               # glow_blobs: 2 puffs at y90_p0
+    "glow_puffs": ((), ()),                              # glow_blobs: 2 puffs at y90_p0: WARN lights_puffs, report only
     "glows_lost": (("lights_glows_lost",), ()),          # glow_blobs: 6 original glows lost at y45_p0
     "orbs_pose_apart_one": ((), ()),                     # one stop with poses apart is listed; the rest pass
     "orbs_all_poses_apart": ((), ("lights_orbs_unmatched", "lights_puffs", "lights_glows_lost")),   # nothing compared: NOT MEASURED
@@ -559,6 +559,7 @@ WARNS = {"low_fps": ("min_median_fps",), "near_target_fps": ("min_median_fps",),
          "never_rt_no_compiles": ("min_median_fps",),
          "high_latency": ("min_median_fps",), "fps_regression": ("min_median_fps",),
          "dimmed_linger": ("lights_dimmed_linger",), "switchoff_lag": ("light_switchoff_lag",),
+         "glow_puffs": ("lights_puffs",),
          "no_reference": ("frame_interval_vs_reference",), "spot_error": ("frame_interval_vs_reference",)}
 PREVIOUS = {"fps_regression", "fps_drop_9pct"}    # judged against a previous run: the healthy 100 FPS run
 NO_REFERENCE = {"no_reference"}                  # run without --reference
@@ -596,6 +597,9 @@ SESSION_CASES = {
     "session_never_rt_no_compiles": (("never_ray_traced", "remix_ray_tracing"), _NO_RT_NM),  # never RT, 0 compiles
     "session_capture_on_shared": (("instanced_shared_slot_draws",), ()),  # 2 shared-slot draws, captureAllInstances on
     "session_capture_off_shared": ((), ()),                            # the same draws with the option off: report only
+    "session_freeze_in_play": (("freezes_in_play_over_1s",), ()),      # 1500 ms Present-to-Present gap on frame 200
+    "session_quit_gap": ((), ()),                                      # 4931 ms gap on the last frame: quit, report only
+    "session_menu_gap": ((), ()),                                      # 1500 ms gap on a frame without a 'G:' publish
 }
 
 
@@ -625,6 +629,16 @@ def make_session(folder: str, case: str) -> str:
                                "instancedCapturedDraws": 4}))
     gate.save_text(os.path.join(d, "d3d9_proxy_gate.csv"), "\n".join(pg) + "\n")
     gate.save_text(os.path.join(d, "rtx_telemetry.jsonl"), "\n".join(tel) + "\n")
+    # d3d9_proxy_frames.csv: frame,entryMs,gapMs,presentMs,draws,publishCount,publishes (a gameplay-camera 'G:' publish)
+    cam = "G:0:0:-221.528:360.466:193.002:0.9438:-0.3304:0.0000:0.000000"
+    n, rows, t = len(pg), [], 0.0
+    for f in range(n):
+        gap = (1500.0 if (case in ("session_freeze_in_play", "session_menu_gap") and f == 200)
+               else 4931.0 if (case == "session_quit_gap" and f == n - 1) else 10.0)
+        t += gap
+        pub = "" if (case == "session_menu_gap" and f == 200) else cam
+        rows.append(f"{f},{t:.3f},{gap:.3f},2.000,400,{1 if pub else 0},{pub}")
+    gate.save_text(os.path.join(d, "d3d9_proxy_frames.csv"), "\n".join(rows) + "\n")
     lost = "[error] vkQueueSubmit: VK_ERROR_DEVICE_LOST\n" if case == "session_device_lost" else ""
     opt = "[info]   rtx.captureAllInstances = True\n" if case == "session_capture_on_shared" else ""
     gate.save_text(os.path.join(d, "rtx-remix_logs_remix-dxvk.log"), "[info] Remix started\n" + opt + lost)
@@ -664,14 +678,14 @@ def fake_glow_blobs(case: str, still: str) -> tuple[int, str]:
         return 1, "SystemExit: no window y45_p0 with frames and proxy frames"
     if case == "orbs_pose_apart_one" and still == "y135_p0":
         return 2, "glow_blobs: NOT MEASURED, poses differ by 20 cm, yaw 4.37, pitch 0.00 deg"
-    ok = not (orbs or puffs or lost)
+    ok = not (orbs or lost)     # 9ddc95d: the verdict and exit code are orbs and lost glows; puffs are report only
     v = lambda n: "PASS" if n == 0 else "FAIL"
     return (0 if ok else 1), "\n".join([
         "glow_blobs: hud mask none",
         f"glow_blobs: unmatched {orbs} of 50 blobs (fake): {v(orbs)}",
-        f"glow_blobs: puffs {puffs} (fake): {v(puffs)}",
+        f"glow_blobs: puffs {puffs} (fake): report only",
         f"glow_blobs: lost {lost} of 20 original glows (fake): {v(lost)}",
-        f"glow_blobs: {'PASS' if ok else 'FAIL'} (orbs unmatched {orbs}, puffs {puffs}, lost glows {lost})"])
+        f"glow_blobs: {'PASS' if ok else 'FAIL'} (orbs unmatched {orbs}, lost glows {lost}; puffs {puffs} report only)"])
 
 def check_case(folder: str, case: str) -> tuple[bool, dict, str]:
     """(expectation met, result, explanation). Checks the case does not name must PASS, except fps_regression, which

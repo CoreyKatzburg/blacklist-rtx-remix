@@ -318,9 +318,11 @@ class FakeRunTest(unittest.TestCase):
         run.metrics.clear()
         gate.proxy_over_50ms(run, "frame_gap_over_50ms", 2, "a Present-to-Present gap", "frame_gap_max", pairs, False)
         self.assertEqual(run.metrics[0]["status"], gate.PASS, run.metrics[0])
+        # The window-start rule must not hide a gap: 5689 is printed even when the check passes.
+        self.assertRegex(run.metrics[0]["detail"], r"1 over 50 ms at window starts, not counted: [\d.]+ ms at frame 5689")
 
     def test_glow_blobs_counts_on_real_stops(self):
-        """Ledger rows 1 and 2: worker B's glow_blobs.py (f56bbcc) through the gate's own call and parsing, against the
+        """Ledger rows 1 and 2: worker B's glow_blobs.py (9ddc95d) through the gate's own call and parsing, against the
         original game at con_bright_hall (reference 000454). 142638 y0_p0, stand-in balls on: 12 orbs and 2 puffs, no
         lost glow. 142638's balls-off switch step: 0/0/0. 063147 y0_p0 (never ray traced, dark): 6 of 21 original
         glows lost, the reverse direction. y135_p0: poses 20 cm apart, not compared (exit 2)."""
@@ -344,6 +346,50 @@ class FakeRunTest(unittest.TestCase):
             for case in fakerun.SESSION_CASES:
                 ok, why = fakerun.check_session_case(td, case)
                 self.assertTrue(ok, f"{case}: {why}")
+
+    def test_session_freezes_on_20261115_135449(self):
+        """Worker C's freeze spec on Corey's session: (a) 0 freezes in play, and the 4931 ms gap on the last frame
+        67921 is the quit (quit_gap_ms 4931); (b) frame 40000's gap set to 1500 ms fails on exactly that frame;
+        (c) with freeze_scan's edge rule off the quit frame 67921 fails, so the rule is what keeps the quit out."""
+        src = os.path.join(r"D:\BlacklistOverhaul\experiments\playtest-evidence\play-setup-logs",
+                           "before-20261115-135449", "d3d9_proxy_frames.csv")
+        if not os.path.exists(src):
+            self.skipTest("session logs not on this machine")
+
+        def score(path):
+            run = gate.Run.__new__(gate.Run)
+            run.dir, run.manifest, run.metrics = "", {}, []
+            gate.freeze_checks(run, path)
+            return {m["check"]: m for m in run.metrics}
+
+        by = score(src)
+        m = by["freezes_in_play_over_1s"]
+        self.assertEqual((m["status"], m["value"]), (gate.PASS, 0), m)
+        self.assertEqual(by["quit_gap_ms"]["value"], 4931)
+        self.assertIn("4931 ms on last frame 67921", by["quit_gap_ms"]["detail"])
+        self.assertIn("end frame 67921: 4931 ms", by["freeze_gaps_excluded"]["detail"])
+
+        with tempfile.TemporaryDirectory() as td:
+            dst = os.path.join(td, "d3d9_proxy_frames.csv")
+            with open(src, encoding="ascii", errors="replace") as fi, open(dst, "w", encoding="ascii") as fo:
+                for line in fi:
+                    if line.startswith("40000,"):
+                        p = line.split(",", 3)
+                        line = ",".join(p[:2] + ["1500.000", p[3]])
+                    fo.write(line)
+            m = score(dst)["freezes_in_play_over_1s"]
+            self.assertEqual((m["status"], m["value"]), (gate.FAIL, 1), m)
+            self.assertIn("frame 40000: gap 1500 ms", m["detail"])
+
+        fs = gate.freeze_scan_module()
+        orig = fs.classify
+        fs.classify = lambda frames, limit, edge_rule=True: orig(frames, limit, edge_rule=False)
+        try:
+            m = score(src)["freezes_in_play_over_1s"]
+        finally:
+            fs.classify = orig
+        self.assertEqual(m["status"], gate.FAIL, m)
+        self.assertIn("frame 67921: gap 4931 ms", m["detail"])
 
     def test_session_mode_on_20261115_135449(self):
         """Corey's free-play session: goggles go off at proxy frame 41475 and Remix rebuilds 94 static meshes on the
