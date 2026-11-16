@@ -6,7 +6,7 @@ param([string]$Gate = (Join-Path (Split-Path $PSScriptRoot) 'verify_runtime.ps1'
 $ErrorActionPreference = 'Stop'
 $ast = [Management.Automation.Language.Parser]::ParseFile($Gate, [ref]$null, [ref]$null)
 foreach ($n in 'Remove-OwnPlayLock', 'Wait-RestartedGame', 'Get-DisplayProblem', 'Test-LaunchDead', 'Get-CSpaceProblem', 'Get-MemoryProblem',
-           'Get-DisplayAwakeProblem', 'Get-DisplayDuring') {
+           'Get-DisplayAwakeProblem', 'Get-DisplayDuring', 'Test-SleepsDisplays') {
     $f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true) | Select-Object -First 1
     if (-not $f) { throw "missing $n" }
     . ([scriptblock]::Create($f.Extent.Text))
@@ -102,7 +102,18 @@ $awakeText = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.Fun
 Check 'rule removed (any wake result accepted): the off case fails' (-not (DisplayCases)['displays still off after the wake: refused'])
 . ([scriptblock]::Create($awakeText))
 Remove-Item $ddir -Recurse -Force
-# Play script lock rules (Corey, Nov 16): a running test refuses his launch, the gate's own launch goes through, a lock
+# Keep-awake (coordinator, Nov 16): every launch holds the displays awake, except the proof launch whose live steps put
+# them to sleep on purpose.
+$proof = [pscustomobject]@{ bench = [pscustomobject]@{ liveSteps = @([pscustomobject]@{ display = 'awake' }, [pscustomobject]@{ display = 'asleep' }) } }
+$rtxSteps = [pscustomobject]@{ bench = [pscustomobject]@{ liveSteps = @([pscustomobject]@{}, [pscustomobject]@{ 'rtx.qualityDLSS' = '1' }) } }
+function SleepCases { @{ 'awake/asleep proof: not kept awake' = (Test-SleepsDisplays $proof)
+                         'live steps without display: kept awake' = -not (Test-SleepsDisplays $rtxSteps)
+                         'normal spot: kept awake' = -not (Test-SleepsDisplays ([pscustomobject]@{ name = 'con_custodial' })) } }
+foreach ($c in (SleepCases).GetEnumerator()) { Check $c.Key $c.Value }
+$sleepText = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq 'Test-SleepsDisplays' }, $true)[0].Extent.Text
+. ([scriptblock]::Create($sleepText.Replace("-eq 'asleep'", "-eq 'never'")))
+Check 'rule removed (asleep steps not seen): the proof case fails' (-not (SleepCases)['awake/asleep proof: not kept awake'])
+. ([scriptblock]::Create($sleepText))# Play script lock rules (Corey, Nov 16): a running test refuses his launch, the gate's own launch goes through, a lock
 # left by a crashed test is cleared after its settings are put back, a clean state is untouched. Each rule is then
 # removed from a copy of the functions, and its case must fail.
 . (Join-Path $PSScriptRoot 'run_files.ps1')

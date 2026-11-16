@@ -145,18 +145,35 @@ def sleep(seconds: float = 10.0) -> dict:
     return {"asked": "asleep", "before": before, "display": got, "seconds": took, "idleSeconds": idle_seconds()}
 
 
+ES_CONTINUOUS, ES_DISPLAY_REQUIRED = 0x80000000, 0x00000002
+kernel32.SetThreadExecutionState.argtypes = [wt.DWORD]
+kernel32.SetThreadExecutionState.restype = wt.DWORD
+
+
+def display_required() -> bool:
+    """Whether any program now holds the displays on (CallNtPowerInformation SystemExecutionState)."""
+    flags = wt.ULONG()
+    ctypes.WinDLL("powrprof").CallNtPowerInformation(16, None, 0, ctypes.byref(flags), ctypes.sizeof(flags))
+    return bool(flags.value & ES_DISPLAY_REQUIRED)
+
+
 def main(argv: list[str]) -> int:
     cmd = argv[0] if argv else "state"
     if cmd == "watch":
         out = argv[argv.index("--out") + 1]
         interval = float(argv[argv.index("--interval") + 1]) if "--interval" in argv else 2.0
+        # --keep-awake (coordinator, Nov 16; Corey: the displays only sleep, and testing may keep them awake): this
+        # process holds ES_DISPLAY_REQUIRED, so Windows does not sleep them for idle time; Windows drops the hold when
+        # the gate kills this process at the end of the launch. The power plan is not changed.
+        if "--keep-awake" in argv:
+            kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED)
         import os
         if not os.path.exists(out):
             with open(out, "w", newline="") as f:
-                f.write("time,display,idleSeconds\r\n")
+                f.write("time,display,idleSeconds,displayRequired\r\n")
         while True:
             with open(out, "a", newline="") as f:
-                f.write(f"{time.strftime('%H:%M:%S')},{state()},{idle_seconds()}\r\n")
+                f.write(f"{time.strftime('%H:%M:%S')},{state()},{idle_seconds()},{int(display_required())}\r\n")
             time.sleep(interval)
     rec = wake() if cmd == "wake" else sleep() if cmd == "sleep" else {"display": state(), "idleSeconds": idle_seconds()}
     print(json.dumps(rec), flush=True)

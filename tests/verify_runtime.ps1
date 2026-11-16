@@ -322,8 +322,14 @@ function Get-DisplayDuring([string]$csv) {
     $rows = @(if (Test-Path -LiteralPath $csv) { Import-Csv -LiteralPath $csv })
     $off = @($rows | Where-Object display -ne 'on')
     [ordered]@{ samples = $rows.Count; awakeThroughout = ($rows.Count -gt 0 -and $off.Count -eq 0); notAwake = $off.Count
+                keptAwakeSamples = @($rows | Where-Object displayRequired -eq '1').Count
                 firstNotAwake = $(if ($off) { "$($off[0].time) $($off[0].display)" } else { $null })
                 maxIdleSeconds = $(if ($rows) { ($rows | ForEach-Object { [double]$_.idleSeconds } | Measure-Object -Maximum).Maximum } else { $null }) }
+}
+# True for a launch whose bench live steps put the displays to sleep on purpose (the awake / asleep proof): it must
+# not hold them awake.
+function Test-SleepsDisplays($spot) {
+    [bool]@($spot.bench.liveSteps | Where-Object { $_ -and $_.PSObject.Properties['display'] -and $_.display -eq 'asleep' }).Count
 }
 function Get-LaunchProblem($s) {
     $why = @((Get-CSpaceProblem $s.freeMB $MinCFreeMB), (Get-MemoryProblem $s $MinCommitRoomMB)) | Where-Object { $_ }
@@ -664,9 +670,12 @@ try {
             $mem = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
                 '-File', ('"' + (Join-Path $Runtime 'mem_sampler.ps1') + '"'), '-Out', ('"' + (Join-Path $spotDir 'memory.csv') + '"'))
             # Display state and time since the last input every 2 s (coordinator, Nov 16: a launch whose displays fall
-            # asleep halfway must be marked; manifest displayDuring.<launch>).
-            $disp = Start-Process $Py -WindowStyle Hidden -PassThru -ArgumentList @('-I', ('"' + (Join-Path $Runtime 'display.py') + '"'),
-                'watch', '--out', ('"' + (Join-Path $spotDir 'display.csv') + '"'))
+            # asleep halfway must be marked; manifest displayDuring.<launch>). The same process keeps the displays awake
+            # for the launch (ES_DISPLAY_REQUIRED, dropped by Windows when it is killed below), except in a launch whose
+            # live steps put them to sleep on purpose.
+            $keepAwake = -not (Test-SleepsDisplays $spot)
+            $disp = Start-Process $Py -WindowStyle Hidden -PassThru -ArgumentList (@('-I', ('"' + (Join-Path $Runtime 'display.py') + '"'),
+                'watch', '--out', ('"' + (Join-Path $spotDir 'display.csv') + '"')) + @(if ($keepAwake) { '--keep-awake' }))
             # The proxy appends its hitch list across launches (worker C, Nov 16): each launch starts it empty, and one
             # left from outside this run is kept beside this launch.
             if (Test-Path -LiteralPath $hitchList) { Move-Item -LiteralPath $hitchList (Join-Path $spotDir 'proxy_hitches_before_launch.txt') -Force }
@@ -735,12 +744,12 @@ try {
         } finally {
             foreach ($p in $smi, $mem, $disp) { if ($p) { try { if (-not $p.HasExited) { $p.Kill() } } catch { } } }
             if ($disp) { try {
-                $d = Get-DisplayDuring (Join-Path $spotDir 'display.csv')
+                $d = Get-DisplayDuring (Join-Path $spotDir 'display.csv'); $d.keepAwakeAsked = $keepAwake
                 $path = Join-Path $runDir 'manifest.json'; $man = Get-Content $path -Raw | ConvertFrom-Json
                 if (-not $man.PSObject.Properties['displayDuring']) { $man | Add-Member displayDuring ([pscustomobject]@{}) }
                 $man.displayDuring | Add-Member $run.dir ([pscustomobject]$d) -Force
                 $man | ConvertTo-Json -Depth 6 | Set-Content $path
-                Write-Step "$($run.dir): displays awake throughout: $($d.awakeThroughout) ($($d.samples) samples, $($d.notAwake) not awake$(if ($d.firstNotAwake) { ', first ' + $d.firstNotAwake }), longest without input $($d.maxIdleSeconds) s)"
+                Write-Step "$($run.dir): displays awake throughout: $($d.awakeThroughout) ($($d.samples) samples, $($d.notAwake) not awake$(if ($d.firstNotAwake) { ', first ' + $d.firstNotAwake }), longest without input $($d.maxIdleSeconds) s, kept awake by the gate in $($d.keptAwakeSamples) samples$(if (-not $keepAwake) { ', not asked: this launch sleeps them on purpose' }))"
             } catch { Write-Step "$($run.dir): display log not read: $($_.Exception.Message)" } }
             $smi = $null; $mem = $null; $disp = $null
             if ($run.variant) {   # back to the baseline before the next variant (the game is closed by now)
