@@ -55,11 +55,20 @@ Checks (thresholds in THRESHOLDS):
   goggles_dark_frame       on that same first rayTraced=true frame, mean luma / mean luma 10 ray-traced frames later
                            >= 0.4 (GUESS)
   flare_standins_off       when proxy.log says flare stand-ins 0, stray line stand-ins S must be 0
-  flare_unplaced_balls     stray line max unplaced stand-ins UM: 0 when skip unplaced SU=1, <= 15 (GUESS) when SU=0
+  flare_unplaced_balls     stray line max unplaced stand-ins UM: 0 when skip unplaced SU=1, <= 15 when SU=0 (measured
+                           live by worker B: 15 at con_custodial and con_bright_hall with SU=0, 0 with SU=1)
   flare_moving_balls       stray line max moving stand-ins MM: 0 when skip moving SM=1
+  flare_sam_gear_balls     stray line "on sam gear N (max M)": M must be 0 when the settings say skip sam gear 1; no
+                           limit with 0. Proxies before c78eb25 lack the field: NOT MEASURED
+  lights_weapon_flips      stray line "weapon flips W": 0 on every line when weapon by shape is 1 or 2; report only
+                           with 0. Proxies before fbe011f lack the field: NOT MEASURED
+  lights_recreated         stray line "recreated R": <= 2 per line when keep tracked 1 (GUESS); report only with 0.
+                           Proxies before fbe011f lack the field: NOT MEASURED
   lamps_without_flare      spot max of lamps without flare XM <= --reference spot max + 10 (GUESS)
-  lights_dimmed_linger     stray line max longest dim TM <= 600 frames (GUESS, ~10 s at 60 fps)
-  light_switchoff_lag      max time from downward brightness run start to stopped in lightpub_trace.csv <= 1.0 s (GUESS)
+  lights_dimmed_linger     report only (WARN above 600 frames, never FAIL): stray line max longest dim TM. It measures
+                           the game: guard rifle flashlights dim on their own (2060 frames at con_bright_hall)
+  light_switchoff_lag      report only (WARN above 1.0 s, never FAIL): longest downward brightness run before stopped
+                           in lightpub_trace.csv. It measures the game: a guard flashlight ran down 18.6 s
   pose                     the camera really went where it was told (proxy camera trace vs requested yaw/pitch)
   goggles                  each goggle mode toggled (proxy log) and looks the same with ray tracing on and off
                            (no missing geometry, no different picture)
@@ -110,10 +119,11 @@ THRESHOLDS = {
     "goggles_dark_min_ratio": 0.4,     # GUESS. Mean luma ratio vs 10 ray-traced frames later on toggle-off.
     "present_stalls_max": 0,           # d3d9_proxy_frames.csv col 3 > 50 ms in measured windows (excl. loads).
     "quit_present_max_ms": 1000.0,     # No proxy Present > 1000 ms in the last 10 s before Terminate.
-    "flare_unplaced_max_noskip": 15,   # GUESS. Max unplaced stand-in spheres when skip unplaced SU=0.
+    "flare_unplaced_max_noskip": 15,   # Measured live (worker B): 15 at both spots with SU=0, 0 with SU=1.
     "lamps_without_flare_margin": 10,  # GUESS. Max jump over --reference spot max XM.
-    "lights_dimmed_max_frames": 600,   # GUESS. ~10 s at 60 fps.
-    "light_switchoff_max_s": 1.0,      # GUESS. Seconds from downward brightness run to stopped.
+    "lights_dimmed_max_frames": 600,   # Report only: WARN above this. Game guard flashlights reach 2060.
+    "light_switchoff_max_s": 1.0,      # Report only: WARN above this. Game guard flashlights reach 18.6 s.
+    "lights_recreated_max_kept": 2,    # GUESS (worker B). Re-creates per stray line with keep tracked 1.
     "zero_normal_skinned_tris_max": 0,     # GUESS until first live run with new build.
     "zero_normal_instances_max": 0,        # GUESS until first live run with new build.
     "zero_normal_static_tris_max": 0,      # GUESS until first live run with new build.
@@ -745,6 +755,78 @@ def _parse_lightpub_log(path: str) -> list[tuple[tuple[int, int, int], int, int,
     return rows
 
 
+_LP_OPT_CFG = {"weapon_shape": re.compile(r"\bweapon by shape\s+(\d+)"),
+               "keep_tracked": re.compile(r"\bkeep tracked\s+(\d+)"),
+               "skip_sam_gear": re.compile(r"\bskip sam gear\s+(\d+)")}
+_LP_OPT_STRAY = {"sam_gear_max": re.compile(r"\bon sam gear\s+\d+\s+\(max\s+(\d+)\)"),
+                 "weapon_flips": re.compile(r"\bweapon flips\s+(\d+)"),
+                 "recreated": re.compile(r"\brecreated\s+(\d+)")}
+_LP_DIMMED_RE = re.compile(r"\bdimmed\s+\d+\s+\(max\s+(\d+)\)")
+S5_WHY = ("S5 report-only (game behaviour: guard rifle flashlights dim and brighten on their own; e.g. light 72977280 "
+          "at con_bright_hall stayed dimmed 2060 frames)")
+S5_THRESH = f"report only, WARN above {THRESHOLDS['lights_dimmed_max_frames']} frames"
+T1_WHY = ("T1 report-only (game behaviour: a guard flashlight fades over many frames before it stops; e.g. light "
+          "72976980 at con_bright_hall ran down 534 frames, 18.6 s, before it stopped)")
+T1_THRESH = f"report only, WARN above {THRESHOLDS['light_switchoff_max_s']:g} s"
+
+
+def _parse_lightpub_extras(path: str) -> list[dict]:
+    """Per stray line: frame plus the optional settings and stray fields of newer proxies (None when absent).
+    Settings come from the last settings line before the stray line ("enabled (", "settings reloaded (", "settings
+    reloaded after a missed notice (" all match _LP_CFG_RE)."""
+    cfg: dict | None = None
+    rows = []
+    for ln in read_lines(path):
+        if _LP_CFG_RE.search(ln):
+            cfg = {k: (int(m.group(1)) if (m := rx.search(ln)) else None) for k, rx in _LP_OPT_CFG.items()}
+            continue
+        m = _LP_STRAY_RE.search(ln)
+        if m and cfg is not None:
+            tail = ln[m.end():]
+            row = dict(cfg, frame=int(m.group(1)), dimmed_max=int(_LP_DIMMED_RE.search(ln).group(1)))
+            row.update({k: (int(mm.group(1)) if (mm := rx.search(tail)) else None) for k, rx in _LP_OPT_STRAY.items()})
+            rows.append(row)
+    return rows
+
+
+def _lightpub_field_checks(run: Run, extras: dict[str, list[dict]], log_src: str) -> None:
+    """S6 flare_sam_gear_balls, lights_weapon_flips and lights_recreated. A stray line or its settings line without
+    the field (an older proxy) makes the check NOT MEASURED."""
+    rows = [(n, r) for n, rs in extras.items() for r in rs]
+    specs = (
+        ("flare_sam_gear_balls", "skip_sam_gear", "sam_gear_max", "0 when skip sam gear 1, no limit with 0",
+         "c78eb25", lambda key, val: 0 if key == 1 else None),
+        ("lights_weapon_flips", "weapon_shape", "weapon_flips",
+         "0 per stray line when weapon by shape 1 or 2, report only with 0", "fbe011f",
+         lambda key, val: 0 if key >= 1 else None),
+        ("lights_recreated", "keep_tracked", "recreated",
+         f"<= {THRESHOLDS['lights_recreated_max_kept']} per stray line when keep tracked 1 (GUESS), report only with 0",
+         "fbe011f", lambda key, val: THRESHOLDS["lights_recreated_max_kept"] if key == 1 else None),
+    )
+    for check, key, field, thresh, since, limit_of in specs:
+        if not rows:
+            run.add(check, NOT_MEASURED, None, thresh, "no lightpub stray lines", log_src)
+            continue
+        old = sorted({n for n, r in rows if r[key] is None or r[field] is None})
+        if old:
+            run.add(check, NOT_MEASURED, None, thresh,
+                    f"proxy older than {since}: no '{field}' or '{key}' field on lightpub lines for: " + ", ".join(old),
+                    log_src)
+            continue
+        bad, limited, report = [], [], []
+        for n, r in rows:
+            lim = limit_of(r[key], r[field])
+            (limited if lim is not None else report).append(r[field])
+            if lim is not None and r[field] > lim:
+                bad.append(f"{n} frame {r['frame']} {field}={r[field]} ({key} {r[key]})")
+        worst = max(r[field] for _, r in rows)
+        detail = (f"limited lines: {len(limited)} (max {max(limited, default=0)}); "
+                  f"report-only lines: {len(report)} (max {max(report, default=0)}, total {sum(report)})")
+        if bad:
+            detail = f"{len(bad)} violation(s), first {bad[0]}; " + detail
+        run.add(check, FAIL if bad else PASS, worst, thresh, detail, log_src)
+
+
 def stop_all_ray_traced(spot: dict, w: dict) -> tuple[bool, str | None]:
     """(True, None) only when the stop has >= 1 telemetry frame and every frame has rayTraced=True;
     otherwise (False, reason) so picture checks fail closed as NOT MEASURED."""
@@ -937,6 +1019,7 @@ def lightpub_checks(run: Run, good: list[dict], reference: dict[str, dict] | Non
     log_src = "proxy.log (lightpub)"
     trace_src = "lightpub_trace.csv"
     parsed: dict[str, list[tuple[tuple[int, int, int], int, int, int, int, int, int]]] = {}
+    extras: dict[str, list[dict]] = {}
     missing_log = []
     for s in good:
         lp = _find_proxy_log(s)
@@ -945,18 +1028,19 @@ def lightpub_checks(run: Run, good: list[dict], reference: dict[str, dict] | Non
             missing_log.append(s["name"])
         else:
             parsed[s["name"]] = rows
+            extras[s["name"]] = _parse_lightpub_extras(lp)
+    _lightpub_field_checks(run, {} if (not good or missing_log) else extras, log_src)
 
     if not good or missing_log:
         msg = ("no spot ran far enough to judge" if not good
                else "missing lightpub stray/settings lines in proxy.log for: " + ", ".join(missing_log))
         run.add("flare_standins_off", NOT_MEASURED, None, "0 when flare stand-ins 0", msg, log_src)
         run.add("flare_unplaced_balls", NOT_MEASURED, None,
-                f"0 when SU=1, <= {THRESHOLDS['flare_unplaced_max_noskip']} when SU=0 (GUESS)", msg, log_src)
+                f"0 when SU=1, <= {THRESHOLDS['flare_unplaced_max_noskip']} when SU=0 (measured live)", msg, log_src)
         run.add("flare_moving_balls", NOT_MEASURED, None, "0 when SM=1", msg, log_src)
         run.add("lamps_without_flare", NOT_MEASURED, None,
                 f"<= reference + {THRESHOLDS['lamps_without_flare_margin']} (GUESS)", msg, log_src)
-        run.add("lights_dimmed_linger", NOT_MEASURED, None,
-                f"<= {THRESHOLDS['lights_dimmed_max_frames']} frames (GUESS)", msg, log_src)
+        run.add("lights_dimmed_linger", NOT_MEASURED, None, S5_THRESH, msg, log_src)
     else:
         all_rows = [(name, *row) for name, rows in parsed.items() for row in rows]
         # S1: flare_standins_off
@@ -972,7 +1056,7 @@ def lightpub_checks(run: Run, good: list[dict], reference: dict[str, dict] | Non
                   if UM > (0 if SU == 1 else noskip_lim)]
         worst_um = max(r[5] for r in all_rows)
         run.add("flare_unplaced_balls", PASS if not bad_s2 else FAIL, worst_um,
-                f"0 when SU=1, <= {noskip_lim} when SU=0 (GUESS)",
+                f"0 when SU=1, <= {noskip_lim} when SU=0 (measured live)",
                 f"worst max-unplaced UM={worst_um} ({len(bad_s2)} violation(s))", log_src)
 
         # S3: flare_moving_balls
@@ -1012,14 +1096,14 @@ def lightpub_checks(run: Run, good: list[dict], reference: dict[str, dict] | Non
                 run.add("lamps_without_flare", PASS if worst_jump <= margin else FAIL, worst_jump, thresh_s4,
                         detail, log_src)
 
-        # S5: lights_dimmed_linger
+        # S5: lights_dimmed_linger, report only (worker B, approved by the coordinator)
         worst_tm = max(r[7] for r in all_rows)
-        lim_tm = THRESHOLDS["lights_dimmed_max_frames"]
-        run.add("lights_dimmed_linger", PASS if worst_tm <= lim_tm else FAIL, worst_tm,
-                f"<= {lim_tm} frames (GUESS)", f"worst longest-dim max TM={worst_tm} frames", log_src)
+        worst_dm = max(r["dimmed_max"] for rs in extras.values() for r in rs)
+        run.add("lights_dimmed_linger", PASS if worst_tm <= THRESHOLDS["lights_dimmed_max_frames"] else WARN,
+                worst_tm, S5_THRESH, f"{S5_WHY}: longest dim {worst_tm} frames, dimmed {worst_dm}", log_src)
 
-    # T1: light_switchoff_lag from lightpub_trace.csv
-    t1_thresh = f"<= {THRESHOLDS['light_switchoff_max_s']:g} s (GUESS)"
+    # T1: light_switchoff_lag from lightpub_trace.csv, report only (worker B, approved by the coordinator)
+    t1_thresh = T1_THRESH
     if not good:
         run.add("light_switchoff_lag", NOT_MEASURED, None, t1_thresh, "no spot ran far enough to judge", trace_src)
         return
@@ -1079,9 +1163,10 @@ def lightpub_checks(run: Run, good: list[dict], reference: dict[str, dict] | Non
         run.add("light_switchoff_lag", PASS, 0.0, t1_thresh, "0 stopped events in lightpub_trace.csv", trace_src)
     else:
         worst_s, worst_fr, w_spot, w_id = max(lags, key=lambda x: x[0])
-        run.add("light_switchoff_lag", PASS if worst_s <= THRESHOLDS["light_switchoff_max_s"] else FAIL,
+        run.add("light_switchoff_lag", PASS if worst_s <= THRESHOLDS["light_switchoff_max_s"] else WARN,
                 round(worst_s, 3), t1_thresh,
-                f"worst {worst_s:.2f} s ({worst_fr} frames) at {w_spot} id={w_id} ({len(lags)} stopped event(s))",
+                f"{T1_WHY}: longest downward run {worst_fr} frames ({worst_s:.2f} s) at {w_spot} id={w_id} "
+                f"({len(lags)} stopped event(s))",
                 trace_src)
 
 

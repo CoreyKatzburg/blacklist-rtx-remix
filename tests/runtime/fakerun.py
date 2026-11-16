@@ -335,13 +335,27 @@ class Builder:
         mm_val = 3 if self.case == "moving_balls" else 0
         xm_val = 80 if self.case == "lamps_no_flare_jump" else 59
         tm_val = 700 if self.case == "dimmed_linger" else 10
+        # Worker B's newer fields (c78eb25, fbe011f): key values in the settings line, totals on the stray line.
+        shape, keep, gear_skip = LP_KEYS.get(self.case, (0, 0, 1))
+        gear, flips, recreated = LP_COUNTS.get(self.case, (0, 0, 0))
+        new_cfg = f"weapon by shape {shape}, keep tracked {keep}, skip sam gear {gear_skip}, "
+        new_tail = f" on sam gear {gear} (max {gear}) weapon flips {flips} recreated {recreated}"
+        if self.case == "old_lightpub_format":       # proxy before c78eb25: none of the new fields
+            new_cfg, new_tail = "", ""
         plog = (
             "lightpub: loaded (scale 1, sun 1, fill 1, max 20, flare stand-ins 0, trace 1, "
-            "stand-in skip unplaced 1, skip moving 1)\n"
+            f"{new_cfg}stand-in skip unplaced 1, skip moving 1)\n"
             f"lightpub: stray frame 120 lamps 120 without flare {xm_val} (max {xm_val}) flares 61 "
             f"stand-ins {s_val} on unplaced {um_val} (max {um_val}) on moving {mm_val} (max {mm_val}) "
-            f"dimmed 2 (max 2) longest dim {tm_val} frames (max {tm_val})\n"
+            f"dimmed 2 (max 2) longest dim {tm_val} frames (max {tm_val}){new_tail}\n"
         )
+        if self.case == "lightpub_missed_notice":   # a later reload turns skip sam gear on; the next line breaks it
+            plog += ("lightpub: settings reloaded after a missed notice (scale 1, sun 1, fill 1, max 20, flare "
+                     "stand-ins 0, trace 1, weapon by shape 0, keep tracked 0, skip sam gear 1, stand-in skip "
+                     "unplaced 1, skip moving 1)\n"
+                     "lightpub: stray frame 720 lamps 120 without flare 59 (max 59) flares 61 stand-ins 0 on "
+                     "unplaced 0 (max 0) on moving 0 (max 0) dimmed 2 (max 2) longest dim 10 frames (max 10) "
+                     "on sam gear 4 (max 4) weapon flips 0 recreated 0\n")
         gate.save_text(os.path.join(self.dir, "proxy.log"), plog)
         trows = ["frame,node,id,change,old,new", "100,0x1,1,started,0.0,100.0"]
         if self.case == "switchoff_lag":
@@ -354,6 +368,15 @@ class Builder:
             trows.append("130,0x1,1,stopped,100.0,0")
         gate.save_text(os.path.join(self.dir, "lightpub_trace.csv"), "\n".join(trows) + "\n")
         gate.save_json(os.path.join(self.dir, "spot.json"), spot)
+
+
+# case -> (weapon by shape, keep tracked, skip sam gear) and (on sam gear max, weapon flips, recreated) in proxy.log;
+# other cases get (0, 0, 1) and (0, 0, 0)
+LP_KEYS = {"sam_gear_noskip": (0, 0, 0), "weapon_flips_shape1": (1, 0, 1), "weapon_flips_shape2": (2, 0, 1),
+           "recreated_kept_40": (0, 1, 1), "recreated_kept_1": (0, 1, 1)}
+LP_COUNTS = {"sam_gear_skip_ignored": (11, 0, 0), "sam_gear_noskip": (11, 0, 0), "weapon_flips_shape1": (0, 3, 0),
+             "weapon_flips_shape2": (0, 3, 0), "weapon_flips_shape0": (0, 3, 0), "recreated_kept_40": (0, 0, 40),
+             "recreated_kept_1": (0, 0, 1), "recreated_untracked_150": (0, 0, 150)}
 
 
 # checks that read telemetry the recorder writes per frame: NOT MEASURED whenever that telemetry is missing
@@ -471,13 +494,24 @@ CASES = {
                                     "outline_overlap", "pose", "goggles", "goggles_toggle_rebuilds",
                                     "goggles_dark_frame", "flare_standins_off", "flare_unplaced_balls",
                                     "flare_moving_balls", "lamps_without_flare", "lights_dimmed_linger",
-                                    "light_switchoff_lag", *_ZERO_NORMALS, *RECORDER, "clean_quit")),
+                                    "light_switchoff_lag", "flare_sam_gear_balls", "lights_weapon_flips",
+                                    "lights_recreated", *_ZERO_NORMALS, *RECORDER, "clean_quit")),
     "standins_ignored": (("flare_standins_off",), ()),
     "unplaced_balls": (("flare_unplaced_balls",), ()),
     "moving_balls": (("flare_moving_balls",), ()),
     "lamps_no_flare_jump": (("lamps_without_flare",), ()),
-    "dimmed_linger": (("lights_dimmed_linger",), ()),
-    "switchoff_lag": (("light_switchoff_lag",), ()),
+    "dimmed_linger": ((), ()),                    # WARN lights_dimmed_linger: report only, the game dims lights
+    "switchoff_lag": ((), ()),                    # WARN light_switchoff_lag: report only, the game fades lights
+    "sam_gear_skip_ignored": (("flare_sam_gear_balls",), ()),   # skip sam gear 1, on sam gear max 11
+    "sam_gear_noskip": ((), ()),                                # skip sam gear 0, max 11: no limit
+    "lightpub_missed_notice": (("flare_sam_gear_balls",), ()),  # reload "after a missed notice" sets skip 1
+    "weapon_flips_shape1": (("lights_weapon_flips",), ()),      # weapon by shape 1, 3 flips
+    "weapon_flips_shape2": (("lights_weapon_flips",), ()),      # weapon by shape 2 (4d7cb45), 3 flips
+    "weapon_flips_shape0": ((), ()),                            # weapon by shape 0, 3 flips: report only
+    "recreated_kept_40": (("lights_recreated",), ()),           # keep tracked 1, 40 re-creates
+    "recreated_kept_1": ((), ()),                               # keep tracked 1, 1 re-create: under 2
+    "recreated_untracked_150": ((), ()),                        # keep tracked 0, 150: report only
+    "old_lightpub_format": ((), ("flare_sam_gear_balls", "lights_weapon_flips", "lights_recreated")),
     "untimed_steps": (("step_timing",), ()),          # every 5th still frame: a step with no timing
     "child_over_parent": (("step_timing",), ()),      # a nested step 1.0 ms longer than its parent
     "child_timer_jitter": ((), ()),                   # 0.4 ms over its parent: inside the tolerance
@@ -495,7 +529,8 @@ CASES = {
 WARNS = {"low_fps": ("min_median_fps",), "near_target_fps": ("min_median_fps",),
          "near_target_89_996": ("min_median_fps",), "never_ray_traced": ("min_median_fps",),
          "never_rt_no_compiles": ("min_median_fps",),
-         "high_latency": ("min_median_fps",), "fps_regression": ("min_median_fps",)}
+         "high_latency": ("min_median_fps",), "fps_regression": ("min_median_fps",),
+         "dimmed_linger": ("lights_dimmed_linger",), "switchoff_lag": ("light_switchoff_lag",)}
 PREVIOUS = {"fps_regression", "fps_drop_9pct"}    # judged against a previous run: the healthy 100 FPS run
 NO_REFERENCE = {"no_reference"}                  # run without --reference
 
