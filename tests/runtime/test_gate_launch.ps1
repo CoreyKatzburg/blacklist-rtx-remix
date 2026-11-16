@@ -4,7 +4,7 @@
 param([string]$Gate = (Join-Path (Split-Path $PSScriptRoot) 'verify_runtime.ps1'))
 $ErrorActionPreference = 'Stop'
 $ast = [Management.Automation.Language.Parser]::ParseFile($Gate, [ref]$null, [ref]$null)
-foreach ($n in 'Remove-OwnPlayLock', 'Wait-RestartedGame', 'Get-DisplayProblem') {
+foreach ($n in 'Remove-OwnPlayLock', 'Wait-RestartedGame', 'Get-DisplayProblem', 'Test-LaunchDead') {
     $f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true) | Select-Object -First 1
     if (-not $f) { throw "missing $n" }
     . ([scriptblock]::Create($f.Extent.Text))
@@ -50,6 +50,17 @@ Check 'all monitors off: refused' ([bool](Get-DisplayProblem $off))
 Check 'no monitors listed: refused' ([bool](Get-DisplayProblem @()))
 $on = @($off[0], [pscustomobject]@{ InstanceId = 'DISPLAY\HKC2731'; Present = $true })
 Check 'one monitor on: allowed' ($null -eq (Get-DisplayProblem $on))
+# Dead start (Nov 16 10:11): launcher and Ubisoft Connect run, then both exit with no game. Each case is one poll per
+# second, the seconds the starter ran, and the first second the start may count as dead (0: never).
+function FirstDead([int[]]$runningAt, [int]$until) {
+    $w = @{ seen = $false; goneAt = $null }
+    foreach ($s in 0..$until) { if (Test-LaunchDead $w ($s -in $runningAt) $s) { return $s } }
+    0
+}
+Check 'starter exits at 11 s: dead 20 s later, not sooner' ((FirstDead (0..10) 120) -eq 31)
+Check 'starter runs until the game: never dead' ((FirstDead (0..120) 120) -eq 0)
+Check 'starter not seen yet (slow Steam): never dead' ((FirstDead @() 120) -eq 0)
+Check 'starter back after a gap: the gap is forgotten' ((FirstDead (@(0..10) + @(20..24)) 120) -eq 45)
 "failures $fail"
 exit [int]($fail -gt 0)
 

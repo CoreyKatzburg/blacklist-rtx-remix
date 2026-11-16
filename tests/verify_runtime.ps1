@@ -280,6 +280,17 @@ function Test-LevelLive($id) {
     $false
 }
 
+# Ubisoft Connect can die while it starts the game: on Nov 16 at 10:11 and 10:17 it logged "FATAL Cannot switch
+# modes after logging in" and exited, Steam's launcher exited too, and no game came. A new Steam request at 10:22
+# worked. True once that start has been dead for $grace seconds: the launcher or Ubisoft Connect ($starterRunning)
+# was seen, and none of them has run since. $watch is @{ seen; goneAt }, kept by the caller between polls.
+function Test-LaunchDead($watch, [bool]$starterRunning, [double]$now, [double]$grace = 20) {
+    if ($starterRunning) { $watch.seen = $true; $watch.goneAt = $null; return $false }
+    if (-not $watch.seen) { return $false }
+    if ($null -eq $watch.goneAt) { $watch.goneAt = $now }
+    ($now - $watch.goneAt) -ge $grace
+}
+
 # Steam -> launcher -> game; then Space, Space, Enter (title, "press any key", "resume at checkpoint") until
 # Test-LevelLive says a level is rendering. Never Esc (quits from menus).
 function Start-GameAtCheckpoint {
@@ -293,12 +304,23 @@ function Start-GameAtCheckpoint {
             -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $Setup 'Play_Blacklist_with_Remix.ps1')`"", '-NoPause'
     } finally { $env:PSModulePath = $savedModulePath }
     $t = [Diagnostics.Stopwatch]::StartNew(); $loginTried = $false
+    $asked = [Diagnostics.Stopwatch]::StartNew(); $watch = @{ seen = $false; goneAt = $null }; $asks = 0
     while (-not ($game = Get-Process Blacklist_game -ErrorAction SilentlyContinue | Select-Object -First 1)) {
         if ($script:PlayProcess.HasExited) {
             throw "The Play script exited ($($script:PlayProcess.ExitCode)) before the game started: " +
                 ((@(Get-Content $playLog, "$playLog.err" -ErrorAction SilentlyContinue) | Select-Object -Last 3) -join ' | ')
         }
-        if ($t.Elapsed.TotalSeconds -gt 300) { throw 'The game did not start within 5 minutes.' }
+        $starter = [bool](Get-Process Blacklist_Launcher, upc, UbisoftGameLauncher -ErrorAction SilentlyContinue)
+        if (Test-LaunchDead $watch $starter $t.Elapsed.TotalSeconds) {
+            $fatal = @(Get-Content 'D:\Ubisoft\Ubisoft Game Launcher\logs\launcher_log.txt' -Tail 300 -ErrorAction SilentlyContinue |
+                       Where-Object { $_ -match '\bFATAL\b' }) | Select-Object -Last 1
+            $why = "the launcher and Ubisoft Connect exited without starting the game ($(if ($fatal) { ($fatal -replace '\s+', ' ').Trim() } else { 'no FATAL line in launcher_log.txt' }))"
+            if ($asks -ge 2) { throw "The game did not start: $why, after $asks repeated Steam requests." }
+            $asks++; $watch.seen = $false; $watch.goneAt = $null; $asked.Restart()
+            Write-Step "$why; asking Steam again ($asks of 2)."
+            Start-Process $SteamGameUrl
+        }
+        if ($asked.Elapsed.TotalSeconds -gt 300) { throw 'The game did not start within 5 minutes.' }
         if (-not $loginTried -and $t.Elapsed.TotalSeconds -gt 60 -and (Get-Process UbisoftGameLauncher -ErrorAction SilentlyContinue)) {
             $loginTried = $true
             & (Join-Path (Split-Path $Tests) 'stutter-recorder\ubi_login.ps1') | Out-Null   # password from 1Password, never printed
