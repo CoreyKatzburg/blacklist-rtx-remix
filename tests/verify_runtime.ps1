@@ -269,7 +269,16 @@ function Start-GameAtCheckpoint {
     Start-Sleep 12; $k = 0
     while (-not (Test-LevelLive $game.Id)) {
         if ($t.Elapsed.TotalSeconds -gt 480) { throw 'The game did not reach the level within 8 minutes.' }
-        if ($game.HasExited) { throw 'The game exited while loading.' }
+        if ($game.HasExited) {
+            # The next launch overwrites the Remix and bridge logs: keep them (Nov 16 07:07, a launch died inside
+            # CreateDevice and nothing showed why).
+            $keep = Join-Path $runDir "load-failure-$($game.Id)"
+            New-Item -ItemType Directory -Force $keep | Out-Null
+            Copy-Item "$S\rtx-remix\logs\*.log" $keep -ErrorAction SilentlyContinue
+            Get-Content $log -Tail 20000 -ErrorAction SilentlyContinue | Where-Object { $_ -match "\[pid $($game.Id)\]" } |
+                Set-Content (Join-Path $keep 'd3d9_proxy.log')
+            throw "The game exited while loading (logs in $keep)."
+        }
         # Only a bridge started after this game counts: on Nov 16 a bridge from elsewhere stopped con_bright_hall
         # although the proxy log showed the game chained the Windows d3d9.
         $bridge = Get-Process NvRemixBridge -ErrorAction SilentlyContinue | Where-Object { $_.StartTime -ge $game.StartTime } | Select-Object -First 1
