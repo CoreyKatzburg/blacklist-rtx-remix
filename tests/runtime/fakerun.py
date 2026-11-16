@@ -50,6 +50,7 @@ def view(yaw: float, pitch: float, rng) -> np.ndarray:
 # case -> (frame time ms, GPU time ms) for every frame. Healthy runs are 10 ms and 8 ms: 100 FPS, CPU wait 2 ms.
 FRAME_TIMES = {
     "low_fps": (14.0, 12.0),           # 71 FPS: WARN under the 90 target, the gate still passes
+    "near_target_fps": (1000.0 / 89.96, 8.0),  # 89.96 FPS: WARN, must print "89.96 FPS" not "90.0 FPS"
     "high_latency": (17.5, 9.0),       # 57 FPS, CPU wait 8.5 ms -> fails latency_overhead_ms
     "fps_regression": (11.8, 8.0),     # 84.7 FPS: 15% below the 100 FPS previous run: FAIL
     "fps_drop_9pct": (10.98, 8.0),     # 91 FPS: 9% below the previous run: passes
@@ -83,9 +84,13 @@ class Builder:
                                "InjectRTX/Ray Reconstruction/Prepare DLSS": [0.3, 0.02, 1]}})
         c = self.case
         if c == "nan_frame" and kind == "still" and i == 3: rec["thumbNonFinite"] = 40
-        if c == "slow_frame" and kind == "pan" and i == 30: rec["frameTimeMs"] = 61.0
-        loading = (c == "loading_in_window" and wname == "to_y45_p0" and i in (2, 3))
-        if loading: rec["frameTimeMs"] = 120.0
+        if c in ("slow_frame", "noremix_scenedraws0") and kind == "pan" and i == 30: rec["frameTimeMs"] = 120.0 if c == "noremix_scenedraws0" else 61.0
+        if c == "missing_cam_col" and wname == "to_y45_p0" and i == 2: rec["frameTimeMs"] = 120.0
+        if c == "load_count_mismatch" and wname == "to_y45_p0" and i in (0, 1): rec["frameTimeMs"] = 120.0
+        if c == "slow_beside_nonload" and wname == "to_y45_p0" and i == 0: rec["frameTimeMs"] = 120.0
+        loading = ((c == "loading_in_window" and wname == "to_y45_p0" and i in (2, 3))
+                   or (c in ("load_count_mismatch", "slow_beside_nonload") and wname == "to_y45_p0" and i == 0))
+        if c == "loading_in_window" and loading: rec["frameTimeMs"] = 120.0
         if c in FRAME_TIMES: rec["frameTimeMs"], rec["gpuTimeMs"] = FRAME_TIMES[c]
         if c == "no_skinned" and kind == "still" and i == 3: rec["skinnedInstances"] = 0
         if c == "blas_rebuild" and kind == "pan" and i == 50: rec["staticBlasRebuilds"] = 1
@@ -120,11 +125,15 @@ class Builder:
         if loading:
             self.proxy.append(f"{self.pframe},1.0,1.6,0.5,29,0,")
             self.pgate.append(f"{self.pframe},0,0,0,0,1")
+        elif c == "missing_cam_col" and wname == "to_y45_p0" and i == 2:
+            self.proxy.append(f"{self.pframe},1.0,14.0,0.5,1500,1")  # 6 columns: no camera column -> unknown
+            self.pgate.append(f"{self.pframe},1400,40,1,{1 if goggles else 0},1")
         else:
             fx, fy, fz = math.cos(cp) * math.cos(cy), math.cos(cp) * math.sin(cy), math.sin(cp)
             self.proxy.append(f"{self.pframe},1.0,14.0,0.5,1500,1,P:22:0:1.0:2.0:3.0:{fx:.5f}:{fy:.5f}:{fz:.5f}:0.0")
             handoff = 0 if (c == "raster_flash" and kind == "pan" and i == 70) else 1
-            self.pgate.append(f"{self.pframe},1400,40,{handoff},{1 if goggles else 0},1")
+            sdraws = 0 if c == "noremix_scenedraws0" else 1400
+            self.pgate.append(f"{self.pframe},{sdraws},40,{handoff},{1 if goggles else 0},1")
         return img
 
     def window(self, name: str, kind: str, n: int, extra=None, goggles=False, motion=None):
@@ -134,6 +143,14 @@ class Builder:
             if motion:
                 motion(i / max(1, n - 1))
             imgs.append(self.frame(kind, name, i, goggles))
+        if self.case == "load_count_mismatch" and name == "to_y45_p0":
+            self.tframe += 1
+            rec = dict(self.telemetry[-1], frame=self.tframe, frameTimeMs=10.0)
+            self.telemetry.append(rec)
+        if self.case == "slow_beside_nonload" and name == "to_y45_p0":
+            self.pframe += 1
+            self.proxy.append(f"{self.pframe}," + self.proxy[-1].split(",", 1)[1])
+            self.pgate.append(f"{self.pframe}," + self.pgate[-1].split(",", 1)[1])
         w = {"name": name, "kind": kind, "yaw": self.yaw, "pitch": self.pitch,
              "telemetry": [start[0], self.tframe], "proxy": [start[1], self.pframe], **(extra or {})}
         self.windows.append(w)
@@ -230,6 +247,8 @@ class Builder:
         if self.case == "half_rate_capture":
             for r in self.telemetry:
                 r.pop("lumaThumb", None)
+        if self.case == "cut_short_proxy":
+            self.proxy.append(f"{self.pframe + 1},1.0,14.0")
         gate.save_text(os.path.join(self.dir, "telemetry.jsonl"), "".join(json.dumps(r) + "\n" for r in self.telemetry))
         gate.save_text(os.path.join(self.dir, "proxy_frames.csv"), "\n".join(self.proxy) + "\n")
         gate.save_text(os.path.join(self.dir, "proxy_gate.csv"), "\n".join(self.pgate) + "\n")
@@ -259,7 +278,13 @@ CASES = {
     "blas_rebuild": (("static_blas_rebuilds",), ()),
     "slow_frame": (("frames_over_50ms",), ()),
     "loading_in_window": ((), ()),                        # >50 ms frames during a loading screen are excluded: passes
+    "missing_cam_col": (("frames_over_50ms",), ()),       # 6-column proxy row (no camera column) is unknown -> fails
+    "cut_short_proxy": ((), ()),                          # last proxy row cut short mid-write: finishes and passes
+    "load_count_mismatch": (("frames_over_50ms",), ()),   # 7 tel vs 6 proxy: 1 loading frame excuses only t0, t1 fails
+    "slow_beside_nonload": (("frames_over_50ms",), ()),   # 6 tel vs 7 proxy: t0 maps to [load, nonload] -> fails
+    "noremix_scenedraws0": (("frames_over_50ms",), ()),   # noRemix=True: sceneDraws=0 ignored, real camera + 120ms -> fails
     "low_fps": ((), ()),                                # WARN min_median_fps (WARNS); the gate passes
+    "near_target_fps": ((), ()),                        # 89.96 FPS: WARN, must print 89.96 FPS not 90.0 FPS
     "high_latency": (("latency_overhead_ms",), ()),
     "lag_within_margin": ((), ()),                      # +5 ms over the reference: the margin's edge still passes
     "lag_over_margin": (("input_latency_ms",), ()),     # +5.5 ms over the reference
@@ -304,7 +329,8 @@ CASES = {
 
 
 # case -> checks that must WARN (shown in the result; the gate still passes)
-WARNS = {"low_fps": ("min_median_fps",), "high_latency": ("min_median_fps",), "fps_regression": ("min_median_fps",)}
+WARNS = {"low_fps": ("min_median_fps",), "near_target_fps": ("min_median_fps",),
+         "high_latency": ("min_median_fps",), "fps_regression": ("min_median_fps",)}
 PREVIOUS = {"fps_regression", "fps_drop_9pct"}    # judged against a previous run: the healthy 100 FPS run
 NO_REFERENCE = {"no_reference"}                  # run without --reference
 
@@ -314,7 +340,10 @@ def make_run(folder: str, case: str) -> str:
     shutil.rmtree(run, ignore_errors=True)
     os.makedirs(run)
     Builder(run, "s1", case).build()
-    gate.save_json(os.path.join(run, "manifest.json"), {"spots": ["s1"], "fake": case})
+    manifest = {"spots": ["s1"], "fake": case}
+    if case == "noremix_scenedraws0":
+        manifest["noRemix"] = True
+    gate.save_json(os.path.join(run, "manifest.json"), manifest)
     return run
 
 

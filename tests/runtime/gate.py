@@ -336,9 +336,12 @@ def camera_angles(row: list[str]) -> tuple[float, float] | None:
 
 
 def is_zero_or_empty_camera(row: list[str]) -> bool:
-    """True when a d3d9_proxy_frames.csv row has no published camera or only an all-zero (0, 0, 0) camera
-    (the loading-screen signature observed in d3d9_proxy_frames.csv)."""
-    if len(row) < 7 or not row[6]:
+    """True when a 7-column d3d9_proxy_frames.csv row has an empty camera column or only an all-zero (0, 0, 0)
+    camera (the loading-screen signature observed in d3d9_proxy_frames.csv). A short row (< 7 columns) is unknown
+    and returns False (never excuses a hitch)."""
+    if len(row) < 7:
+        return False
+    if not row[6]:
         return True
     unskipped = [p for p in (pub.split(":") for pub in row[6].split("|")) if len(p) >= 9 and p[2] == "0"]
     if not unskipped:
@@ -346,21 +349,29 @@ def is_zero_or_empty_camera(row: list[str]) -> bool:
     return all(abs(float(p[3])) < 1e-6 and abs(float(p[4])) < 1e-6 and abs(float(p[5])) < 1e-6 for p in unskipped)
 
 
-def is_loading_frame(spot: dict, w: dict, idx: int, n_tids: int) -> bool:
-    """True when the proxy frame corresponding to telemetry index `idx` in window `w` is a loading-screen frame
-    (sceneDraws == 0 in proxy_gate.csv, or empty/all-zero camera in proxy_frames.csv). Fails closed (False) if proxy
-    data for that frame is missing."""
-    pids = frames_in(w, "proxy")
-    if not pids:
-        return False
-    pf = pids[idx] if len(pids) == n_tids else pids[min(len(pids) - 1, idx * len(pids) // max(1, n_tids))]
-    pg = spot["_data"]["pgate"]
-    if pf in pg and len(pg[pf]) >= 2 and int(pg[pf][1]) == 0:
-        return True
+def is_proxy_loading(spot: dict, pf: int, no_remix: bool = False) -> bool:
+    """True when proxy frame `pf` explicitly shows a loading screen. In no-Remix runs, proxy sceneDraws is always 0,
+    so only the camera rule is used. Fails closed (False) if data for `pf` is missing or short."""
+    if not no_remix:
+        pg = spot["_data"]["pgate"]
+        if pf in pg and len(pg[pf]) >= 2 and int(pg[pf][1]) == 0:
+            return True
     prx = spot["_data"]["proxy"]
     if pf in prx and is_zero_or_empty_camera(prx[pf]):
         return True
     return False
+
+
+def is_loading_frame(spot: dict, w: dict, idx: int, n_tids: int, no_remix: bool = False) -> bool:
+    """True when every proxy frame that telemetry index `idx` in window `w` could map to is a loading-screen frame.
+    Fails closed (False) if proxy data is missing."""
+    pids = frames_in(w, "proxy")
+    if not pids:
+        return False
+    m = len(pids)
+    lo = max(0, min(idx, idx + m - n_tids))
+    hi = min(m - 1, max(idx, idx + m - n_tids))
+    return all(is_proxy_loading(spot, pids[j], no_remix=no_remix) for j in range(lo, hi + 1))
 
 
 def wrap(deg: float) -> float:
@@ -475,7 +486,7 @@ def recorder_checks(run: Run, pick, good: list[dict], tsrc: str) -> None:
         if not (pids and all(f in prx for f in pids) and all(isinstance(tel.get(f, {}).get("skips"), dict) for f in tids)):
             missing += 1
             continue
-        draws = sum(float(prx[f][4]) for f in pids)
+        draws = sum(float(prx[f][4]) for f in pids if len(prx[f]) > 4)
         skips: dict[str, float] = {}
         for f in tids:
             for reason, n in tel[f]["skips"].items():
@@ -681,6 +692,7 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
         value, ok = judge(vals)
         run.add(name, PASS if ok else bad, value, threshold, describe(value, want), tsrc)
 
+    no_remix = bool(run.manifest.get("noRemix"))
     measured_pairs = pick(MEASURED)
     if not measured_pairs:
         run.add("frames_over_50ms", NOT_MEASURED, None, "0", "no windows of this kind were run", tsrc)
@@ -697,7 +709,7 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
                 tids = frames_in(w, "telemetry")
                 for idx, tf in enumerate(tids):
                     if tel[tf]["frameTimeMs"] > 50.0:
-                        if is_loading_frame(s, w, idx, len(tids)):
+                        if is_loading_frame(s, w, idx, len(tids), no_remix=no_remix):
                             excluded_load += 1
                         else:
                             over_nonload += 1
@@ -715,12 +727,24 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
     telemetry_check("nonfinite_thumb_pixels", pick(SCENE), "thumbNonFinite",
                     lambda v: (sum(v), sum(v) == 0),
                     "0", lambda v, n: f"{v} NaN or infinite thumbnail pixels in {n} scene frames")
-    telemetry_check("min_median_fps", pick(SCENE), "frameTimeMs",
-                    lambda v: (round(1000.0 / max(float(np.median(v)), 1e-3), 2),
-                               1000.0 / max(float(np.median(v)), 1e-3) >= THRESHOLDS["min_median_fps"]),
+    def fmt_fps(raw: float, target: float) -> str:
+        if abs(raw - target) >= 0.1:
+            return f"{raw:.1f}"
+        for d in (2, 3, 4):
+            s = f"{raw:.{d}f}"
+            if (raw < target and float(s) < target) or raw >= target:
+                return s
+        return f"{raw:.4f}"
+
+    def judge_fps(vals: list[float]) -> tuple[float, bool]:
+        raw = 1000.0 / max(float(np.median(vals)), 1e-3)
+        return round(raw, 2), raw >= THRESHOLDS["min_median_fps"]
+
+    telemetry_check("min_median_fps", pick(SCENE), "frameTimeMs", judge_fps,
                     f">= {THRESHOLDS['min_median_fps']:g} FPS (goal, WARN below)",
-                    lambda v, n: f"median {v:.1f} FPS, target is at or above {THRESHOLDS['min_median_fps']:g} FPS "
-                                 f"({n} scene frames)", bad=WARN)
+                    lambda v, n: f"median {fmt_fps(v, THRESHOLDS['min_median_fps'])} FPS, "
+                                 f"target is at or above {THRESHOLDS['min_median_fps']:g} FPS ({n} scene frames)",
+                    bad=WARN)
     fps_regression_check(run, good, prev_spots)
 
     # Latency checks & Top 10 Latency Contributors breakdown

@@ -123,6 +123,8 @@ class MathTest(unittest.TestCase):
             self.assertTrue(any("not JSON" in x for x in problems))
 
     def test_is_zero_or_empty_camera(self):
+        self.assertFalse(gate.is_zero_or_empty_camera(["0", "1.0", "1.6", "0.5", "3", "0"]))  # 6 cols -> unknown
+        self.assertFalse(gate.is_zero_or_empty_camera(["0", "1.0"]))                            # cut-short -> unknown
         self.assertTrue(gate.is_zero_or_empty_camera(["0", "1.0", "1.6", "0.5", "3", "0", ""]))
         self.assertTrue(gate.is_zero_or_empty_camera(["545", "1.0", "1.6", "0.5", "29", "3",
                                                       "G:0:0:-0.000:-0.000:-0.000:1.0:0.0:0.0:0.0"]))
@@ -173,6 +175,13 @@ class FakeRunTest(unittest.TestCase):
                         md = read(os.path.join(t, case, "result.md"))
                         self.assertIn("## Top 10 Latency Contributors", md)
                         self.assertGreaterEqual(len(result.get("latencyContributors", [])), 4)
+                    if case == "near_target_fps":
+                        fps_check = next(c for c in result["checks"] if c["check"] == "min_median_fps")
+                        self.assertIn("89.96 FPS", fps_check["detail"])
+                    if case == "load_count_mismatch":
+                        hitch = next(c for c in result["checks"] if c["check"] == "frames_over_50ms")
+                        self.assertEqual(hitch["value"], 1)
+                        self.assertIn("1 loading-screen frames excluded", hitch["detail"])
 
     def test_missing_spot_folder_fails(self):
         with tempfile.TemporaryDirectory() as t:
