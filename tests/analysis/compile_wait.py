@@ -16,6 +16,10 @@ Table (no files: every telemetry*.jsonl / rtx_telemetry*.jsonl under --root, ide
   waitS           seconds of frames in the compile-wait signature
   waitPreRtS      of those, seconds before the first ray-traced frame
   midWaitS        of those, seconds after ray tracing had started (shaders compiled mid-session)
+  preRtComp       most Remix pipelines in flight (remixShaderCompiles) before the first ray-traced frame, or over
+                  the whole launch if it never ray traced; - when the recorder predates the field. Above 0 proves
+                  the wait was Remix compiling; 0 with wait time means the signature caught something else, such
+                  as a loading screen paced near 30 FPS.
   verdict         STUCK       never ray traced, >= --stuck-s of wait
                   NEVER_RT    never ray traced, little wait (ray tracing never switched on)
                   MID_WAIT    ray traced, but has wait frames after ray tracing started
@@ -46,10 +50,11 @@ INFERRED_RT_GPU_MS = 15.0
 FRAME = re.compile(rb'"frame":(\d+)')
 FT = re.compile(rb'"frameTimeMs":([-\d.]+),"gpuTimeMs":([-\d.]+)')
 RT = re.compile(rb'"rayTraced":(true|false)')
+COMPILES = re.compile(rb'"remixShaderCompiles":(\d+)')
 
 
 def frames_of(path):
-    """Yields (frame, frameTimeMs, gpuTimeMs, rayTraced or None) per telemetry line."""
+    """Yields (frame, frameTimeMs, gpuTimeMs, rayTraced or None, remixShaderCompiles or None) per telemetry line."""
     with open(path, "rb") as f:
         for line in f:
             m = FT.search(line)
@@ -57,8 +62,9 @@ def frames_of(path):
                 continue
             fr = FRAME.search(line)
             r = RT.search(line)
+            c = COMPILES.search(line)
             yield (int(fr.group(1)) if fr else -1, float(m.group(1)), float(m.group(2)),
-                   None if r is None else r.group(1) == b"true")
+                   None if r is None else r.group(1) == b"true", None if c is None else int(c.group(1)))
 
 
 def is_wait(ft, gpu, rt, wait_min, wait_max):
@@ -68,11 +74,14 @@ def is_wait(ft, gpu, rt, wait_min, wait_max):
 def scan(args):
     path, wait_min, wait_max, stuck_s = args
     frames, t, first_rt, wait_s, wait_before, has_rt_field = 0, 0.0, None, 0.0, 0.0, False
-    for _, ft, gpu, r in frames_of(path):
+    pre_compiles = None   # most Remix compiles in flight before the first ray-traced frame; None: recorder lacks the field
+    for _, ft, gpu, r, c in frames_of(path):
         frames += 1
         has_rt_field |= r is not None
         # Recorders before rayTraced existed: a ray-traced frame keeps the GPU busy, a compile-wait frame does not.
         rt = r if r is not None else gpu >= INFERRED_RT_GPU_MS
+        if first_rt is None and c is not None:
+            pre_compiles = max(pre_compiles or 0, c)
         if rt and first_rt is None:
             first_rt = t
         if is_wait(ft, gpu, rt, wait_min, wait_max):
@@ -90,7 +99,7 @@ def scan(args):
     if frames and not has_rt_field:
         verdict += "(inferred)"
     return dict(path=path, frames=frames, lengthS=t, firstRtS=first_rt, waitS=wait_s, waitBeforeRtS=wait_before,
-                midWaitS=mid, verdict=verdict)
+                midWaitS=mid, preRtCompiles=pre_compiles, verdict=verdict)
 
 
 def key(path):
@@ -117,23 +126,26 @@ def table(paths, root, wait_min, wait_max, stuck_s, csv_out=None, out=sys.stdout
         results = sorted(ex.map(scan, jobs), key=lambda r: r["path"])
     copies = {ps[0]: len(ps) for ps in groups.values()}
     print(f"{'launch (first copy)':80} {'copies':>6} {'frames':>7} {'lenS':>6} {'firstRtS':>8} {'waitS':>6} "
-          f"{'waitPreRtS':>10} {'midWaitS':>8} verdict", file=out)
+          f"{'waitPreRtS':>10} {'midWaitS':>8} {'preRtComp':>9} verdict", file=out)
     counts = {}
     for r in results:
         rel = os.path.relpath(r["path"], root) if root and r["path"].startswith(root) else r["path"]
         frt = "-" if r["firstRtS"] is None else f"{r['firstRtS']:.1f}"
         r["launch"], r["copies"] = rel, copies[r["path"]]
         print(f"{rel[-80:]:80} {r['copies']:6d} {r['frames']:7d} {r['lengthS']:6.0f} {frt:>8} {r['waitS']:6.1f} "
-              f"{r['waitBeforeRtS']:10.1f} {r['midWaitS']:8.1f} {r['verdict']}", file=out)
+              f"{r['waitBeforeRtS']:10.1f} {r['midWaitS']:8.1f} {'-' if r['preRtCompiles'] is None else r['preRtCompiles']:>9} "
+              f"{r['verdict']}", file=out)
         counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
     print("launches:", len(results), " ".join(f"{k}={v}" for k, v in sorted(counts.items())), file=out)
     if csv_out:
         with open(csv_out, "w", encoding="utf-8", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["launch", "copies", "frames", "lengthS", "firstRtS", "waitS", "waitBeforeRtS", "midWaitS", "verdict"])
+            w.writerow(["launch", "copies", "frames", "lengthS", "firstRtS", "waitS", "waitBeforeRtS", "midWaitS",
+                        "preRtCompiles", "verdict"])
             for r in results:
                 w.writerow([r["launch"], r["copies"], r["frames"], round(r["lengthS"], 1), r["firstRtS"],
-                            round(r["waitS"], 1), round(r["waitBeforeRtS"], 1), round(r["midWaitS"], 1), r["verdict"]])
+                            round(r["waitS"], 1), round(r["waitBeforeRtS"], 1), round(r["midWaitS"], 1),
+                            r["preRtCompiles"], r["verdict"]])
     return results
 
 
@@ -162,7 +174,7 @@ def read_proxy(d):
 
 def best_offset(tel, proxy, span=5, sample=20000):
     """The proxy frame offset whose frame deltas best match the telemetry frame times (sum of |difference|)."""
-    tf = [(fr, ft) for fr, ft, _, _ in tel[1:sample]]
+    tf = [(fr, ft) for fr, ft, _, _, _ in tel[1:sample]]
     scores = {}
     for off in range(-span, span + 1):
         diffs = [abs(proxy[fr + off][0] - ft) for fr, ft in tf if fr + off in proxy]
@@ -183,7 +195,7 @@ def runs(d, wait_min, wait_max, out=sys.stdout):
     # Wait frames before the first ray-traced frame: count, seconds, loading count, seconds, count with the proxy's
     # ray tracing off. Remix only throttles while ray tracing is on, so those last frames are not compile waits.
     pre = [0, 0.0, 0, 0.0, 0]
-    for i, (fr, ft, gpu, r) in enumerate(tel):
+    for i, (fr, ft, gpu, r, _) in enumerate(tel):
         rt = r if r is not None else gpu >= INFERRED_RT_GPU_MS
         if rt and first_rt is None:
             first_rt = i
@@ -231,10 +243,12 @@ def runs(d, wait_min, wait_max, out=sys.stdout):
 
 def self_test():
     """Fake launches. Each must get its verdict; the mid-session run must be found by --runs."""
-    def line(fr, ft, gpu, rt):
+    def line(fr, ft, gpu, rt, compiles=None):
         o = {"frame": fr, "frameTimeMs": ft, "gpuTimeMs": gpu, "instances": 1}
         if rt is not None:
             o["rayTraced"] = rt
+        if compiles is not None:
+            o["remixShaderCompiles"] = compiles
         return json.dumps(o, separators=(",", ":")) + "\n"
 
     menu = [(10.0, 5.0, False)] * 300                 # menus: ray tracing off, no throttle
@@ -242,6 +256,10 @@ def self_test():
     rt = [(33.0, 31.0, True)] * 900                   # ray tracing
     cases = {
         "stuck": (menu + wait * 10, "STUCK"),
+        # remixShaderCompiles present: in flight during the wait proves a compile wait; 0 during the same signature
+        # (a loading screen paced near 30 FPS) must report 0, not a compile.
+        "stuck_compiling": ([r + (0,) for r in menu] + [r + (3,) for r in wait * 10], "STUCK", 3),
+        "loading_paced": ([r + (0,) for r in menu + wait + rt], "OK", 0),
         "normal": (menu + wait + rt, "OK"),
         "mid_session": (menu + rt + wait[:40] + rt, "MID_WAIT"),
         "old_recorder": ([(f, g, None) for f, g, _ in menu + wait + rt], "OK(inferred)"),
@@ -250,16 +268,18 @@ def self_test():
     bad = 0
     with tempfile.TemporaryDirectory() as tmp:
         paths = {}
-        for name, (rows, _) in cases.items():
+        for name, (rows, *_) in cases.items():
             os.makedirs(os.path.join(tmp, name))
             p = paths[name] = os.path.join(tmp, name, "rtx_telemetry.jsonl")
             with open(p, "w", encoding="utf-8") as f:
                 f.writelines(line(i, *r) for i, r in enumerate(rows))
-        for name, (_, want) in cases.items():
-            got = scan((paths[name], 28.0, 40.0, 20.0))["verdict"]
-            ok = got == want
+        for name, (_, want, *comp) in cases.items():
+            r = scan((paths[name], 28.0, 40.0, 20.0))
+            want_comp = comp[0] if comp else None   # None: the fake recorder has no remixShaderCompiles
+            ok = r["verdict"] == want and r["preRtCompiles"] == want_comp
             bad += not ok
-            print(f"{'ok ' if ok else 'BAD'} {name}: {got} (want {want})")
+            print(f"{'ok ' if ok else 'BAD'} {name}: {r['verdict']}, preRtCompiles {r['preRtCompiles']} "
+                  f"(want {want}, {want_comp})")
         # --runs on the mid-session launch: one run of 40 frames, ray traced before and after, 10 of them loading.
         d = os.path.dirname(paths["mid_session"])
         n = len(cases["mid_session"][0])
