@@ -510,20 +510,44 @@ struct FlareData {
     float peakIntensity = 0.0f;  // brightest element
     float peakSize = 20.0f;      // that element's mean sprite size
     bool moved = false;          // FlareMotion: has moved since first seen (hangs on Sam, a guard or a drone)
+    uint32_t elementCount = 0;   // +0x90
+    float size0[2] = {};         // first element's sprite size, +0x18/+0x1C
 };
+
+// Sam's own gear flares, the ones FlareAttachments.ini [BASE] (BackLight x3, Watch, PDA) and [BASE_GOGGLE]
+// (DoubleStreaks and Test_Flare_2 on GoggleR/M/L) attach to him. The FlareNode keeps no link back to the actor it
+// hangs on (Ghidra: the ini is read on the actor side, FUN_008e48d0), so they are told apart by their templates:
+// element count and first sprite size, which no other flare shares in the 7 Consumption sessions (185 flares each)
+// or the Paladin fixture (209 flares). Which size belongs to which ini name is not known. A gear flare also moves,
+// which keeps a world lamp that happens to use the same size out of the group.
+struct FlareShape { uint32_t elements; float sx, sy; };
+constexpr FlareShape kSamGearShapes[] = {
+    {1, 75.6f, 54.0f}, {1, 54.6f, 54.6f}, {1, 16.0f, 16.0f}, {1, 28.0f, 28.0f}, {1, 40.0f, 40.0f},  // [BASE]
+    {2, 15.0f, 25.0f}, {1, 8.0f, 8.0f},                                                             // [BASE_GOGGLE]
+};
+
+inline bool IsSamGearFlare(const FlareData& f) {
+    if (!f.moved) return false;
+    for (const FlareShape& s : kSamGearShapes)
+        if (f.elementCount == s.elements && std::fabs(f.size0[0] - s.sx) < 0.05f && std::fabs(f.size0[1] - s.sy) < 0.05f)
+            return true;
+    return false;
+}
 
 struct StandInOptions {
     bool enabled = true;         // [Lights] FlareStandIns
     bool skipUnplaced = false;   // [Lights] StandInSkipUnplaced: no ball on flares with +0x2C bit 0
     bool skipMoving = false;     // [Lights] StandInSkipMoving: no ball on flares that move
+    bool skipSamGear = false;    // [Lights] StandInSkipSamGear: no ball on Sam's own gear flares (IsSamGearFlare)
 };
 
-// A glowing ball goes on a flare that has a bright element and is not a camera-space or sky-sized flare. The two
+// A glowing ball goes on a flare that has a bright element and is not a camera-space or sky-sized flare. The
 // skips are off by default, which keeps the choice made before they existed.
 inline bool WantsStandIn(const FlareData& f, const StandInOptions& o) {
     if (!o.enabled || (f.word34 & 0x2) || !(f.peakIntensity > 0.0f) || !(f.peakSize < 400.0f)) return false;
     if (o.skipUnplaced && (f.nodeFlags & kFlareNodeUnplaced)) return false;
     if (o.skipMoving && f.moved) return false;
+    if (o.skipSamGear && IsSamGearFlare(f)) return false;
     return true;
 }
 

@@ -63,8 +63,11 @@ struct Settings {
     bool flareStandIns = true;
     // StandInSkipUnplaced=1: no sphere on flares with node flag +0x2C bit 0 (16 of 17 such flares sit at the world
     // origin). StandInSkipMoving=1: no sphere on flares that move (Sam's gear, guards' and drones' lights).
+    // StandInSkipSamGear=1: no sphere on Sam's own gear flares only (lightcal::IsSamGearFlare); guards' and drones'
+    // lights keep theirs.
     bool standInSkipUnplaced = false;
     bool standInSkipMoving = false;
+    bool standInSkipSamGear = false;
     float standInRadius = 2.5f;       // max bulb radius in game units (cm), scaled per flare element size
     float standInIntensity = 20.0f;   // Remix emissive intensity
     // [Proxy] EnableDebuggingTelemetry=1: write lightpub_trace.csv next to the game exe (one line per light change).
@@ -116,6 +119,7 @@ void LoadSettings(const wchar_t* ini) {
     s.flareStandIns = GetPrivateProfileIntW(L"Lights", L"FlareStandIns", 1, ini) != 0;
     s.standInSkipUnplaced = GetPrivateProfileIntW(L"Lights", L"StandInSkipUnplaced", 0, ini) != 0;
     s.standInSkipMoving = GetPrivateProfileIntW(L"Lights", L"StandInSkipMoving", 0, ini) != 0;
+    s.standInSkipSamGear = GetPrivateProfileIntW(L"Lights", L"StandInSkipSamGear", 0, ini) != 0;
     s.standInRadius = IniFloat(ini, L"StandInRadius", 2.5f);
     s.standInIntensity = IniFloat(ini, L"StandInIntensity", 20.0f);
     s.trace = GetPrivateProfileIntW(L"Proxy", L"EnableDebuggingTelemetry", 0, ini) != 0;
@@ -520,12 +524,15 @@ void UpdateAutoRaytracing(bool inLevel) {
                      action.raytracing ? "live" : action.keepScene ? "kept for the pause" : "cleared", (int)r, (int)k);
 }
 
+// "skip sam gear" sits before the other two skips so the line still ends in "skip moving N)", which the harness
+// matches after a reload.
 void LogSettings(const char* what) {
     if (g_log) g_log("lightpub: %s (scale %g, sun %g, fill %d, max %u, flare stand-ins %d, trace %d, "
-                     "stand-in skip unplaced %d, skip moving %d)", what,
+                     "skip sam gear %d, stand-in skip unplaced %d, skip moving %d)", what,
                      g_settings.tuning.radianceScale, g_settings.tuning.sunRadianceScale, g_settings.includeFill ? 1 : 0,
                      g_settings.maxLights, g_settings.flareStandIns ? 1 : 0, g_settings.trace ? 1 : 0,
-                     g_settings.standInSkipUnplaced ? 1 : 0, g_settings.standInSkipMoving ? 1 : 0);
+                     g_settings.standInSkipSamGear ? 1 : 0, g_settings.standInSkipUnplaced ? 1 : 0,
+                     g_settings.standInSkipMoving ? 1 : 0);
 }
 
 uint32_t g_seenIniEpoch = 0;
@@ -643,6 +650,7 @@ uint32_t CollectFlares(uintptr_t database) {
     options.enabled = g_settings.flareStandIns;
     options.skipUnplaced = g_settings.standInSkipUnplaced;
     options.skipMoving = g_settings.standInSkipMoving;
+    options.skipSamGear = g_settings.standInSkipSamGear;
     uint32_t count = 0;
     for (int guard = 0; node && guard < 8192 && count < kMaxFlares; ++guard) {
         uintptr_t cls = 0, next = 0, elements = 0;
@@ -656,12 +664,17 @@ uint32_t CollectFlares(uintptr_t database) {
             // Colour and size of the brightest element.
             f.color[0] = f.color[1] = f.color[2] = 0.0f;
             if (Read(node + 0x8C, &elements) && Read(node + 0x90, &elementCount) && elements) {
+                d.elementCount = elementCount;
                 for (uint32_t i = 0; i < elementCount && i < 8; ++i) {
                     const uintptr_t e = elements + i * 0x68;
                     float intensity = 0, sx = 0, sy = 0, rgb[3] = {};
                     Read(e + 0x04, &intensity);
                     Read(e + 0x18, &sx);
                     Read(e + 0x1C, &sy);
+                    if (i == 0) {
+                        d.size0[0] = sx;
+                        d.size0[1] = sy;
+                    }
                     for (int k = 0; k < 3; ++k) Read(e + 0x38 + k * 4, &rgb[k]);
                     if (intensity > d.peakIntensity && isfinite(intensity)) {
                         d.peakIntensity = intensity;
@@ -750,12 +763,12 @@ remixapi_MeshHandle StandInMesh(const float color[3]) {
     return g_standInMesh[key];
 }
 
-// Stand-ins drawn this frame, and how many of them sit on unplaced (+0x2C bit 0) or moving flares.
-uint32_t g_standInsDrawn = 0, g_standInsUnplaced = 0, g_standInsMoving = 0;
+// Stand-ins drawn this frame, and how many of them sit on unplaced (+0x2C bit 0), moving, or Sam's gear flares.
+uint32_t g_standInsDrawn = 0, g_standInsUnplaced = 0, g_standInsMoving = 0, g_standInsSamGear = 0;
 
 void DrawFlareStandIns() {
     const bool api = g_remix.CreateMesh && g_remix.CreateMaterial && g_remix.DrawInstance;
-    uint32_t drawn = 0, unplaced = 0, moving = 0;
+    uint32_t drawn = 0, unplaced = 0, moving = 0, samGear = 0;
     for (uint32_t n = 0; api && n < g_flareCount; ++n) {
         const FlareSnap& f = g_flares[n];
         if (!f.standIn) continue;
@@ -771,10 +784,12 @@ void DrawFlareStandIns() {
         ++drawn;
         unplaced += (f.data.nodeFlags & lightcal::kFlareNodeUnplaced) != 0;
         moving += f.data.moved;
+        samGear += lightcal::IsSamGearFlare(f.data);
     }
     g_standInsDrawn = drawn;
     g_standInsUnplaced = unplaced;
     g_standInsMoving = moving;
+    g_standInsSamGear = samGear;
     if (g_log && g_settings.logEveryFrames && !(g_frame % g_settings.logEveryFrames))
         g_log("lightpub: flare stand-ins %u drawn of %u flares (enabled %d, max radius %g, intensity %g)", drawn,
               g_flareCount, g_settings.flareStandIns ? 1 : 0, g_settings.standInRadius, g_settings.standInIntensity);
@@ -783,11 +798,13 @@ void DrawFlareStandIns() {
 // "lightpub: stray" line, every LogEveryFrames frames, for gate checks. Each count is this frame's value; "max" is
 // the highest value since the previous stray line, so a spike between lines is not lost.
 //   lamps without flare: published point/spot lights with no flare within 1 m (lightcal::CountLampsWithoutFlare)
-//   stand-ins on unplaced / moving: stand-in spheres drawn on flares with +0x2C bit 0 / flares that moved
+//   stand-ins on unplaced / moving / sam gear: stand-in spheres drawn on flares with +0x2C bit 0 / flares that
+//   moved / Sam's own gear flares (lightcal::IsSamGearFlare, a subset of moving)
 //   dimmed: published lights below 10% of their own peak brightness; longest dim: frames the longest of them has
 //   been dimmed (how long a light the game nearly switched off keeps lighting the Remix scene)
+// New fields go at the end of the line; the gate's pattern reads it from the start.
 void UpdateStrayCounts() {
-    struct Max { uint32_t lonely, unplaced, moving, dimmed, longestDim; };
+    struct Max { uint32_t lonely, unplaced, moving, dimmed, longestDim, samGear; };
     static Max window = {};
     const uint32_t lonely = lightcal::CountLampsWithoutFlare(g_lampPos, g_lampCount, g_flareData, g_flareCount);
     uint32_t dimmed = 0, longestDim = 0;
@@ -797,11 +814,13 @@ void UpdateStrayCounts() {
     window.moving = std::max(window.moving, g_standInsMoving);
     window.dimmed = std::max(window.dimmed, dimmed);
     window.longestDim = std::max(window.longestDim, longestDim);
+    window.samGear = std::max(window.samGear, g_standInsSamGear);
     if (!g_log || !g_settings.logEveryFrames || g_frame % g_settings.logEveryFrames) return;
     g_log("lightpub: stray frame %u lamps %u without flare %u (max %u) flares %u stand-ins %u on unplaced %u (max %u) "
-          "on moving %u (max %u) dimmed %u (max %u) longest dim %u frames (max %u)",
+          "on moving %u (max %u) dimmed %u (max %u) longest dim %u frames (max %u) on sam gear %u (max %u)",
           g_frame, g_lampCount, lonely, window.lonely, g_flareCount, g_standInsDrawn, g_standInsUnplaced,
-          window.unplaced, g_standInsMoving, window.moving, dimmed, window.dimmed, longestDim, window.longestDim);
+          window.unplaced, g_standInsMoving, window.moving, dimmed, window.dimmed, longestDim, window.longestDim,
+          g_standInsSamGear, window.samGear);
     window = {};
 }
 
@@ -915,9 +934,10 @@ void DumpFlares(HANDLE file, uintptr_t database) {
             for (uint32_t i = 0; i < g_flareCount && !snap; ++i)
                 if (g_flares[i].node == node) snap = &g_flares[i];
             FilePrintf(file, "flare\tnode=%08X\tvtable=%08X\tnodeflags=%08X\tindex=%d\tw34=%08X\tf84=%g\t"
-                       "pos=%.6g,%.6g,%.6g\tmoved=%d\tstandin=%d\telements=%u",
+                       "pos=%.6g,%.6g,%.6g\tmoved=%d\tsamgear=%d\tstandin=%d\telements=%u",
                        static_cast<unsigned>(node), static_cast<unsigned>(vtable), nodeFlags, index, word34, f84,
-                       pos[0], pos[1], pos[2], snap && snap->data.moved ? 1 : 0, snap && snap->standIn ? 1 : 0, count);
+                       pos[0], pos[1], pos[2], snap && snap->data.moved ? 1 : 0,
+                       snap && lightcal::IsSamGearFlare(snap->data) ? 1 : 0, snap && snap->standIn ? 1 : 0, count);
             for (uint32_t i = 0; elements && i < count && i < 8; ++i) {
                 float intensity = 0, size[2] = {}, rgba[4] = {};
                 const uintptr_t e = elements + i * 0x68;
@@ -943,11 +963,12 @@ void DumpLights(const wchar_t* path) {
     HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return;
     FilePrintf(file, "settings\tready=%d\trton=%d\tradianceScale=%g\tsunRadianceScale=%g\tfill=%d\ttracked=%u\tflareStandIns=%d\t"
-               "standInSkipUnplaced=%d\tstandInSkipMoving=%d\tflares=%u\tstandins=%u\n",
+               "standInSkipUnplaced=%d\tstandInSkipMoving=%d\tstandInSkipSamGear=%d\tflares=%u\tstandins=%u\n",
                g_ready ? 1 : 0, g_autoRt.State(), g_settings.tuning.radianceScale, g_settings.tuning.sunRadianceScale,
                g_settings.includeFill ? 1 : 0, static_cast<unsigned>(g_tracker.Count()),
                g_settings.flareStandIns ? 1 : 0, g_settings.standInSkipUnplaced ? 1 : 0,
-               g_settings.standInSkipMoving ? 1 : 0, g_flareCount, g_standInsDrawn);
+               g_settings.standInSkipMoving ? 1 : 0, g_settings.standInSkipSamGear ? 1 : 0, g_flareCount,
+               g_standInsDrawn);
     uintptr_t database = 0, heads = 0, head = 0, node = 0, lockHolder = 0;
     uint32_t classIndex = 0, headCount = 0;
     if (!Read(kDatabaseGlobal, &database) || !database || !g_lightClass || !Read(database + 0x2C, &heads) ||

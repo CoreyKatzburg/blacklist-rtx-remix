@@ -71,6 +71,7 @@ static Dump Load(const std::filesystem::path& path) {
             for (std::string w; words >> w;) raw.push_back(static_cast<uint32_t>(std::strtoul(w.c_str(), nullptr, 16)));
             f.nodeFlags = raw.size() > 3 ? raw[(0x2C - 0x20) / 4] : 0;
             f.word34 = raw.size() > 5 ? raw[(0x34 - 0x20) / 4] : 0;
+            f.elementCount = static_cast<uint32_t>(std::strtoul(kv["elements"].c_str(), nullptr, 10));
             // Brightest element, as CollectFlares picks it (first 8 elements).
             for (int i = 0; i < 8; ++i) {
                 const auto it = kv.find("e" + std::to_string(i));
@@ -78,6 +79,10 @@ static Dump Load(const std::filesystem::path& path) {
                 const auto v = Split(it->second, ',');  // i<intensity>, s<sx>, <sy>, c<r>, g, b, a
                 const float intensity = std::strtof(v[0].c_str() + 1, nullptr);
                 const float sx = std::strtof(v[1].c_str() + 1, nullptr), sy = std::strtof(v[2].c_str(), nullptr);
+                if (i == 0) {
+                    f.size0[0] = sx;
+                    f.size0[1] = sy;
+                }
                 if (intensity > f.peakIntensity) {
                     f.peakIntensity = intensity;
                     if (sx > 0.0f && sy > 0.0f) f.peakSize = 0.5f * (sx + sy);
@@ -139,6 +144,33 @@ static void FakeCases() {
     placed.moved = true;
     CHECK(lightcal::WantsStandIn(placed, today) && !lightcal::WantsStandIn(placed, skipMoving),
           "StandInSkipMoving=1 drops a moved flare, the default keeps it");
+
+    // StandInSkipSamGear: Sam's BackLight flare (one 75.6 x 54 element) and a goggle flare (two 15 x 25 elements)
+    // lose their ball; a guard's rifle-light flare (the four-element 125/250/120 template, also moving) and a
+    // world lamp that happens to use an 8 x 8 sprite but never moves keep theirs.
+    StandInOptions skipGear;
+    skipGear.skipSamGear = true;
+    FlareData backLight = placed;
+    backLight.elementCount = 1;
+    backLight.size0[0] = 75.6f;
+    backLight.size0[1] = 54.0f;
+    FlareData goggle = backLight;
+    goggle.elementCount = 2;
+    goggle.size0[0] = 15.0f;
+    goggle.size0[1] = 25.0f;
+    FlareData guard = placed;
+    guard.elementCount = 4;
+    guard.size0[0] = guard.size0[1] = 125.0f;
+    FlareData lamp8 = placed;
+    lamp8.moved = false;
+    lamp8.elementCount = 1;
+    lamp8.size0[0] = lamp8.size0[1] = 8.0f;
+    CHECK(lightcal::WantsStandIn(backLight, today) && lightcal::WantsStandIn(goggle, today),
+          "defaults must keep today's choice: Sam's gear flares get a ball");
+    CHECK(!lightcal::WantsStandIn(backLight, skipGear), "StandInSkipSamGear=1 must drop Sam's BackLight flare");
+    CHECK(!lightcal::WantsStandIn(goggle, skipGear), "StandInSkipSamGear=1 must drop Sam's goggle flare");
+    CHECK(lightcal::WantsStandIn(guard, skipGear), "StandInSkipSamGear=1 must keep a guard's flashlight flare");
+    CHECK(lightcal::WantsStandIn(lamp8, skipGear), "StandInSkipSamGear=1 must keep a lamp that never moves");
 
     // Lamps without a flare: the boundary is 100 cm inclusive, and a flare far away does not count.
     FlareData glow;
@@ -229,15 +261,45 @@ static void Run20(const std::filesystem::path& folder) {
     // Motion over the session's dumps, one dump per frame: 21 flares move (10 guards' lights, 11 on Sam).
     lightcal::FlareMotion<512> motion;
     std::map<uintptr_t, bool> moved;
+    std::map<uintptr_t, FlareData> last;
+    std::map<uintptr_t, std::vector<std::vector<float>>> track;
     uint32_t frame = 0;
     for (const auto& file : files) {
         ++frame;
-        for (const auto& [node, f] : Load(file).flares) moved[node] = motion.Update(node, f.pos, frame);
+        for (auto [node, f] : Load(file).flares) {
+            f.moved = moved[node] = motion.Update(node, f.pos, frame);
+            last[node] = f;
+            track[node].push_back({f.pos[0], f.pos[1], f.pos[2]});
+        }
         motion.Sweep(frame);
     }
     size_t movedCount = 0;
     for (const auto& m : moved) movedCount += m.second;
     CHECK(movedCount == 21, "run20: %zu flares moved across the dumps, want 21", movedCount);
+
+    // Sam's gear, found without the templates: Sam stands still while the harness dumps, so his gear sways less
+    // than 1 m; guards' and drones' lights travel metres. StandInSkipSamGear must pick exactly the first group.
+    size_t gearKept = 0, guardsDropped = 0, gear = 0, guards = 0, ballsGear = 0, ballsAll = 0;
+    StandInOptions skipGear;
+    skipGear.skipSamGear = true;
+    for (const auto& [node, f] : last) {
+        float travel = 0.0f;
+        for (const auto& a : track[node])
+            for (const auto& b : track[node])
+                travel = std::max(travel, std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) +
+                                                    (a[2] - b[2]) * (a[2] - b[2])));
+        const bool isGear = f.moved && travel < 100.0f, isGuard = f.moved && travel >= 100.0f;
+        gear += isGear;
+        guards += isGuard;
+        gearKept += isGear && !lightcal::IsSamGearFlare(f);
+        guardsDropped += !isGear && lightcal::IsSamGearFlare(f);
+        ballsAll += lightcal::WantsStandIn(f, StandInOptions{});
+        ballsGear += lightcal::WantsStandIn(f, StandInOptions{}) && !lightcal::WantsStandIn(f, skipGear);
+    }
+    CHECK(gear == 11 && guards == 10, "run20: %zu gear and %zu guard flares by travel, want 11 and 10", gear, guards);
+    CHECK(gearKept == 0, "run20: %zu of Sam's gear flares not recognised as gear", gearKept);
+    CHECK(guardsDropped == 0, "run20: %zu flares that are not Sam's gear recognised as gear", guardsDropped);
+    std::printf("run20 last dump: %zu balls by default, StandInSkipSamGear removes %zu\n", ballsAll, ballsGear);
 }
 
 int main(int argc, char** argv) {
