@@ -99,6 +99,8 @@ class Builder:
             rec["rayTraced"] = False
         if c == "one_stop_not_ray_traced" and wname == "y0_p0":
             rec["rayTraced"] = False
+        if c == "pan_not_ray_traced" and kind == "pan":
+            rec["rayTraced"] = False
         if c == "goggles_off_only" and goggles and i < 3:
             rec["rayTraced"] = False
         if c == "nan_frame" and kind == "still" and i == 3: rec["thumbNonFinite"] = 40
@@ -144,7 +146,7 @@ class Builder:
         if c == "renamed_fields":
             rec["frameMs"] = rec.pop("frameTimeMs")
         rec["lumaThumb"] = base64.b64encode(img.astype(np.uint8).tobytes()).decode()
-        if not (c == "sparse_telemetry" and self.tframe % 15):
+        if not (c == "sparse_telemetry" and self.tframe % 15) and not (c == "stop_missing_telemetry" and wname == "y45_p0"):
             self.telemetry.append(rec)
         # proxy camera trace: sign of yaw flipped against the request, pitch kept
         cy = math.radians(self.base_cam - self.yaw + (10.0 if c == "pose_off" and wname == "y135_p0" else 0.0))
@@ -309,6 +311,11 @@ class Builder:
             for w in self.windows:
                 w["proxy"] = [w["proxy"][0] + 1, w["proxy"][1] + 1]
         gate.save_text(os.path.join(self.dir, "telemetry.jsonl"), "".join(json.dumps(r) + "\n" for r in self.telemetry))
+        if self.case == "launch_rt_delay":
+            lrecs = [{"frame": k, "frameTimeMs": 100.0, "rayTraced": False} for k in range(1, 21)]
+            lrecs.append({"frame": 21, "frameTimeMs": 10.0, "rayTraced": True})
+            gate.save_text(os.path.join(self.dir, "telemetry_launch.jsonl"),
+                           "".join(json.dumps(r) + "\n" for r in lrecs))
         gate.save_text(os.path.join(self.dir, "proxy_frames.csv"), "\n".join(self.proxy) + "\n")
         gate.save_text(os.path.join(self.dir, "proxy_gate.csv"), "\n".join(self.pgate) + "\n")
         if self.case != "no_quit_log":
@@ -373,6 +380,14 @@ CASES = {
     "one_stop_not_ray_traced": (("remix_ray_tracing",),
                                 ("nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
                                  "outline_overlap", "flashes", "still_flicker")),
+    "pan_not_ray_traced": (("remix_ray_tracing",), ()),
+    "launch_rt_delay": ((), ()),
+    "stop_missing_telemetry": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms",
+                                    "skinned_min", "remix_dropped_character_frames",
+                                    "inward_fraction", "nonfinite_thumb_pixels",
+                                    "remix_ray_tracing",
+                                    "nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
+                                    "flashes", "still_flicker", *_ZERO_NORMALS, *RECORDER)),
     "sam_missing": (("outline_overlap",), ()),
     "inward": (("inward_fraction",), ()),
     "raster_flash": (("raster_fallback_frames",), ()),
@@ -420,12 +435,16 @@ CASES = {
                           "skinned_min", "remix_dropped_character_frames", "static_blas_rebuilds",
                           "inward_fraction", "nonfinite_thumb_pixels", "frame_join_clock",
                           "remix_ray_tracing", "remix_compile_stall",
+                          "nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
+                          "outline_overlap", "flashes", "still_flicker",
                           "goggles_toggle_rebuilds", "goggles_dark_frame", *_ZERO_NORMALS, *RECORDER)),
-    # Remix writing only every 15th frame: per-frame checks can't pass; flashes fall back to the screen captures
+    # Remix writing only every 15th frame: per-frame checks can't pass; picture checks fail closed
     "sparse_telemetry": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms",
                               "skinned_min", "remix_dropped_character_frames", "static_blas_rebuilds",
                               "inward_fraction", "nonfinite_thumb_pixels",
                               "remix_ray_tracing",
+                              "nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness",
+                              "outline_overlap", "flashes", "still_flicker",
                               "goggles_toggle_rebuilds", "goggles_dark_frame", *_ZERO_NORMALS, *RECORDER)),
     "renamed_fields": ((), ("frames_over_50ms", "min_median_fps", "latency_overhead_ms", "remix_compile_stall")),
     "no_dumps": ((), ("nan_pixels", "neon_fraction", "scene_brightness", "angled_sharpness", "outline_overlap")),

@@ -200,6 +200,11 @@ class FakeRunTest(unittest.TestCase):
                         md = read(os.path.join(t, case, "result.md"))
                         self.assertIn("## Top 10 Latency Contributors", md)
                         self.assertGreaterEqual(len(result.get("latencyContributors", [])), 4)
+                        rt_c = next(c for c in result["checks"] if c["check"] == "remix_ray_tracing")
+                        self.assertIn("from spot start", rt_c["detail"])
+                    if case == "launch_rt_delay":
+                        rt_c = next(c for c in result["checks"] if c["check"] == "remix_ray_tracing")
+                        self.assertIn("2.0s to RT (from launch start)", rt_c["detail"])
                     if case == "near_target_fps":
                         fps_check = next(c for c in result["checks"] if c["check"] == "min_median_fps")
                         self.assertIn("89.96 FPS", fps_check["detail"])

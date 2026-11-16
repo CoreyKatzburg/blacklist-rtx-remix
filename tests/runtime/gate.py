@@ -120,6 +120,7 @@ THRESHOLDS = {
     "compile_stall_min_frames": 300,       # GUESS. Consecutive rayTraced=false frames with 25-40 ms CPU wait.
     "compile_stall_wait_min_ms": 25.0,     # GUESS.
     "compile_stall_wait_max_ms": 40.0,     # GUESS.
+    "min_scene_rt_share": 0.99,            # GUESS. Non-goggles scene RT share (con_custodial measured 100.0%).
     }
 SOFT_NM = frozenset({"frame_join_clock"})  # NOT MEASURED does not fail the gate for these checks yet
 TELEMETRY_FIELDS = ("frame", "frameTimeMs", "gpuTimeMs", "instances", "skinnedInstances", "staticBlasRebuilds",
@@ -721,17 +722,25 @@ def _parse_lightpub_log(path: str) -> list[tuple[tuple[int, int, int], int, int,
     return rows
 
 
-def stop_all_ray_traced(spot: dict, w: dict) -> bool:
-    """False when telemetry has rayTraced=False on any frame of window `w`."""
+def stop_all_ray_traced(spot: dict, w: dict) -> tuple[bool, str | None]:
+    """(True, None) only when the stop has >= 1 telemetry frame and every frame has rayTraced=True;
+    otherwise (False, reason) so picture checks fail closed as NOT MEASURED."""
     tel = spot["_data"]["telemetry"]
     tids = frames_in(w, "telemetry")
-    return not any(tel.get(f, {}).get("rayTraced") is False for f in tids)
+    if not tids or any(f not in tel for f in tids):
+        return False, "no telemetry for the stop"
+    if any(not isinstance(tel[f].get("rayTraced"), bool) for f in tids):
+        return False, "rayTraced missing"
+    if any(not tel[f]["rayTraced"] for f in tids):
+        return False, "not all frames ray traced"
+    return True, None
 
 
 def ray_tracing_checks(run: Run, good: list[dict], tsrc: str) -> None:
-    """remix_ray_tracing (non-goggles scene RT share + every still stop 100% ray traced) and
+    """remix_ray_tracing (non-goggles scene RT share >= 99% GUESS + every still stop 100% ray traced) and
     remix_compile_stall (>= 300 consecutive rayTraced=false frames with 25-40 ms CPU wait, GUESS)."""
-    rt_thresh = "all still stops 100% ray traced"
+    min_rt = THRESHOLDS["min_scene_rt_share"]
+    rt_thresh = f"all still stops 100% RT, scene RT >= {min_rt:.0%} (GUESS)"
     cs_lim = THRESHOLDS["compile_stall_min_frames"]
     w_lo, w_hi = THRESHOLDS["compile_stall_wait_min_ms"], THRESHOLDS["compile_stall_wait_max_ms"]
     cs_thresh = f"< {cs_lim} consecutive rayTraced=false frames with {w_lo:g}..{w_hi:g} ms wait (GUESS)"
@@ -762,20 +771,32 @@ def ray_tracing_checks(run: Run, good: list[dict], tsrc: str) -> None:
                         non_goggles_rt += 1
         shares.append((s["name"], non_goggles_rt / non_goggles_total if non_goggles_total else 1.0))
         for w in s["windows"]:
-            if w["kind"] == "still" and not stop_all_ray_traced(s, w):
-                bad_stops.append(f"{s['name']}/{w['name']}")
-        # Seconds from first telemetry frame of the launch to first rayTraced=true frame
+            if w["kind"] == "still":
+                ok_rt, _ = stop_all_ray_traced(s, w)
+                if not ok_rt:
+                    bad_stops.append(f"{s['name']}/{w['name']}")
+        # Seconds from first telemetry frame of the launch (telemetry_launch.jsonl if present, else spot telemetry)
+        launch_path = spot_path(s, s.get("telemetryLaunch")) or os.path.join(s["_dir"], "telemetry_launch.jsonl")
+        if os.path.exists(launch_path):
+            ltel, _ = read_telemetry(launch_path)
+            lt_label = "from launch start"
+        else:
+            ltel = tel
+            lt_label = "from spot start"
         t_ms = 0.0
         first_rt_s = None
-        for fr in sorted(tel):
-            r = tel[fr]
+        for fr in sorted(ltel):
+            r = ltel[fr]
             if r.get("rayTraced") is True:
                 first_rt_s = t_ms / 1000.0
                 break
             ft = r.get("frameTimeMs")
             if isinstance(ft, (int, float)):
                 t_ms += float(ft)
-        launch_times.append(f"{s['name']} " + (f"{first_rt_s:.1f}s to RT" if first_rt_s is not None else "never RT"))
+        launch_times.append(
+            f"{s['name']} " + (f"{first_rt_s:.1f}s to RT ({lt_label})" if first_rt_s is not None
+                               else f"never RT ({lt_label})")
+        )
 
     if missing_rt or not shares:
         run.add("remix_ray_tracing", NOT_MEASURED, None, rt_thresh,
@@ -786,7 +807,8 @@ def ray_tracing_checks(run: Run, good: list[dict], tsrc: str) -> None:
         lt_str = "; ".join(launch_times)
         detail = (f"{len(bad_stops)} non-RT still stop(s) ({', '.join(bad_stops[:5])}); "
                   if bad_stops else "") + f"scene RT: {share_str} ({lt_str})"
-        run.add("remix_ray_tracing", PASS if not bad_stops else FAIL, round(worst_share, 4), rt_thresh, detail, tsrc)
+        ok_rt_all = (not bad_stops) and (worst_share >= min_rt)
+        run.add("remix_ray_tracing", PASS if ok_rt_all else FAIL, round(worst_share, 4), rt_thresh, detail, tsrc)
 
     # 2. remix_compile_stall
     worst_run, stall_runs, missing_cs = 0, [], []
@@ -1433,8 +1455,10 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
     # flashes: every still stop (>= 15 frames) and the pan (frames for >= 90% of the game's frames)
     flash_total, flash_detail, flash_missing, sources = 0, [], [], set()
     for s, w in pick(("still", "pan")):
-        if w["kind"] == "still" and not stop_all_ray_traced(s, w):
-            flash_missing.append(f"{s['name']}/{w['name']}: not all frames ray traced"); continue
+        if w["kind"] == "still":
+            ok_rt, rt_why = stop_all_ray_traced(s, w)
+            if not ok_rt:
+                flash_missing.append(f"{s['name']}/{w['name']}: {rt_why}"); continue
         frames, src = window_frames(s, w)
         sources.add(src)
         n_game = len(frames_in(w, "telemetry")) or len(frames_in(w, "proxy"))
@@ -1462,8 +1486,9 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
     flicker_thresh = (f"block jitter <= {j_limit:g}, drift <= {d_limit:g}, "
                       f"pulse <= {p_limit:g}, step4 <= {s4_limit:g} (/255)")
     for s, w in pick(("still",)):
-        if not stop_all_ray_traced(s, w):
-            flicker_missing.append(f"{s['name']}/{w['name']}: not all frames ray traced"); continue
+        ok_rt, rt_why = stop_all_ray_traced(s, w)
+        if not ok_rt:
+            flicker_missing.append(f"{s['name']}/{w['name']}: {rt_why}"); continue
         frames, src = window_frames(s, w)
         flicker_sources.add(src)
         n = 0 if frames is None else len(dedupe(frames))
@@ -1494,10 +1519,11 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
         tag = w.get("dump")
         if not tag:
             continue
-        if not stop_all_ray_traced(s, w):
-            not_rt_stops.append(f"{s['name']}/{tag}")
+        ok_rt, rt_why = stop_all_ray_traced(s, w)
+        if not ok_rt:
+            not_rt_stops.append(f"{s['name']}/{tag}: {rt_why}")
             if w.get("outline"):
-                outline_missing.append(f"{s['name']}/{tag}: not all frames ray traced")
+                outline_missing.append(f"{s['name']}/{tag}: {rt_why}")
             continue
         final = spot_path(s, os.path.join("gate", f"{tag}_final.pfm"))
         if os.path.exists(final):
@@ -1525,7 +1551,7 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
     b_src = "Remix <tag>_final.pfm + reference <tag>_raster.pfm"
     if missing_final or not_rt_stops or n_final == 0 or not good:
         if not_rt_stops:
-            detail = f"{len(not_rt_stops)} stop(s) not all ray traced ({', '.join(not_rt_stops[:5])})"
+            detail = f"{len(not_rt_stops)} stop(s) unverified for RT ({'; '.join(not_rt_stops[:4])})"
         elif missing_final or n_final == 0:
             detail = f"{len(missing_final)} of {len(missing_final) + n_final} stops have no final image dump"
         else:
