@@ -1072,6 +1072,11 @@ class Spot:
                 for k, v in keys.items():
                     set_ini(self.ini, "RemixConfig", k, str(v))
                 self.window(f"live_step{i + 1}", "still", lambda: self.hold(seconds), liveRtx=keys)
+                # cfg["liveStepDump"] (worker C, Nov 16, picture cost at one held pose): final and game depth at the
+                # end of each step, as y0_p0 dumps them, so picture_cost.py can compare steps of one launch.
+                if cfg.get("liveStepDump"):
+                    tag = f"live_step{i + 1}"
+                    self.window(f"{tag}_dump", "dump", lambda: self.dump(tag), dump=tag)
         # cfg["lightSwitch"] (worker B, Nov 16, fog fade sweep at con_custodial): after the lit-room bench window, the
         # light switch with its light dumps, so each variant launch also measures the fade (frames/light_switch.gray).
         if cfg.get("lightSwitch"):
@@ -1296,39 +1301,47 @@ class Spot:
         results, sign = [], 1
         try:
             self.hold(1.5)
-            # Until `trials` turns showed on screen (gate.py needs 20 samples), at most 2x trials turns: in the Paladin
-            # its moving screens hid 9 of 20 turns in the noise (no-Remix reference, Nov 16).
-            while sum(r.get("screenMs") is not None for r in results) < trials and len(results) < 2 * trials:
-                if len(results) >= 3 and all("error" in r for r in results[-3:]):
-                    break   # three turns in a row without a usable screen: the grab is broken, not the turn
+            # Every turn is sent and timed in the game whatever the grab does: the gate's input_latency_ms is the game
+            # share (8e779a5), so a broken grab blanks only the screen part of a turn (coordinator, Nov 16; before, a
+            # bad grab skipped the turn and three in a row ended the measurement with no game share either).
+            # Until `trials` turns have a game share (gate.py needs 20), or `trials` turns without a proxy log, at most
+            # 2x trials turns: in the Paladin its moving screens hid 9 of 20 turns in the noise (no-Remix reference).
+            def enough() -> bool:
+                if not self.proxy.path:
+                    return len(results) >= trials
+                return sum(r.get("gameMs") is not None for r in results) >= trials
+            while not enough() and len(results) < 2 * trials:
                 self.hold(0.5)
                 tq = time.perf_counter() * 1000.0
                 self.hold(0.3)
                 still = [img for t, img in list(shots) if t >= tq]
                 span_ms = time.perf_counter() * 1000.0 - tq
+                grab: dict = {}
+                base, threshold = None, 0.0
                 if len(still) < 3:
-                    results.append({"error": "screen grab delivered under 10 shots a second"}); continue
-                if not any(img.any() for img in still):
-                    results.append({"error": "screen grab is all black"}); continue
+                    grab = {"error": "screen grab delivered under 10 shots a second"}
+                elif not any(img.any() for img in still):
+                    grab = {"error": "screen grab is all black"}
                 # More shots than gdigrab was asked for means it hands back the same picture again and again (Remix
                 # runs and monitors-off references, Nov 16: 5,700 to 7,142 shots a second, noise 0, 0 to 9 of 40 turns
                 # seen; cause: ffmpeg's constant-rate output, now passthrough). Kept as the guard if it comes back.
-                if len(still) > 2 * grab_fps * span_ms / 1000.0 + 2:
+                elif len(still) > 2 * grab_fps * span_ms / 1000.0 + 2:
                     different = 1 + sum(bool(np.any(a != b)) for a, b in zip(still, still[1:]))
-                    results.append({"error": f"screen grab repeats pictures (over {2 * grab_fps} shots a second, "
-                                             f"{grab_fps} asked)", "shots": len(still),
-                                    "spanMs": round(span_ms), "different": different}); continue
-                base = still[-1]
-                noise = max(float(np.abs(img - base).mean()) for img in still)
-                threshold = max(1.5, 3.0 * noise)
+                    grab = {"error": f"screen grab repeats pictures (over {2 * grab_fps} shots a second, "
+                                     f"{grab_fps} asked)", "shots": len(still), "spanMs": round(span_ms),
+                            "different": different}
+                else:
+                    base = still[-1]
+                    noise = max(float(np.abs(img - base).mean()) for img in still)
+                    threshold = max(1.5, 3.0 * noise)
+                    grab = {"noise": round(noise, 2), "threshold": round(threshold, 2)}
                 t0 = time.perf_counter() * 1000.0
                 mouse_move_rel(sign * counts, 0)
                 self.hold(0.6)
-                seen = first_change(list(shots), t0, base, threshold)
+                seen = None if "error" in grab else first_change(list(shots), t0, base, threshold)
                 turned = first_turned(proxy_camera_dirs(self.proxy.path, t0 - 500.0), t0) if self.proxy.path else None
                 results.append({"screenMs": round(seen - t0, 1) if seen else None,
-                                "gameMs": round(turned - t0, 1) if turned else None,
-                                "noise": round(noise, 2), "threshold": round(threshold, 2)})
+                                "gameMs": round(turned - t0, 1) if turned else None, **grab})
                 sign = -sign
             n, first, last = arrivals["n"], arrivals["first"], arrivals["last"]
             fps = (n - 1) * 1000.0 / (last - first) if n > 1 and last > first else 0.0

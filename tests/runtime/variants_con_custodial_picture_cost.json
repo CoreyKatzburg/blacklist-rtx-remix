@@ -1,0 +1,10 @@
+{
+ "about": "Worker C's picture cost at one held pose (Nov 16): one con_custodial launch, rtx keys changed live at y0_p0, about 10 s per step, then final and game depth dumped at the end of each step (live_stepN_final.pfm, live_stepN_gamedepth.pfm). Steps: 1 base, 2 RR CNN, 3 RR transformer with DLSS balanced, 4 DLSS performance, 5 DLSS quality (base again; step 5 against step 1 is the noise floor). A step counts only with its new '[RTX Ray Reconstruction] created: render WxH' line or RR preset change in remix-dxvk.log. Score with tests\\analysis\\picture_cost.py.",
+ "spot": "con_custodial",
+ "bench": {"settle": 5, "frames": 150},
+ "variants": [
+  {"name": "01_live_picture_cost",
+   "bench": {"liveSteps": [{}, {"rtx.rayreconstruction.model": "0"}, {"rtx.rayreconstruction.model": "1", "rtx.qualityDLSS": "2"}, {"rtx.qualityDLSS": "1"}, {"rtx.qualityDLSS": "3"}],
+             "liveStepSeconds": 10, "liveStepDump": true}}
+ ]
+}

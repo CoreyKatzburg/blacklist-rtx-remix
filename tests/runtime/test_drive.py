@@ -767,8 +767,34 @@ class Reference(unittest.TestCase):
             self.assertIsNone(r["samples_ms"], name)
             self.assertIn("no turn showed on screen", r.get("error", ""), name)
             self.assertIn("all black" if name == "black" else "under 10 shots", r["error"], name)
-            self.assertEqual(len(r["trials"]), 3, name)   # gives up after three dead turns, not forty
-            self.assertIsNone(gate.spot_mouse_lag({"mouse_lag": r}))
+            self.assertEqual(len(r["trials"]), 20, name)   # no proxy log: `trials` turns, not forty
+            self.assertIsNone(gate.spot_screen_lag({"mouse_lag": r}))
+
+    def test_a_broken_grab_still_gives_the_game_share_of_every_turn(self):
+        # The gate's input lag is the game share since 8e779a5; a black or repeating grab used to skip the turn
+        # (no mouse move, no gameMs) and stop after three, so the gate had no input lag at all (coordinator, Nov 16).
+        for name in ("black", "repeats"):
+            sent = []
+
+            class Out:
+                def read(self, n):
+                    time.sleep(0.0002 if name == "repeats" else 0.01)
+                    return bytes(n) if name == "black" else b"\x50" * n
+            s = drive.Spot.__new__(drive.Spot)
+            s.counts_per_deg_x, s.proxy = 10.0, mock.Mock(path="proxy.log")
+            s.hold = lambda seconds, until=None: time.sleep(min(seconds, 0.05))
+            # the game turns the camera 25 ms after each mouse move, whatever the screen grab shows
+            with mock.patch.object(drive.subprocess, "Popen", lambda *a, **k: mock.Mock(stdout=Out())), \
+                    mock.patch.object(drive, "mouse_move_rel", lambda dx, dy: sent.append(dx)), \
+                    mock.patch.object(drive, "proxy_camera_dirs", lambda path, since: []), \
+                    mock.patch.object(drive, "first_turned", lambda dirs, t0: t0 + 25.0):
+                r = s.mouse_lag()
+            self.assertEqual(len(sent), 20, name)
+            self.assertEqual([t["gameMs"] for t in r["trials"]], [25.0] * 20, name)
+            self.assertIsNone(r["samples_ms"], name)
+            self.assertTrue(all("error" in t and t["screenMs"] is None for t in r["trials"]), name)
+            self.assertEqual(gate.spot_mouse_lag({"mouse_lag": r})["n"], 20, name)
+            self.assertIsNone(gate.spot_screen_lag({"mouse_lag": r}), name)
 
     def _lag_with_fake_grab(self, burst):
         """mouse_lag on a fake gdigrab: ~100 real pictures a second, and the picture changes when the mouse turns.
@@ -806,7 +832,7 @@ class Reference(unittest.TestCase):
         always = self._lag_with_fake_grab("always")
         self.assertIsNone(always["samples_ms"])
         self.assertIn("screen grab repeats pictures", always["error"])
-        self.assertEqual(len(always["trials"]), 3)        # gives up after three, like a dead grab
+        self.assertEqual(len(always["trials"]), 20)       # every turn is still sent
         self.assertEqual(always["trials"][0]["different"], 1)
 
         # the still windows look normal, but the grab floods after each turn: the turns it timed are not used
