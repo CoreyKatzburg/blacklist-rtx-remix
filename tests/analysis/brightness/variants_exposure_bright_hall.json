@@ -1,0 +1,14 @@
+{
+ "about": "Worker F exposure vs light-strength sweep at con_bright_hall (Nov 16): one clean launch per variant at y0_p0 (measured again at the end of each launch after one look round the room), testing whether Remix's ~2.7x lift over the original game comes from automatic exposure + local tonemapping defaults (rtx.tonemappingMode=1, rtx.autoExposure.enabled=True, evMinValue=-2.0, localtonemap.exposure=0.75, localtonemap.shadows=2.0). 01_base and 07_base_end measure run-to-run drift; exposure_vs_lights.py --score-sweep marks any variant whose effect does not beat |07_base_end - 01_base| as NOT_MEASURED.",
+ "spot": "con_bright_hall",
+ "bench": {"settle": 5, "frames": 150, "revisit": true},
+ "variants": [
+  {"name": "01_base"},
+  {"name": "02_ae_off_fixed", "about": "disable auto exposure (fixed 1.0x auto-exposure factor)", "rtx": {"rtx.autoExposure.enabled": "False"}},
+  {"name": "03_ae_evmin_0p5", "about": "raise auto-exposure floor from EV -2.0 (7.02x max gain) to EV +0.5 (1.24x max gain)", "rtx": {"rtx.autoExposure.evMinValue": "0.5"}},
+  {"name": "04_ltm_exp_0p25", "about": "lower local tonemap linear exposure multiplier 3x (0.75 -> 0.25)", "rtx": {"rtx.localtonemap.exposure": "0.25"}},
+  {"name": "05_ltm_exp0p35_shad0", "about": "lower local tonemap exposure (0.75 -> 0.35) and disable 4x shadow-branch boost (shadows 2.0 -> 0.0)", "rtx": {"rtx.localtonemap.exposure": "0.35", "rtx.localtonemap.shadows": "0.0"}},
+  {"name": "06_global_tm_evmin_0", "about": "switch from Local tonemapper to Global ACES tonemapper with EV floor 0.0", "rtx": {"rtx.tonemappingMode": "0", "rtx.tonemap.finalizeWithACES": "True", "rtx.autoExposure.evMinValue": "0.0"}},
+  {"name": "07_base_end", "about": "closing baseline launch to bound run-to-run drift against 01_base"}
+ ]
+}
