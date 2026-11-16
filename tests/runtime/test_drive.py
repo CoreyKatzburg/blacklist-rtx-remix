@@ -443,6 +443,9 @@ class Reference(unittest.TestCase):
             while not hwnd and time.monotonic() < deadline:
                 time.sleep(0.2)
                 hwnd = drive.game_window(n.pid)
+            # Worker C's mid-play minimize: the window really is minimized during the wait and back afterwards.
+            m = drive.minimize_restore(hwnd, 0.5)
+            self.assertEqual((m["minimized"], m["restored"]), (True, True))
             with mock.patch.object(drive, "tap", side_effect=AssertionError("typed instead of posted")):
                 drive.quit_step(hwnd, "SC_CLOSE")
             self.assertEqual(drive.wait_exit(n.pid, 10), 0)

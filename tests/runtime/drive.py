@@ -234,6 +234,25 @@ def quit_step(hwnd: int, key: str) -> None:
         tap(key)
 
 
+def clock() -> str:
+    return time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
+
+
+def minimize_restore(hwnd: int, seconds: float) -> dict:
+    """Minimize the window, wait, restore it and bring it to the front (worker C, Nov 16: the swapchain is recreated
+    on both). Returns the wall-clock times and whether Windows reported the window minimized each time."""
+    h = ctypes.c_void_p(hwnd)
+    out = {"minimizedAt": clock()}
+    user32.ShowWindow(h, 6)   # SW_MINIMIZE
+    time.sleep(seconds)
+    out["minimized"] = bool(user32.IsIconic(h))
+    out["restoredAt"] = clock()
+    user32.ShowWindow(h, 9)   # SW_RESTORE
+    out["front"] = front(hwnd)
+    out["restored"] = not user32.IsIconic(h)
+    return out
+
+
 def files_under(folder: str) -> dict[str, int]:
     """Every file below `folder`, as {path relative to it: write time in ns} (empty when the folder does not exist)."""
     return {os.path.relpath(p, folder): os.stat(p).st_mtime_ns
@@ -1373,6 +1392,26 @@ class Spot:
             if not out["gogglesOn"]:
                 raise RuntimeError("goggles did not turn on (no 'Goggles: on' in the proxy log)")
         self.hold(float(cfg.get("holdSeconds", 10)))
+        # cfg["minimize"] {"seconds", "after"} (worker C, Nov 16): mid-play minimize and restore before the quit;
+        # whether the game survived and ray tracing came back is read from telemetry over the "after" window.
+        if cfg.get("minimize"):
+            m = cfg["minimize"]
+            last = recent_telemetry(self.telemetry.path, 0)[-1:] if self.telemetry.path else []
+            before = last[0].get("frame", 0) if last else 0
+            out["minimize"] = minimize_restore(hwnd, float(m.get("seconds", 5)))
+            time.sleep(float(m.get("after", 10)))
+            out["minimize"]["aliveAfter"] = wait_exit(self.a.pid, 0) is None
+            # telemetry lines are about 25 KB (lumaThumb, rgbThumb): read enough tail for the whole window
+            tail = int((float(m.get("seconds", 5)) + float(m.get("after", 10))) * 40 * 30_000)
+            rows = [r for r in (recent_telemetry(self.telemetry.path, before, tail) if self.telemetry.path else [])
+                    if r.get("frame", 0) > before]
+            out["minimize"]["framesAfter"] = len(rows)
+            out["minimize"]["rayTracedFramesAfter"] = sum(bool(r.get("rayTraced")) for r in rows)
+            out["minimize"]["lastFrameRayTraced"] = bool(rows[-1].get("rayTraced")) if rows else None
+            print("MINIMIZE", json.dumps(out["minimize"]), flush=True)
+            if not out["minimize"]["aliveAfter"]:
+                out["exited"], out["exitCode"] = True, wait_exit(self.a.pid, 1)
+                return out
         last = recent_telemetry(self.telemetry.path, 0)[-10:] if self.telemetry.path else []
         out["rayTracedBeforeQuit"] = [bool(r.get("rayTraced")) for r in last]
         out["askedAt"] = time.strftime("%Y-%m-%d %H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
