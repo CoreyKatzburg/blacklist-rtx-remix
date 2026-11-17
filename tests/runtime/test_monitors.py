@@ -49,5 +49,29 @@ class MonitorStates(unittest.TestCase):
             self.assertTrue(mons["HKC2731"]["available"], order)
 
 
+class DdcHandles(unittest.TestCase):
+    def test_monitor_handle_above_2_31_reaches_the_call(self):
+        # Nov 16 21:40 monitor_proof: without argtypes ctypes passed HMONITOR as a C int, the enumeration callback hit
+        # "int too long to convert", and ACI27A8 got no DDC handle. A bad handle only makes the call return 0.
+        big, cnt, buf = 2**40 + 0x10001, M.wt.DWORD(), (M.PHYSICAL_MONITOR * 1)()
+        mi = M.MONITORINFOEXW(cbSize=M.ctypes.sizeof(M.MONITORINFOEXW))
+        M.user32.GetMonitorInfoW(big, M.ctypes.byref(mi))
+        M.dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR(big, M.ctypes.byref(cnt))
+        M.dxva2.GetPhysicalMonitorsFromHMONITOR(big, 1, buf)
+
+    def test_handle_zero_is_a_handle(self):
+        # Nov 16 21:45: HKC2731's physical monitor handle is 0, which a truth test reads as "no handle".
+        def reply(h, code, _, cur, mx):
+            cur._obj.value = M.DDC_OFF
+            return 1
+        with mock.patch.object(M, "ddc_open", return_value={"HKC2731": 0}), \
+             mock.patch.object(M.dxva2, "GetVCPFeatureAndVCPFeatureReply", side_effect=reply), \
+             mock.patch.object(M.dxva2, "SetVCPFeature", return_value=1) as setter:
+            self.assertEqual(M.ddc_read("HKC2731"), M.DDC_OFF)
+            self.assertTrue(M.ddc_power("HKC2731", M.DDC_ON))
+            self.assertIsNone(M.ddc_read("ACI27A8"))
+        setter.assert_called_once_with(0, 0xD6, M.DDC_ON)
+
+
 if __name__ == "__main__":
     unittest.main()

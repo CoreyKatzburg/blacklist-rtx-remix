@@ -215,6 +215,11 @@ class MONITORINFOEXW(ctypes.Structure):
 
 
 dxva2 = ctypes.WinDLL("dxva2", use_last_error=True)
+# Without argtypes ctypes passes a monitor handle as a C int, and a handle above 2**31 fails inside the enumeration
+# callback ("int too long to convert"): that monitor then gets no DDC handle (no-game probe, Nov 16 21:42).
+user32.GetMonitorInfoW.argtypes = [wt.HMONITOR, ctypes.c_void_p]
+dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR.argtypes = [wt.HMONITOR, ctypes.POINTER(wt.DWORD)]
+dxva2.GetPhysicalMonitorsFromHMONITOR.argtypes = [wt.HMONITOR, wt.DWORD, ctypes.c_void_p]
 dxva2.SetVCPFeature.argtypes = [wt.HANDLE, wt.BYTE, wt.DWORD]
 dxva2.GetVCPFeatureAndVCPFeatureReply.argtypes = [wt.HANDLE, wt.BYTE, ctypes.c_void_p, ctypes.POINTER(wt.DWORD),
                                                   ctypes.POINTER(wt.DWORD)]
@@ -241,7 +246,7 @@ def ddc_open() -> dict:
             dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR(hmon, ctypes.byref(cnt))
             arr = (PHYSICAL_MONITOR * cnt.value)()
             if cnt.value == 1 and dxva2.GetPhysicalMonitorsFromHMONITOR(hmon, cnt, arr):
-                _ddc[name] = arr[0].h
+                _ddc[name] = arr[0].h or 0   # ctypes reads handle 0 back as None
         return True
 
     user32.EnumDisplayMonitors(None, None, MonProc(cb), 0)
@@ -253,14 +258,14 @@ DDC_ON, DDC_STANDBY, DDC_OFF = 1, 4, 5   # VCP 0xD6 power mode; both monitors li
 
 def ddc_power(name: str, value: int) -> bool:
     """Sets VCP 0xD6 on one monitor through its kept handle. True when the monitor acknowledged the write."""
-    h = ddc_open().get(name)
-    return bool(h and dxva2.SetVCPFeature(h, 0xD6, value))
+    h = ddc_open().get(name)   # a physical monitor handle can be 0, so test for None
+    return bool(h is not None and dxva2.SetVCPFeature(h, 0xD6, value))
 
 
 def ddc_read(name: str) -> int | None:
     h = ddc_open().get(name)
     cur, mx = wt.DWORD(), wt.DWORD()
-    return cur.value if h and dxva2.GetVCPFeatureAndVCPFeatureReply(h, 0xD6, None, ctypes.byref(cur), ctypes.byref(mx)) else None
+    return cur.value if h is not None and dxva2.GetVCPFeatureAndVCPFeatureReply(h, 0xD6, None, ctypes.byref(cur), ctypes.byref(mx)) else None
 
 
 def snapshot(pid: int | None = None, known: list[str] | None = None, pnp: bool = True) -> dict:
