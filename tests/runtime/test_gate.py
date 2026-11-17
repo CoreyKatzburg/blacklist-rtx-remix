@@ -75,6 +75,58 @@ class MathTest(unittest.TestCase):
         self.assertEqual(gate.find_flashes(strobe), [])                     # 1-in-4 local strobe below flashes floor
         self.assertGreater(gate.still_flicker(strobe)[3], gate.THRESHOLDS["still_block_step4"])
 
+    def test_overlay_box_masked_in_screen_capture_checks(self):
+        # The NVIDIA performance overlay (tests/analysis/overlay_mask.py) changes its digits every frame. Screen-capture
+        # frames must have its box blanked the same way in every frame, and nothing outside it: a change only inside
+        # the box reads no flash or flicker, a change starting one row below or one column left is still caught, and
+        # the unmasked frames do read the inside shimmer as flicker (so the compare can fail). The box is about 1% of
+        # the picture, under flashes' 98th-percentile block cut, so flashes alone cannot show the unmasked failure.
+        w, h = 128, 72
+        x0, y0, x1, y1 = gate.overlay_mask.box_at(w, h)
+        base = self.rng.uniform(40, 150, (h, w)).astype(np.float32)
+        spot = {"_dir": None, "_data": {"telemetry": {}}}
+        win = {"frames": "w.gray", "frameSize": [w, h]}
+
+        def frames_with(region, amount, every=None):
+            f = np.array([base + self.rng.uniform(-1, 1, (h, w)) for _ in range(18)], np.float32)
+            for i in (every if every is not None else [6]):
+                f[i][region] += amount
+            return np.clip(f, 0, 255).astype(np.uint8)
+
+        inside = (slice(y0, y1 + 1), slice(x0, x1 + 1))
+        below = (slice(y1 + 1, y1 + 9), slice(x0, x1 + 1))
+        left = (slice(y0, y0 + 16), slice(x0 - 16, x0))
+        with tempfile.TemporaryDirectory() as t:
+            spot["_dir"] = t
+            path = os.path.join(t, "w.gray")
+            for name, region, flash in (("inside", inside, []), ("below", below, [6]), ("left", left, [6])):
+                with self.subTest(case=name):
+                    frames_with(region, 80).tofile(path)
+                    masked, src = gate.window_frames(spot, win)
+                    raw = gate.read_gray(path, w, h)
+                    self.assertIn("overlay box masked", src)
+                    self.assertEqual(gate.find_flashes(masked), flash)
+                    np.testing.assert_array_equal(masked[:, y1 + 1, x0:x1 + 1], raw[:, y1 + 1, x0:x1 + 1])
+                    np.testing.assert_array_equal(masked[:, y0:y1 + 1, x0 - 1], raw[:, y0:y1 + 1, x0 - 1])
+                    self.assertEqual(float(np.abs(masked[:, y0:y1 + 1, x0:x1 + 1]).max()), 0.0)
+            frames_with(inside, 30, every=range(1, 18, 2)).tofile(path)      # digits shimmering every other frame
+            masked, _ = gate.window_frames(spot, win)
+            self.assertGreater(gate.still_flicker(gate.read_gray(path, w, h))[0], gate.THRESHOLDS["still_block_jitter"])
+            self.assertLessEqual(gate.still_flicker(masked)[0], gate.THRESHOLDS["still_block_jitter"])
+
+            def goggles(region):
+                on = frames_with(region, 0, every=[])
+                off = on.copy(); off[(slice(None),) + region] = np.clip(off[(slice(None),) + region] + 80.0, 0, 255)
+                on.tofile(os.path.join(t, "on.gray")); off.tofile(os.path.join(t, "off.gray"))
+                s = {"name": "g", "_dir": t, "windows": [
+                    {"kind": "goggles", "goggles": {"mode": 1, "rt": rt, "toggled": True, "shot": f"{rt}.gray",
+                                                    "frameSize": [w, h]}} for rt in ("on", "off")]}
+                run = gate.Run.__new__(gate.Run); run.metrics = []
+                gate.goggles_check(run, [s])
+                return run.metrics[0]["detail"]
+            self.assertIn("corr 1.00, brightness gap 0.000, missing blocks 0.0%", goggles(inside))
+            self.assertNotIn("brightness gap 0.000", goggles(below))
+
     def test_large_shift_compares_without_shift_not_nan(self):
         # Phase correlation can report a shift that leaves no area to compare (16 of 36 rows here). That returned NaN,
         # which every "> limit" test silently reads as "not a flash". Expected value: the unshifted 98th percentile

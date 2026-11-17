@@ -114,6 +114,9 @@ import sys
 
 import numpy as np
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "analysis")))
+import overlay_mask  # noqa: E402  the NVIDIA performance overlay box, blanked in every screen-capture compare
+
 THRESHOLDS = {
     "nan_pixels": 0, "neon_fraction": 0.001, "skinned_min": 1, "remix_dropped_character_frames": 0,
     "outline_overlap": 0.85, "inward_fraction": 0.005,
@@ -535,7 +538,10 @@ def window_frames(spot: dict, w: dict) -> tuple[np.ndarray | None, str]:
     p = spot_path(spot, w.get("frames"))
     if p and os.path.exists(p):
         width, height = w["frameSize"]
-        return read_gray(p, width, height), "screen capture (gdigrab)"
+        frames = read_gray(p, width, height)
+        x0, y0, x1, y1 = overlay_mask.box_at(width, height)
+        frames[:, y0:y1 + 1, x0:x1 + 1] = 0            # every frame the same way, like overlay_mask.mask_pair
+        return frames, "screen capture (gdigrab, overlay box masked)"
     return None, "none"
 
 
@@ -2617,6 +2623,7 @@ def goggles_check(run: Run, spots: list[dict]) -> None:
                     imgs[rt] = read_gray(p, *g["frameSize"]).mean(axis=0) / 255.0   # average away goggle noise
             if len(imgs) != 2:
                 missing.append(f"{s['name']} mode {mode}: shot missing"); continue
+            imgs["on"], imgs["off"] = overlay_mask.mask_pair(imgs["on"], imgs["off"])
             ta, tb = thumb(imgs["on"]).ravel(), thumb(imgs["off"]).ravel()
             corr = float(np.corrcoef(ta, tb)[0, 1]) if ta.std() > 1e-6 and tb.std() > 1e-6 else 0.0
             gap = abs(float(imgs["on"].mean() - imgs["off"].mean()))
