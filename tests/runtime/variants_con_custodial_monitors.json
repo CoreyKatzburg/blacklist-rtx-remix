@@ -1,5 +1,5 @@
 {
- "about": "Worker C's monitor test (Nov 16, Corey approved; runs LAST, after every launch another worker waits on). Does detaching the monitors explain the morning's fast frames? One con_custodial launch, gate settings, holding y0_p0 after the bench window, no input during steps: live steps monitorStep both_on, second_off (DDC/CI VCP 0xD6=5 on ACI27A8 through a handle opened while attached, the method monitor_proof.py proves; put back on with 0xD6=1 after its hold), both_off (Corey switches both monitors off together by remote; the step runs from the first poll reading both detached to the last one; recorded as skipped if they do not both detach within 600 s), both_on_again (starts once both read attached and the display state reads on). Each live_stepN window records monitors, monitorsRaw and gameWindow at start and end and the wall clock; monitor_layout.json holds the layout before and after. Score: python -I tests\\analysis\\monitor_steps.py <spot folder>. Exit 0 = scored (Q1 may read NOT ANSWERED), 1 = VOID.",
+ "about": "Worker C's monitor test (Nov 16, Corey approved; runs LAST, after every launch another worker waits on). Does detaching the monitors explain the morning's fast frames? One con_custodial launch, gate settings, holding y0_p0 after the bench window, no input during steps. The driver switches no monitor (monitor_proof 21:58: DDC/CI VCP 0xD6=5 darkens ACI27A8 but Windows keeps it attached); Corey does both switch-offs by hand. Live steps monitorStep both_on; second_off (Corey takes ACI27A8's power away, e.g. its cable; the step starts when HKC2731 reads attached and ACI27A8 detached and runs while that holds, at most 45 s; skipped if not reached within 180 s); both_off (Corey switches both off at the plug; the step runs from the first poll reading both detached to the last one; skipped if not reached within 600 s); both_on_again (starts once both read attached and the display state reads on, so Corey must plug ACI27A8 back in too). Each live_stepN window records monitors, monitorsRaw and gameWindow at start and end and the wall clock; monitor_layout.json holds the layout before and after and whether both monitors are back. Score: python -I tests\\analysis\\monitor_steps.py <spot folder>. Exit 0 = scored (Q1 or Q2 may read NOT ANSWERED), 1 = VOID.",
  "spot": "con_custodial",
  "bench": {"settle": 5, "frames": 150},
  "variants": [
@@ -7,6 +7,6 @@
    "bench": {"liveSteps": [{"monitorStep": "both_on"}, {"monitorStep": "second_off"}, {"monitorStep": "both_off"},
                            {"monitorStep": "both_on_again"}],
              "liveStepSeconds": 45, "secondMonitor": "ACI27A8", "monitors": ["HKC2731", "ACI27A8"],
-             "monitorWaitSeconds": 600, "monitorPollSeconds": 1.0, "monitorBackSeconds": 90}}
+             "monitorSecondWaitSeconds": 180, "monitorWaitSeconds": 600, "monitorPollSeconds": 1.0}}
  ]
 }
