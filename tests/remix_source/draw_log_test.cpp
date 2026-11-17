@@ -198,6 +198,69 @@ static void testArming(const std::filesystem::path& dir) {
   expect(!std::filesystem::exists(dir / "t1_remix_draws.tsv.tmp"), "no temporary file left behind");
 }
 
+static void testCaptureWait(const std::filesystem::path& dir) {
+  // rtx.drawLog.waitForCapture: a one-frame USD capture opens and closes inside one end-of-frame step, after every
+  // draw of the frame (live 20261116-215353: every row read cap=0 on all 3 capture tries). The log must keep
+  // recording, drop frames nobody captured, and write the captured frame with the capturer's fill.
+  DrawLog log;
+  log.armIfNewTag("w1", true);
+  expect(log.active() && !log.ready(), "wait mode: armed but not ready before a capture");
+  for (uint32_t i = 0; i < 5; ++i) {
+    DrawLogRow r;
+    r.dcid = 100 + i;  // an uncaptured frame
+    log.add(r);
+  }
+  expect(!log.ready(), "wait mode: an uncaptured frame is not written");
+  log.skipFrame();
+  expect(log.active(), "wait mode: still armed after an uncaptured frame");
+  for (uint32_t i = 0; i < 2; ++i) {
+    DrawLogRow r;
+    r.dcid = 200 + i;  // the captured frame
+    r.capmesh = 0xAAAA000000000000ull + i;
+    log.add(r);
+  }
+  log.fillCapture([](DrawLogRow& r) {
+    r.cap = true;
+    r.capmat = r.capmesh & 1 ? 0 : 1;
+    r.capmeshmat = 1;
+    r.capmeshmathash = r.capmesh ^ 0xFFFF;
+  });
+  expect(log.ready(), "wait mode: ready after the capture fill");
+  const std::string path = log.write(dir, 77, 0.0);
+  expect(!path.empty() && !log.active(), "wait mode: captured frame written, log disarmed");
+  std::ifstream f(path);
+  std::string line;
+  std::getline(f, line);
+  const auto head = parse(line);
+  expect(head.at("draws") == "2" && head.at("capture") == "1", "wait mode header: " + line);
+  for (int i = 0; i < 2; ++i) {
+    std::getline(f, line);
+    const auto row = parse(line);
+    expect(row.at("order") == std::to_string(i) && row.at("dcid") == std::to_string(200 + i),
+           "wait mode: only the captured frame's rows, renumbered from 0: " + line);
+    expect(row.at("cap") == "1" && row.at("capmat") == (i ? "0" : "1") && row.at("capmeshmat") == "1",
+           "wait mode: cap fields come from the fill: " + line);
+  }
+  expect(!std::getline(f, line) || line.empty(), "wait mode: no extra rows");
+  f.close();
+  std::filesystem::remove(path);
+
+  // Without wait mode the next frame is written as before, with capture=0, and a fill on an unarmed log is a no-op.
+  DrawLog plain;
+  bool called = false;
+  plain.fillCapture([&called](DrawLogRow&) { called = true; });
+  expect(!called && !plain.ready(), "fill on an unarmed log does nothing");
+  plain.armIfNewTag("p1");
+  expect(plain.ready(), "plain mode: the next frame is ready without a capture");
+  plain.add(DrawLogRow());
+  const std::string p2 = plain.write(dir, 78, 0.0);
+  std::ifstream g(p2);
+  std::getline(g, line);
+  expect(parse(line).at("capture") == "0", "plain mode header reads capture=0: " + line);
+  g.close();
+  std::filesystem::remove(p2);
+}
+
 static void costs() {
   // Key off: processDrawCallState pays one bool test per draw; onFrameEnd one empty-string test.
   DrawLog off;
@@ -251,6 +314,7 @@ int main(int argc, char** argv) {
   testDraw305Shape();
   testTexcoordSource();
   testArming(dir);
+  testCaptureWait(dir);
   std::error_code ec;
   std::filesystem::remove_all(dir, ec);
   if (!(argc > 1 && std::string(argv[1]) == "--no-cost")) {

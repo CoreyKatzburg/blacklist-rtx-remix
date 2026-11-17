@@ -10,6 +10,9 @@ using rules Remix's own code makes true for every draw (two witnesses for each f
   tcbuf     tcsrc decl or vscapture exactly when tcstride > 0
   prims     prims == (idx or verts) // 3
   cap       cap 0 gives capmat -1 and capmeshmat -1; cap 1 gives capmat 0 or 1
+  capture   header capture=1 (rtx.drawLog.waitForCapture: rows filled by the capturer) gives cap 1 on every row,
+            capture=0 gives cap 0 on every row. A file without the key predates it (ee695ff). The report says
+            "cap fields: NOT MEASURED" unless capture=1: in ee695ff a one-frame capture could never set cap.
   ignored   ignored 1 gives inst 0 and instalbedo -1
   rtype     ralbedo is -1 exactly when rtype is not 0 (opaque)
   t0empty   t0empty 1 gives t0 0 for game draws (TextureRef::getImageHash is 0 without an image view)
@@ -48,6 +51,10 @@ def check(head, rows):
         fails.append(f"rows: header draws={head.get('draws')} but {len(rows)} rows")
     if [int(r["order"]) for r in rows] != list(range(len(rows))):
         fails.append("rows: order does not run 0..n-1")
+    if head.get("capture") in ("0", "1"):
+        off = [r["order"] for r in rows if r["cap"] != head["capture"]]
+        if off:
+            fails.append(f"capture: header capture={head['capture']} but {len(off)} rows differ (first order {off[0]})")
     for r in rows:
         o = r["order"]
         game = r["ext"] == "0"
@@ -90,7 +97,8 @@ def check(head, rows):
 
 def report(head, rows):
     fails, findings, counts = check(head, rows)
-    lines = [f"{len(rows)} draws, frame {head.get('frame') if head else '?'}"]
+    lines = [f"{len(rows)} draws, frame {head.get('frame') if head else '?'}",
+             "cap fields: " + ("measured (capture=1)" if head and head.get("capture") == "1" else "NOT MEASURED")]
     lines += [f"  {k}: {v}" for k, v in sorted(counts.items())]
     lines += [f"FINDING {f}" for f in findings]
     lines += [f"FAIL {f}" for f in fails]
@@ -109,8 +117,9 @@ def row(order, **kw):
     return r
 
 
-def fake_file(rows, draws=None):
-    lines = [f"remixframe\tframe=9\tqpcMs=1.000\ttag=t\tdraws={len(rows) if draws is None else draws}"]
+def fake_file(rows, draws=None, capture=None):
+    lines = [f"remixframe\tframe=9\tqpcMs=1.000\ttag=t\tdraws={len(rows) if draws is None else draws}"
+             + ("" if capture is None else f"\tcapture={capture}")]
     lines += ["remixdraw\t" + "\t".join(f"{k}={v}" for k, v in r.items()) for r in rows]
     return "\n".join(lines) + "\n"
 
@@ -171,6 +180,20 @@ def self_test():
     run("albedo valid and texcoords but not tracked is a FINDING, not a failure", fake_file(rows), 0, "order 0 ")
     rows = good_rows()
     run("a later draw of an instance is not compared", fake_file(rows), 0)
+    # Header capture key (rtx.drawLog.waitForCapture).
+    capd = [dict(r, cap="1", capmat="1" if i % 2 else "0", capmeshmat="1") for i, r in enumerate(good_rows())]
+    run("captured frame, every row filled", fake_file(capd, capture=1), 0)
+    run("captured frame but one row not filled", fake_file([capd[0], dict(capd[1], cap="0", capmat="-1",
+                                                                        capmeshmat="-1")] + capd[2:], capture=1), 1)
+    plain = [dict(r, cap="0", capmat="-1", capmeshmat="-1") for r in good_rows()]
+    run("uncaptured frame, no row filled", fake_file(plain, capture=0), 0)
+    run("uncaptured frame but a row reads cap 1", fake_file(plain[:6] + [capd[6]] + plain[7:], capture=0), 1)
+    code, lines = report(*parse(fake_file(plain, capture=0)))
+    ok = "cap fields: NOT MEASURED" in lines
+    code1, lines1 = report(*parse(fake_file(capd, capture=1)))
+    ok = ok and "cap fields: measured (capture=1)" in lines1
+    bad += not ok
+    print(f"{'ok  ' if ok else 'FAIL'} report says whether the cap fields were measured")
     print("remix_draw_log self-test:", "PASS" if not bad else f"FAIL ({bad})")
     return 1 if bad else 0
 
