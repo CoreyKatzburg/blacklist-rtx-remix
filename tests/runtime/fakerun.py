@@ -21,6 +21,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gate  # noqa: E402
+import display_state  # noqa: E402
 
 TW, TH = gate.THUMB_W, gate.THUMB_H
 PX_PER_DEG = 2.0
@@ -456,6 +457,8 @@ CASES = {
     "no_mouse_lag": ((), ("input_latency_ms",)),        # missing mouse_lag in spot.json: NOT MEASURED, fails the gate
     "fps_regression": (("fps_regression",), ()),        # 15% below the previous run
     "fps_drop_9pct": ((), ()),                          # 9% below the previous run: passes
+    "fps_previous_plug_off": ((), ("fps_regression",)),  # same FPS, previous run had the monitors off: NOT COMPARABLE
+    "fps_previous_unknown": ((), ("fps_regression",)),   # same FPS, previous run has no machine_before.json
     "no_reference": ((), ("reference_position", "input_latency_ms", "lamps_without_flare", "scene_brightness", "lights_orbs_unmatched", "lights_puffs", "lights_glows_lost")),
     "too_dark": (("scene_brightness",), ()),
     "too_dark_vs_raster": (("scene_brightness",), ()),
@@ -551,15 +554,20 @@ WARNS = {"low_fps": ("min_median_fps",), "near_target_fps": ("min_median_fps",),
          "dimmed_linger": ("lights_dimmed_linger",), "switchoff_lag": ("light_switchoff_lag",),
          "glow_puffs": ("lights_puffs",),
          "no_reference": ("frame_interval_vs_reference",), "spot_error": ("frame_interval_vs_reference",)}
-PREVIOUS = {"fps_regression", "fps_drop_9pct"}    # judged against a previous run: the healthy 100 FPS run
+PREVIOUS = {"fps_regression", "fps_drop_9pct", "fps_previous_plug_off", "fps_previous_unknown"}
+# judged against a previous run: the healthy 100 FPS run, in the display state named here (default plug on, as the run)
+PREVIOUS_DISPLAY = {"fps_previous_plug_off": display_state.OFF_002048, "fps_previous_unknown": None}
 NO_REFERENCE = {"no_reference"}                  # run without --reference
 
 
-def make_run(folder: str, case: str, no_remix: bool = False) -> str:
+def make_run(folder: str, case: str, no_remix: bool = False, display: dict | None = display_state.ON_212703) -> str:
+    """display: the spot's machine_before.json (display_state), None for a run recorded before Nov 16 16:58."""
     run = os.path.join(folder, case)
     shutil.rmtree(run, ignore_errors=True)
     os.makedirs(run)
     Builder(run, "s1", case).build()
+    if display is not None:
+        gate.save_json(os.path.join(run, "s1", "machine_before.json"), display)
     manifest = {"spots": ["s1"], "fake": case}
     if case == "noremix_scenedraws0" or no_remix:
         manifest["noRemix"] = True
@@ -677,7 +685,8 @@ def check_case(folder: str, case: str) -> tuple[bool, dict, str]:
     only WARNs when no previous run is given (the PREVIOUS cases get one)."""
     must_fail, must_nm = CASES[case]
     must_warn = WARNS.get(case, ())
-    previous = make_run(os.path.join(folder, "previous"), "good") if case in PREVIOUS else None
+    previous = make_run(os.path.join(folder, "previous"), "good",
+                        display=PREVIOUS_DISPLAY.get(case, display_state.ON_212703)) if case in PREVIOUS else None
     reference = None if case in NO_REFERENCE else make_run(os.path.join(folder, "reference"), "good",
                                                             no_remix=case != "orbs_remix_reference")
     gate.glow_blobs_stop = lambda r, o, still, orig: fake_glow_blobs(case, still)

@@ -41,7 +41,8 @@ Checks (thresholds in THRESHOLDS):
                            (proxy sceneDraws == 0 or all-zero/empty camera)
   min_median_fps           median FPS over the scene windows: WARN below 90 (Corey's target: a goal, not a limit)
   fps_regression           each spot's median FPS against the same spot in --previous: FAIL when more than 10% slower;
-                           WARN when no previous run is given
+                           WARN when no previous run is given; NOT MEASURED ("NOT COMPARABLE") when the two runs are
+                           not in the same known display state (display_state.py, machine_before.json)
   input_latency_ms         each spot's median game share of the mouse lag (spot.json mouse_lag.trials gameMs, >= 20
                            turns: mouse turn to the first proxy frame with the turned camera) against the same spot in
                            --reference (the no-Remix run): FAIL when more than the GUESS margin above it; NOT MEASURED when
@@ -116,6 +117,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "analysis")))
 import overlay_mask  # noqa: E402  the NVIDIA performance overlay box, blanked in every screen-capture compare
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import display_state  # noqa: E402  frame times compare only between runs in the same known display state
 
 THRESHOLDS = {
     "nan_pixels": 0, "neon_fraction": 0.001, "skinned_min": 1, "remix_dropped_character_frames": 0,
@@ -1292,13 +1295,21 @@ def spot_screen_lag(spot: dict) -> dict | None:
     return _lag_stats(raw) if isinstance(raw, list) else None
 
 
-def fps_regression_check(run: Run, good: list[dict], previous: dict[str, dict] | None) -> None:
+def fps_regression_check(run: Run, good: list[dict], previous: dict[str, dict] | None,
+                         previous_dir: str | None = None) -> None:
     """FAIL when a spot's median FPS is more than max_fps_drop below the same spot in the previous run. With no previous
-    run it only WARNs, since there is nothing to compare against."""
-    src = "previous run folder (--previous), same spot"
-    threshold = f"no spot more than {THRESHOLDS['max_fps_drop']:.0%} slower than its previous run"
+    run it only WARNs, since there is nothing to compare against. The two runs must be in the same known display state
+    (display_state.comparable, from each launch's machine_before.json): otherwise NOT MEASURED, detail "NOT COMPARABLE",
+    because a frame time with Corey's monitors on is about 12 % slower than with them off at the plug (Nov 17)."""
+    src = "previous run folder (--previous), same spot; display state from each run's machine_before.json"
+    threshold = f"no spot more than {THRESHOLDS['max_fps_drop']:.0%} slower than its previous run, same display state"
     if previous is None:
         run.add("fps_regression", WARN, None, threshold, "no previous run given (--previous): nothing to compare", src)
+        return
+    same_display, display_why = display_state.comparable(run.dir, previous_dir) if previous_dir else (
+        False, "NOT COMPARABLE: display state of the previous run unknown (no folder)")
+    if not same_display:
+        run.add("fps_regression", NOT_MEASURED, None, threshold, display_why, src)
         return
     drops, missing = [], []
     for s in good:
@@ -1313,7 +1324,8 @@ def fps_regression_check(run: Run, good: list[dict], previous: dict[str, dict] |
                 "no comparable FPS for: " + (", ".join(missing) or "no spot measured"), src)
         return
     worst = max(d[0] for d in drops)
-    detail = f"worst drop {worst:.1%}; " + "; ".join(f"{n} {b:.1f} -> {a:.1f} FPS" for _, n, b, a in drops)
+    detail = f"worst drop {worst:.1%} ({display_why}); " + "; ".join(
+        f"{n} {b:.1f} -> {a:.1f} FPS" for _, n, b, a in drops)
     run.add("fps_regression", PASS if worst <= THRESHOLDS["max_fps_drop"] else FAIL, round(worst, 4), threshold,
             detail, src)
 
@@ -1949,7 +1961,7 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
             run.add("min_median_fps", PASS if ok_fps else WARN, val_fps, fps_thresh,
                     f"median {fmt_fps(raw_fps, fps_target)} FPS, target is at or above {fps_target:g} FPS "
                     f"({want_fps} scene frames)", tsrc)
-    fps_regression_check(run, good, prev_spots)
+    fps_regression_check(run, good, prev_spots, previous)
 
     # Latency checks & Top 10 Latency Contributors breakdown
     want_lat, lat_recs = coverage(pick(SCENE), "telemetry", "telemetry")
