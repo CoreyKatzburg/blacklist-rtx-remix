@@ -440,6 +440,44 @@ class FakeRunTest(unittest.TestCase):
         self.assertEqual(counts(rx, "switch_flare_balls_off", "y0_p0"), (0, (0, 0, 0)))
         self.assertEqual(counts(dark, "y0_p0", "y0_p0"), (1, (13, 5, 6)))
         self.assertEqual(gate.glow_blobs_stop(rx, og, "y135_p0", "y135_p0")[0], 2)
+
+    def test_glow_checks_goggles_window_needs_a_goggles_reference(self):
+        """Worker B, Nov 17: 152548 con_custodial switch_goggles_on against the original's y0_p0 read 24 lost glows that
+        were the goggles. Fake spot, glow_blobs stubbed to read 24 lost on the goggles stop: a reference with only
+        y0_p0 leaves the goggles stop out (listed as NOT MEASURED in the detail, lights_glows_lost PASS on y0_p0); a
+        reference with a still of the same name compares it, and the 24 lost fails the check. Without the fix the first
+        case pairs the goggles stop with y0_p0 and fails."""
+        pose = [("y0_p0", 0, 0, (0, 0, 0), 0.0, 0.0), ("switch_goggles_on", 0, 0, (0, 0, 0), 0.0, 0.0)]
+        calls = []
+
+        def stub(remix_spot, orig_spot, still, orig_still):
+            calls.append((still, orig_still))
+            lost = 24 if still == "switch_goggles_on" else 0
+            return (1 if lost else 0), (f"glow_blobs: unmatched 0 of 3 blobs\nglow_blobs: puffs 0\n"
+                                        f"glow_blobs: lost {lost} of 30 original glows\n")
+
+        real = gate.glow_blobs_stop
+        gate.glow_blobs_stop = stub
+        self.addCleanup(setattr, gate, "glow_blobs_stop", real)
+        with tempfile.TemporaryDirectory() as td:
+            remix = self._pose_spot(td, "remix", pose)
+            remix["windows"][1].update(kind="switch", switch={"goggles": True})
+            for case, ref_stills, want_calls, want in (
+                    ("no goggles still", pose[:1], [("y0_p0", "y0_p0")], gate.PASS),
+                    ("goggles still", pose, [("switch_goggles_on", "switch_goggles_on"), ("y0_p0", "y0_p0")],
+                     gate.FAIL)):
+                with self.subTest(case):
+                    calls.clear()
+                    ref = self._pose_spot(td, f"ref_{len(ref_stills)}", ref_stills)
+                    remix["name"] = ref["name"] = "spot"
+                    run = self._stub_run()
+                    gate.glow_checks(run, [remix], {"spot": ref}, True)
+                    self.assertEqual(sorted(calls), want_calls)
+                    lost = next(m for m in run.metrics if m["check"] == "lights_glows_lost")
+                    self.assertEqual(lost["status"], want, lost)
+                    if want == gate.PASS:
+                        self.assertIn("switch_goggles_on: NOT MEASURED, goggles on", lost["detail"])
+
     def test_lamps_dimmed_on_142638(self):
         """lights_lamps_dimmed (worker B's 32a905d): 142638 con_bright_hall's switch steps against switch_base,
         switch_base_again and reference 000454's y0_p0. Real: every change dims 0 of 5 lamps, PASS; the goggles switch

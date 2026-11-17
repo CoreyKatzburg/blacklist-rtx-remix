@@ -1582,6 +1582,13 @@ def glow_checks(run: Run, good: list[dict], reference: dict[str, dict] | None, r
             orig = w["name"] if w["name"] in ref_stills else ("y0_p0" if w["kind"] == "switch" else None)
             if orig not in ref_stills:
                 continue
+            if (w.get("switch") or {}).get("goggles") and orig != w["name"]:
+                # Goggles replace the picture, so a goggles-on still is compared only with a reference goggles still
+                # of the same name (worker B, Nov 17: 152548 con_custodial switch_goggles_on against the original's
+                # y0_p0 read 24 lost glows that were the goggles, not lost lamps).
+                apart.append(f"{s['name']} {w['name']}: NOT MEASURED, goggles on and the reference has no goggles "
+                             f"still of that name")
+                continue
             placed, why = reference_position(s, w["name"], ref, orig)
             if placed:
                 jobs.append((s["name"], s["_dir"], ref["_dir"], w["name"], orig))
