@@ -1,0 +1,15 @@
+{
+ "about": "Coordinator's cut of the frame-time sweep (Nov 17): 8 clean launches at con_custodial y0_p0, one setting (or one pair) changed against the play-setup baseline, base first and last. Each launch: the bench still (5 s settle, 150 frames, screen frames for still_flicker, y0_p0 final.pfm for pfm_brightness and glow_blobs), the revisit, then the 20-turn mouse_lag with the normalised first_turned (db7e0ba). Scored by tests\\runtime\\sweep_score.py: FASTER only when a variant's frame time beats both bases by more than the floor (the two bases' difference, at least 0.626 ms) and no picture check is worse than base against the original. verify_runtime.ps1 -Variants <this file>.",
+ "spot": "con_custodial",
+ "bench": {"settle": 5, "frames": 150, "revisit": true, "mouseLag": true},
+ "variants": [
+  {"name": "01_base"},
+  {"name": "02_dlss_balanced_2", "rtx": {"rtx.qualityDLSS": "2"}},
+  {"name": "03_dlss_perf_1", "rtx": {"rtx.qualityDLSS": "1"}},
+  {"name": "04_rr_cnn_0", "rtx": {"rtx.rayreconstruction.model": "0"}},
+  {"name": "05_rr_cnn_0_dlss_balanced_2", "rtx": {"rtx.rayreconstruction.model": "0", "rtx.qualityDLSS": "2"}},
+  {"name": "06_rr_cnn_0_dlss_perf_1", "rtx": {"rtx.rayreconstruction.model": "0", "rtx.qualityDLSS": "1"}},
+  {"name": "07_telemetry_off", "proxy": {"EnableDebuggingTelemetry": "0", "FrameTrace": "1", "CallTiming": "0", "HitchSampler": "0"}},
+  {"name": "08_base"}
+ ]
+}
