@@ -1300,6 +1300,77 @@ class Reference(unittest.TestCase):
             # an unknown state is refused before any change
             spot().bench({"settle": 0, "frames": 1, "liveSteps": [{"monitorStep": "both_on", "ampWindow": "hidden"}]})
 
+    def test_every_launch_holds_the_amp_window_minimized_and_a_window_where_it_was_not_voids_the_spot(self):
+        # Coordinator, Nov 17 after 20261117-114305: every launch minimizes the Amp window before any measured step,
+        # with the watchdog started first; each window records whether it read minimized at its start and end; a
+        # window where it did not voids the spot; the window is restored at the end, also after a failure.
+        self.assertTrue(drive.amp_hold_wanted({"name": "x"}))
+        self.assertFalse(drive.amp_hold_wanted({"ampWindow": "as_is"}))
+        self.assertFalse(drive.amp_hold_wanted({"bench": {"liveSteps": [{"monitorStep": "both_on",
+                                                                          "ampWindow": "minimized"}]}}))
+        with self.assertRaises(ValueError):
+            drive.amp_hold_wanted({"ampWindow": "hidden"})
+
+        def run(restore_in=None, minimize_takes=True, found=True, fail_in=None):
+            calls, fake = [], {"min": False, "n": 0}
+            s = drive.Spot.__new__(drive.Spot)
+            s.out, s.windows, s.yaw, s.pitch = "out", [], 0.0, 0.0
+            s.counters = lambda: {"telemetry": 0, "proxy": 0}
+            s.hold = lambda seconds, until=None: None
+
+            def mini(h):
+                calls.append("minimize")
+                fake["min"] = minimize_takes
+
+            def body():
+                fake["n"] += 1
+                if fake["n"] == restore_in:      # someone restores the Amp window during this window
+                    fake["min"] = False
+                if fake["n"] == fail_in:
+                    raise RuntimeError("game gone")
+            with mock.patch.object(drive.amp_window, "find", lambda: (55, 1, "Amp") if found else (0, 0, "")), \
+                    mock.patch.object(drive.amp_window, "start_watchdog",
+                                      lambda h, at, log: calls.append(("watchdog", h)) or 999), \
+                    mock.patch.object(drive.amp_window, "state",
+                                      lambda with_webview=False: {"found": True, "minimized": fake["min"]}), \
+                    mock.patch.object(drive.amp_window, "is_minimized", lambda h: fake["min"]), \
+                    mock.patch.object(drive.amp_window, "minimize", mini), \
+                    mock.patch.object(drive.amp_window, "restore",
+                                      lambda h: calls.append("restore") or fake.update(min=False)), \
+                    mock.patch.object(drive.time, "sleep", lambda x: None):
+                try:
+                    s.amp_hold_start()
+                    for i in range(3):
+                        s.window(f"still{i + 1}", "still", body)
+                except RuntimeError as e:
+                    calls.append(f"error: {e}")
+                finally:
+                    s.amp_hold_end()
+            return s, calls
+        s, calls = run()
+        self.assertEqual(calls[:2], [("watchdog", 55), "minimize"])                    # watchdog before the change
+        self.assertEqual([w["ampMinimized"] for w in s.windows], [[True, True]] * 3)
+        self.assertTrue(s.amp_hold["allMinimized"])
+        self.assertIsNone(drive.amp_hold_void(s.amp_hold))
+        self.assertEqual(calls[-1], "restore")
+        self.assertFalse(s.amp_hold["after"]["minimized"])
+        s, _ = run(restore_in=2)                                                      # restored inside window 2
+        self.assertEqual([w["ampMinimized"] for w in s.windows], [[True, True], [True, False], [False, False]])
+        self.assertEqual(s.amp_hold["notMinimized"], ["still2", "still3"])
+        self.assertIn("VOID", drive.amp_hold_void(s.amp_hold))
+        s, calls = run(minimize_takes=False)                                          # the minimize does not take
+        self.assertIn("error: VOID: the Amp window did not read back minimized before the measured steps", calls)
+        self.assertEqual(s.windows, [])
+        self.assertIn("VOID", drive.amp_hold_void(s.amp_hold))
+        s, calls = run(fail_in=2)                                                     # a step fails while minimized
+        self.assertEqual(calls[-1], "restore")
+        self.assertFalse(s.amp_hold["after"]["minimized"])
+        s, calls = run(found=False)                                                   # no Amp app running
+        self.assertNotIn("minimize", calls)
+        self.assertNotIn("ampMinimized", s.windows[0])
+        self.assertIsNone(s.amp_hold["allMinimized"])
+        self.assertIsNone(drive.amp_hold_void(s.amp_hold))
+
     def test_bits_are_set_again_after_a_relink_and_a_bit_that_did_not_read_back_voids_the_spot(self):
         # Worker G's game_bits on the spot "bits" field: every call is recorded; a relink (new pawn, new guards) sets
         # them again; a set that did not read back makes the spot NOT MEASURED. No "bits" field: no call at all.

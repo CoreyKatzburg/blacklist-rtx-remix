@@ -31,6 +31,8 @@ PLUG_ON, PLUG_OFF, UNKNOWN = "plug on", "plug off", "unknown"
 MONITORS = ("HKC2731", "ACI27A8")
 PLUG_ON_PRIMARY, PLUG_ON_HZ = "HKC2731", 240
 PLUG_OFF_DISPLAY, PLUG_OFF_HZ = "ASUS MG278", 60
+AMP_MIN, AMP_DRAWING, AMP_NONE = "minimized", "drawing", "no Amp window"
+AMP_NOT_RECORDED, AMP_MIXED = "not recorded", "mixed"
 
 
 def _load(path: str) -> dict | None:
@@ -100,14 +102,58 @@ def run_state(folder: str) -> dict:
             f"all {len(launches)} launches {classes[0]}", "launches": launches}
 
 
+def amp_launch_state(launch: str) -> tuple[str, str]:
+    """The Amp app window's state during one launch, from its spot.json (drive.py's "ampWindow" record, Nov 17 from
+    20261117-114305; the launch-wide minimize from the same day): minimized (read minimized before the steps and at the
+    start and end of every measured window), drawing (not minimized at the launch start and end, no hold), no Amp
+    window, not recorded, or mixed (the Amp-window test, a minimize that did not hold, or a start and end that differ)."""
+    spot = _load(os.path.join(launch, "spot.json"))
+    aw = (spot or {}).get("ampWindow")
+    if not aw:
+        return AMP_NOT_RECORDED, "no Amp window record in spot.json (recorded from 20261117-114305)"
+    if spot.get("ampWindowTest"):
+        return AMP_MIXED, "the Amp-window test: its state changes between windows"
+    hold = aw.get("hold")
+    if hold:
+        if hold.get("found") is False:
+            return AMP_NONE, "no Amp window found when the launch held it"
+        if hold.get("allMinimized"):
+            return AMP_MIN, "minimized before the steps and at the start and end of every measured window"
+        return AMP_MIXED, f"the launch-wide minimize did not hold (not minimized in {hold.get('notMinimized')})"
+    st, en = aw.get("start") or {}, aw.get("end") or {}
+    if st.get("found") and en.get("found") and not st.get("minimized") and not en.get("minimized"):
+        return AMP_DRAWING, "not minimized at the launch start and end, no launch-wide minimize"
+    if st.get("found") is False and en.get("found") is False:
+        return AMP_NONE, "no Amp window at the launch start and end"
+    return AMP_MIXED, f"start {st.get('minimized')} / end {en.get('minimized')} (found {st.get('found')} / {en.get('found')})"
+
+
+def amp_run_state(folder: str) -> tuple[str, str]:
+    """Every launch folder of a run (those holding machine_before.json or spot.json) must agree."""
+    launches = sorted({os.path.dirname(f) for p in ("machine_before.json", "spot.json")
+                       for f in glob.glob(os.path.join(folder, "*", p))})
+    if not launches:
+        return AMP_NOT_RECORDED, "no launch folder"
+    got = {os.path.basename(x): amp_launch_state(x) for x in launches}
+    classes = sorted({c for c, _ in got.values()})
+    if len(classes) > 1:
+        return AMP_MIXED, "launches differ: " + ", ".join(f"{k} {c}" for k, (c, _) in got.items())
+    return classes[0], next(iter(got.values()))[1] if len(got) == 1 else f"all {len(got)} launches {classes[0]}"
+
+
 def comparable(a: str, b: str) -> tuple[bool, str]:
-    """Whether frame times of runs a and b may be compared: same class, and not unknown."""
+    """Whether frame times of runs a and b may be compared: same display class, not unknown; and the same Amp window
+    state, not mixed (coordinator, Nov 17: the drawing Amp window cost 8 ms a frame in 20261117-114305). Two runs whose
+    Amp window was not recorded still compare with each other, never with a recorded one."""
     sa, sb = run_state(a), run_state(b)
     na, nb = os.path.basename(os.path.normpath(a)), os.path.basename(os.path.normpath(b))
     if sa["class"] == UNKNOWN or sb["class"] == UNKNOWN or sa["class"] != sb["class"]:
         return False, (f"NOT COMPARABLE: display state {sa['class']} in {na} ({sa['why']}), "
                        f"{sb['class']} in {nb} ({sb['why']})")
-    return True, f"display state {sa['class']} in both {na} and {nb}"
+    (ca, wa), (cb, wb) = amp_run_state(a), amp_run_state(b)
+    if ca == AMP_MIXED or cb == AMP_MIXED or ca != cb:
+        return False, f"NOT COMPARABLE: Amp window {ca} in {na} ({wa}), {cb} in {nb} ({wb})"
+    return True, f"display state {sa['class']} and Amp window {ca} in both {na} and {nb}"
 
 
 def classify_root(root: str) -> list[str]:
@@ -162,12 +208,15 @@ def self_test() -> int:
     check("none present, MG278 at 144 Hz", classify(dict(OFF_002048, displays=dict(OFF_002048["displays"],
                                                                                  refreshHz=143.86)))[0], UNKNOWN)
     with tempfile.TemporaryDirectory() as root:
-        def run(name, *records, layout=None):
+        def run(name, *records, layout=None, amp=None):
             os.makedirs(os.path.join(root, name), exist_ok=True)
             for i, r in enumerate(records):
                 os.makedirs(os.path.join(root, name, f"l{i}"), exist_ok=True)
                 with open(os.path.join(root, name, f"l{i}", "machine_before.json"), "w") as f:
                     json.dump(r, f)
+                if amp is not None:
+                    with open(os.path.join(root, name, f"l{i}", "spot.json"), "w") as f:
+                        json.dump(amp, f)
                 if layout is not None:
                     with open(os.path.join(root, name, f"l{i}", "monitor_layout.json"), "w") as f:
                         json.dump({"layoutBefore": layout}, f)
@@ -190,6 +239,28 @@ def self_test() -> int:
         check("monitor_layout.json with MG278 primary while both present",
               run_state(run("lay_bad", ON_212703, layout=[OFF_002048["displays"]]))["class"], UNKNOWN)
         check("refusal names both states", comparable(off, on_a)[1].startswith("NOT COMPARABLE: display state plug off"),
+              True)
+        # The Amp window (coordinator, Nov 17 after 20261117-114305): the same known state on both runs.
+        win = {"found": True, "minimized": False}
+        held = {"ampWindow": {"start": win, "end": win, "hold": {"found": True, "allMinimized": True}}}
+        drawing = {"ampWindow": {"start": win, "end": win}}
+        broke = {"ampWindow": {"start": win, "end": win, "hold": {"found": True, "allMinimized": False,
+                                                                     "notMinimized": ["still3"]}}}
+        test = {"ampWindow": {"start": win, "end": win}, "ampWindowTest": {"hwnd": 1}}
+        m1, m2 = run("m1", ON_212703, amp=held), run("m2", ON_LAYOUT, amp=held)
+        d1, nr = run("d1", ON_212703, amp=drawing), run("nr", ON_212703, amp={"windows": []})
+        check("Amp minimized against drawing is refused", comparable(m1, d1)[0], False)
+        check("Amp minimized against not recorded is refused", comparable(m1, nr)[0], False)
+        check("Amp not recorded against minimized is refused", comparable(on_a, m1)[0], False)
+        check("two Amp-minimized runs compare", comparable(m1, m2)[0], True)
+        check("two drawing runs compare", comparable(d1, run("d2", ON_212703, amp=drawing))[0], True)
+        check("two runs without an Amp record compare (as before Nov 17)", comparable(on_a, nr)[0], True)
+        check("a minimize that did not hold is refused", comparable(run("b1", ON_212703, amp=broke), m1)[0], False)
+        check("the Amp-window test is refused even against itself", comparable(run("t1", ON_212703, amp=test),
+                                                                              run("t2", ON_212703, amp=test))[0], False)
+        check("plug off with Amp minimized against plug on with Amp minimized is still refused",
+              comparable(run("offm", OFF_002048, amp=held), m1)[0], False)
+        check("refusal names the Amp states", comparable(m1, d1)[1].startswith("NOT COMPARABLE: Amp window minimized"),
               True)
     print("self-test:", "PASS" if not fails else f"FAIL ({fails})")
     return 1 if fails else 0

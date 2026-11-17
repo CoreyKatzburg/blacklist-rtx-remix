@@ -33,7 +33,7 @@ import gate  # noqa: E402  (file helpers)
 import display  # noqa: E402  (display power state)
 import monitors  # noqa: E402  (which monitors Windows sees; DDC/CI power for the monitor test)
 import game_bits  # noqa: E402  (worker G: Sam invisible / godmode, guards blind, with read-back)
-import amp_window  # noqa: E402  (the Amp app window: state per launch; minimized only for the Amp-window test)
+import amp_window  # noqa: E402  (the Amp app window: state per launch; minimized for every launch's measured steps)
 
 FFMPEG = r"d:\ffmpeg\bin\ffmpeg.exe"
 CAP_W, CAP_H = 320, 180
@@ -276,6 +276,28 @@ def amp_state(with_webview: bool = True) -> dict:
         return amp_window.state(with_webview=with_webview)
     except Exception as e:   # noqa: BLE001
         return {"found": None, "error": f"{type(e).__name__}: {e}"}
+
+
+AMP_HOLD_DEADLINE_S = 45 * 60   # the launch-wide minimize's watchdog: past verify_runtime's 40 min drive.py limit
+AMP_HOLDS = ("minimized", "as_is")
+
+
+def amp_hold_wanted(spot: dict) -> bool:
+    """Whether a launch holds the Amp window minimized: always, unless the spot says "ampWindow": "as_is" or its live
+    steps ask "ampWindow" per window (the Amp-window test sets the state itself)."""
+    want = spot.get("ampWindow", "minimized")
+    if want not in AMP_HOLDS:
+        raise ValueError(f"spot ampWindow must be one of {AMP_HOLDS}, got {want!r}")
+    steps = (spot.get("bench") or {}).get("liveSteps") or []
+    return want == "minimized" and not any(k.get("ampWindow") for k in steps)
+
+
+def amp_hold_void(hold: dict) -> str | None:
+    """The spot error when a launch-wide minimize did not hold (spot void); None when it held or no Amp window ran."""
+    if hold.get("allMinimized") is False:
+        return (f"VOID: the Amp window was not minimized throughout the launch (read back before the steps "
+                f"{hold.get('readBack')}; not minimized in {hold.get('notMinimized')})")
+    return None
 
 
 def minimize_restore(hwnd: int, seconds: float) -> dict:
@@ -572,6 +594,7 @@ def first_turned(dirs, t0: float, degrees: float = 0.5) -> float | None:
 class Spot:
     bits: tuple[str, ...] = ()   # no "bits" field: relink sets nothing (__init__ sets the spot's own list)
     amp_test: dict | None = None   # the Amp-window test's watchdog and records, when a live step asks "ampWindow"
+    amp_hold: dict | None = None   # the launch-wide Amp window minimize (every launch since Nov 17 12:00)
 
     def __init__(self, a, spot: dict, checkpoint: dict):
         self.a, self.spot, self.cp = a, spot, checkpoint
@@ -953,11 +976,13 @@ class Spot:
             time.sleep(0.05)
 
     def window(self, name: str, kind: str, body, **extra) -> dict:
+        a = self.amp_minimized()   # both reads sit outside the window's frame range
         start = self.counters()
         body()
         end = self.counters()
         w = {"name": name, "kind": kind, "yaw": self.yaw, "pitch": self.pitch,
              "telemetry": [start["telemetry"], end["telemetry"]], "proxy": [start["proxy"], end["proxy"]], **extra}
+        self.amp_note(w, a, self.amp_minimized())
         self.windows.append(w)
         if getattr(self, "save_partial", None):
             self.save_partial()
@@ -1601,6 +1626,7 @@ class Spot:
             # Runs while Corey's state holds, polling without the PnP list (it starts a PowerShell process); the range
             # ends at the last poll that still read the state, and the poll that saw it change is kept as firstBack.
             run = seconds if step == "second_off" else wait
+            amp_a = self.amp_minimized()
             c0 = self.counters()
             last = (c0, snaps["start"], clocks[0])
             t0 = time.monotonic()
@@ -1616,6 +1642,7 @@ class Spot:
             clocks.append(c1clock)
             w = {"name": tag, "kind": "still", "yaw": self.yaw, "pitch": self.pitch,
                  "telemetry": [c0["telemetry"], c1["telemetry"]], "proxy": [c0["proxy"], c1["proxy"]], **rec}
+            self.amp_note(w, amp_a, self.amp_minimized())
             self.windows.append(w)
         else:
             # Both snapshots sit outside the window's frame range: the Get-PnpDevice list starts a PowerShell process.
@@ -1654,6 +1681,61 @@ class Spot:
         (amp_window.minimize if ask == "minimized" else amp_window.restore)(hwnd)
         self.hold(2.0)
         return {"asked": ask, "start": amp_window.state()}
+
+    def amp_hold_start(self) -> None:
+        """Every launch (coordinator, Nov 17 after 20261117-114305: the drawing Amp window cost 8 ms a frame and is not
+        a fixed condition): after the game is in front and before any measured step, the Amp app's window is minimized
+        and read back, with a detached watchdog restoring it AMP_HOLD_DEADLINE_S later (past verify_runtime's 40 min
+        limit for drive.py, which kills it without this finally). No Amp window: recorded, nothing to minimize."""
+        hwnd = amp_window.find()[0]
+        if not hwnd:
+            self.amp_hold = {"asked": "minimized", "found": False}
+            print("AMP WINDOW: no Amp window found; nothing to minimize", flush=True)
+            return
+        deadline = time.time() + AMP_HOLD_DEADLINE_S
+        log = os.path.join(self.out, "amp_watchdog.log")
+        rec = {"asked": "minimized", "found": True, "hwnd": hwnd, "before": amp_window.state(with_webview=True),
+               "watchdogLog": log, "watchdogDeadline": time.strftime("%H:%M:%S", time.localtime(deadline)),
+               "notMinimized": []}
+        rec["watchdogPid"] = amp_window.start_watchdog(hwnd, deadline, log)
+        self.amp_hold = rec
+        amp_window.minimize(hwnd)
+        self.hold(2.0)
+        rec["start"] = amp_window.state()
+        rec["readBack"] = amp_window.read_back("minimized", rec["start"])
+        print(f"AMP WINDOW minimized for the launch: read back {rec['readBack']}; watchdog pid {rec['watchdogPid']} "
+              f"restores it at {rec['watchdogDeadline']}", flush=True)
+        if not rec["readBack"]:
+            raise RuntimeError("VOID: the Amp window did not read back minimized before the measured steps")
+
+    def amp_minimized(self) -> bool | None:
+        """While the launch holds the Amp window minimized: whether it still reads minimized; None when not held."""
+        h = self.amp_hold
+        return amp_window.is_minimized(h["hwnd"]) if h and h.get("hwnd") else None
+
+    def amp_note(self, w: dict, a: bool | None, b: bool | None) -> None:
+        if a is None:
+            return
+        w["ampMinimized"] = [a, b]
+        if not (a and b):
+            self.amp_hold["notMinimized"].append(w["name"])
+
+    def amp_hold_end(self) -> None:
+        """When the launch ends, also after a failure: the Amp window restored and read back; allMinimized says whether
+        it read back minimized before the steps and at the start and end of every measured window."""
+        rec = self.amp_hold
+        if not rec.get("found"):
+            rec["allMinimized"] = None
+            return
+        try:
+            amp_window.restore(rec["hwnd"])
+            time.sleep(1.0)
+            rec["after"] = amp_window.state()
+        except Exception as e:   # noqa: BLE001
+            rec["after"] = {"error": f"{type(e).__name__}: {e}"}
+        rec["allMinimized"] = bool(rec.get("readBack")) and not rec["notMinimized"]
+        print(f"AMP WINDOW after the launch: minimized throughout {rec['allMinimized']}, restored "
+              f"{not rec['after'].get('minimized', True)}", flush=True)
 
     def amp_back(self) -> None:
         """After the live steps, also when one failed: the Amp window restored and read back."""
@@ -2412,6 +2494,10 @@ def main() -> int:
         elif "teleport" in spot:
             result["teleport"] = s.first_teleport(spot["teleport"])
         hwnd = game_window(a.pid)
+        if amp_hold_wanted(spot):   # after the game is in front, before any measured step
+            if hwnd:
+                front(hwnd)
+            s.amp_hold_start()
         if spot.get("quit"):   # one quit per launch: nothing else
             if not a.no_remix:
                 result["rayTracingAtStart"] = s.rt_is_on()
@@ -2494,6 +2580,11 @@ def main() -> int:
                 s.bit_calls.append({"on": False, "ok": False, "why": "end", "error": f"{type(e).__name__}: {e}"})
             if s.bits_problem() and not result["error"]:
                 result["error"] = s.bits_problem()
+        if s and s.amp_hold:
+            s.amp_hold_end()
+            result["ampWindow"]["hold"] = s.amp_hold
+            if amp_hold_void(s.amp_hold) and not result["error"]:
+                result["error"] = amp_hold_void(s.amp_hold)
         result["ampWindow"]["end"] = amp_state()
         if s:
             if s.amp_test:

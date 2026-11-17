@@ -155,6 +155,11 @@ def restore(hwnd: int) -> None:
         user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
 
 
+def is_minimized(hwnd: int) -> bool:
+    """Cheap per-window check (no monitor layout read): the window still exists and reads minimized."""
+    return bool(user32.IsWindow(hwnd) and user32.IsIconic(hwnd))
+
+
 def read_back(asked: str, st: dict) -> bool:
     """True when the window read back in the asked state: "minimized" or "as_is" (not minimized)."""
     return bool(st.get("found")) and st.get("minimized") == (asked == "minimized")
