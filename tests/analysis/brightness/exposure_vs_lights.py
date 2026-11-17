@@ -288,8 +288,66 @@ def _make_gate_stop_ok(run_dir: str, reference_dirs: list[str]):
     return ok
 
 
+EXPOSURE_SETTLE_WINDOW_MS = 2000.0
+MAX_SETTLED_EXPOSURE_REL_SPAN = 0.025
+MAX_SETTLED_EXPOSURE_F2F_REL = 0.005
+
+EXPOSURE_SETTLE_SPEC = {
+    "window_seconds": EXPOSURE_SETTLE_WINDOW_MS / 1000.0,
+    "max_rel_span": MAX_SETTLED_EXPOSURE_REL_SPAN,
+    "max_frame_to_frame_rel": MAX_SETTLED_EXPOSURE_F2F_REL,
+    "provenance": (
+        "Measured on 20261117-152548 con_custodial held windows: single-bucket held base steps "
+        "switch_base (52 frames, 1.72 s) and switch_base_again (50 frames, 1.64 s) have 0.0000% 2s span "
+        "and 0.0000% frame-to-frame wobble, and y0_p0 (41 frames, 1.33 s) has 0.0093% 2s span and "
+        "0.0009% frame-to-frame wobble; when Median-mode autoExposure (256 histogram bins across 7.0 EV, "
+        "1 bin = 1.87% at 4.2318..4.3108) straddles one bin boundary on held con_custodial windows "
+        "(switch_fill_lights_off 1.85%, y90_p30 1.69%, and 45 s held y0_p0 in 20261117-105336-settings "
+        "live_step1 1.82%), 2s span reaches 1.85% and max frame-to-frame step reaches 0.294%. "
+        "Thresholds 2.5% (last-2s relative span) and 0.5% (last-2s max frame-to-frame relative step) "
+        "on both effectiveExposure and autoExposure accept <=1 histogram-bin steady-state wobble and "
+        "reject multi-bin exposure ramps as NOT MEASURED ('exposure not settled')."
+    ),
+}
+
+
+def _select_last_window_rows(rows: list[dict[str, Any]], window_ms: float = EXPOSURE_SETTLE_WINDOW_MS) -> tuple[list[dict[str, Any]], float | None]:
+    """Selects rows within the last `window_ms` of `rows` using qpcMs or frameTimeMs (fallback: tail 60 frames)."""
+    if not rows:
+        return [], None
+    if all(r.get("qpcMs") is not None for r in rows):
+        q_end = float(rows[-1]["qpcMs"])
+        tail = [r for r in rows if q_end - float(r["qpcMs"]) <= window_ms]
+        dur = float(tail[-1]["qpcMs"]) - float(tail[0]["qpcMs"]) if len(tail) >= 2 else 0.0
+        return tail, dur
+    dts = [float(r.get("frameTimeMs") or 0.0) for r in rows]
+    if any(d > 0.0 for d in dts):
+        acc = 0.0
+        k = len(rows) - 1
+        for i in range(len(rows) - 1, -1, -1):
+            acc += dts[i] if dts[i] > 0.0 else 33.33
+            k = i
+            if acc >= window_ms:
+                break
+        return rows[k:], acc
+    tail_n = min(len(rows), 60)
+    return rows[-tail_n:], None
+
+
+def _series_wobble(vals: list[float]) -> tuple[float | None, float | None, float | None]:
+    """Returns (median, rel_span, max_frame_to_frame_rel) for a series of exposure samples."""
+    if not vals:
+        return None, None, None
+    arr = np.asarray(vals, dtype=np.float64)
+    med = float(np.median(arr))
+    denom = max(abs(med), 1e-6)
+    rel_span = float(arr.max() - arr.min()) / denom
+    f2f_rel = float(np.max(np.abs(np.diff(arr)))) / denom if arr.size >= 2 else 0.0
+    return med, rel_span, f2f_rel
+
+
 def extract_stop_exposure_telemetry(spot_dir: str) -> dict[str, dict[str, Any]]:
-    """Extracts per-window autoExposure, effectiveExposure, and rayTraced share from telemetry.jsonl."""
+    """Extracts per-window autoExposure, effectiveExposure, last-2s settle wobble, and rayTraced share."""
     tel_path = os.path.join(spot_dir, "telemetry.jsonl")
     spot_path = os.path.join(spot_dir, "spot.json")
     if not (os.path.isfile(tel_path) and os.path.isfile(spot_path)):
@@ -308,25 +366,40 @@ def extract_stop_exposure_telemetry(spot_dir: str) -> dict[str, dict[str, Any]]:
             continue
         rt_vals = [bool(r.get("rayTraced")) for r in rows]
         rt_share = float(sum(rt_vals)) / len(rt_vals)
-        # Settle over second half of window when >= 10 frames so live transitions have adapted.
-        settled = rows[len(rows) // 2 :] if len(rows) >= 10 else rows
-        ae_vals = [
+        tail_rows, tail_ms = _select_last_window_rows(rows, EXPOSURE_SETTLE_WINDOW_MS)
+        ae_tail = [
             float(r["autoExposure"])
-            for r in settled
+            for r in tail_rows
             if r.get("autoExposure") is not None and math.isfinite(float(r["autoExposure"]))
         ]
-        eff_vals = [
+        eff_tail = [
             float(r["effectiveExposure"])
-            for r in settled
+            for r in tail_rows
             if r.get("effectiveExposure") is not None and math.isfinite(float(r["effectiveExposure"]))
         ]
+        ae_med, ae_span_rel, ae_f2f_rel = _series_wobble(ae_tail)
+        eff_med, eff_span_rel, eff_f2f_rel = _series_wobble(eff_tail)
+        if len(ae_tail) >= 2 and len(eff_tail) >= 2:
+            settled_ok = (
+                max(float(ae_span_rel or 0.0), float(eff_span_rel or 0.0)) <= MAX_SETTLED_EXPOSURE_REL_SPAN
+                and max(float(ae_f2f_rel or 0.0), float(eff_f2f_rel or 0.0)) <= MAX_SETTLED_EXPOSURE_F2F_REL
+            )
+        else:
+            settled_ok = None
         entry: dict[str, Any] = {
             "n_frames": len(rows),
+            "last2s_frames": len(tail_rows),
+            "last2s_duration_ms": tail_ms,
             "ray_traced_share": rt_share,
-            "auto_exposure_median": float(np.median(ae_vals)) if ae_vals else None,
-            "effective_exposure_median": float(np.median(eff_vals)) if eff_vals else None,
+            "auto_exposure_median": ae_med,
+            "effective_exposure_median": eff_med,
+            "last2s_auto_exp_rel_span": ae_span_rel,
+            "last2s_eff_exp_rel_span": eff_span_rel,
+            "last2s_auto_exp_f2f_max_rel": ae_f2f_rel,
+            "last2s_eff_exp_f2f_max_rel": eff_f2f_rel,
+            "exposure_settled": settled_ok,
             "ceiling_clamped_share": (
-                float(np.mean([v >= 7.020 for v in ae_vals])) if ae_vals else None
+                float(np.mean([v >= 7.020 for v in ae_tail])) if ae_tail else None
             ),
         }
         out[wname] = entry
@@ -927,6 +1000,55 @@ def _expected_effective_exposure_ceiling(rtx_keys: dict[str, Any]) -> float | No
     return float(max_ae * mult)
 
 
+def _classify_live_step_role(
+    rtx_keys: dict[str, Any],
+    is_base: bool,
+    n_non_base_steps: int,
+) -> dict[str, Any]:
+    """Classifies whether a live step is a base anchor, a single-stage diagnostic isolator,
+    a multi-variant screening candidate, or a dedicated 3-step off/on/off fix test."""
+    if is_base:
+        return {
+            "step_role": "base_anchor",
+            "diagnostic_stage": None,
+            "narrows_cause_only": False,
+            "requires_dedicated_off_on_off": False,
+        }
+    ae_en = str(rtx_keys.get("rtx.autoExposure.enabled", "True")).strip().lower() != "false"
+    ev_min = float(rtx_keys.get("rtx.autoExposure.evMinValue", -2.0))
+    tm_mode = int(rtx_keys.get("rtx.tonemappingMode", 1))
+    ltm_exp = float(rtx_keys.get("rtx.localtonemap.exposure", 0.75))
+    ltm_sh = float(rtx_keys.get("rtx.localtonemap.shadows", 2.0))
+
+    if (not ae_en) and tm_mode == 1 and abs(ltm_sh - 2.0) < 1e-6:
+        return {
+            "step_role": "diagnostic_cause_isolation",
+            "diagnostic_stage": "stage1_auto_exposure_off_fixed_1x",
+            "narrows_cause_only": True,
+            "requires_dedicated_off_on_off": True,
+        }
+    if ae_en and abs(ev_min - (-2.0)) < 1e-6 and tm_mode == 1 and abs(ltm_exp - 0.75) < 1e-6 and abs(ltm_sh) < 1e-6:
+        return {
+            "step_role": "diagnostic_cause_isolation",
+            "diagnostic_stage": "stage2_localtonemap_shadows_zero_only",
+            "narrows_cause_only": True,
+            "requires_dedicated_off_on_off": True,
+        }
+    if n_non_base_steps > 1:
+        return {
+            "step_role": "screening_fix_candidate",
+            "diagnostic_stage": None,
+            "narrows_cause_only": True,
+            "requires_dedicated_off_on_off": True,
+        }
+    return {
+        "step_role": "dedicated_off_on_off_candidate",
+        "diagnostic_stage": None,
+        "narrows_cause_only": False,
+        "requires_dedicated_off_on_off": False,
+    }
+
+
 def score_live_steps(
     live_dir: str,
     reference_dirs: list[str],
@@ -967,6 +1089,8 @@ def score_live_steps(
     ]
     if len(live_wins) < 3:
         raise ValueError(f"Need at least 3 live_step windows (base, variant..., base_end) in {spot_path}")
+    n_non_base_steps = len(live_wins) - 2
+    sweep_design = "dedicated_off_on_off" if n_non_base_steps == 1 else "multi_variant_screening"
 
     raster_pfm, ref_pose_err, ref_err_reason = _find_on_pose_reference_pfm(spot_name, ref_tag, reference_dirs)
     raster_img = gate.read_pfm(raster_pfm) if raster_pfm else None
@@ -989,9 +1113,16 @@ def score_live_steps(
         rtx_keys = dict(w.get("liveRtx") or {})
         label = _describe_live_rtx(rtx_keys, stag)
         is_base = idx in (0, len(live_wins) - 1)
+        role_info = _classify_live_step_role(rtx_keys, is_base=is_base, n_non_base_steps=n_non_base_steps)
         f_pfm = os.path.join(gate_dir, f"{stag}_final.pfm")
         if not os.path.isfile(f_pfm):
-            raw_steps[stag] = {"step": stag, "label": label, "is_base": is_base, "status": "MISSING_FINAL"}
+            raw_steps[stag] = {
+                "step": stag,
+                "label": label,
+                "is_base": is_base,
+                **role_info,
+                "status": "MISSING_FINAL",
+            }
             continue
         f_img = gate.read_pfm(f_pfm)
         f_stats = pb.image_brightness_stats(f_img, mask_hud=True)
@@ -1010,11 +1141,19 @@ def score_live_steps(
             "step": stag,
             "label": label,
             "is_base": is_base,
+            **role_info,
             "rtx": rtx_keys,
             "ray_traced": rt_ok,
             "ray_traced_share": rt_share,
             "auto_exposure_median": ae_med,
             "effective_exposure_median": eff_med,
+            "exposure_settled": tel_info.get("exposure_settled"),
+            "last2s_frames": tel_info.get("last2s_frames"),
+            "last2s_duration_ms": tel_info.get("last2s_duration_ms"),
+            "last2s_auto_exp_rel_span": tel_info.get("last2s_auto_exp_rel_span"),
+            "last2s_eff_exp_rel_span": tel_info.get("last2s_eff_exp_rel_span"),
+            "last2s_auto_exp_f2f_max_rel": tel_info.get("last2s_auto_exp_f2f_max_rel"),
+            "last2s_eff_exp_f2f_max_rel": tel_info.get("last2s_eff_exp_f2f_max_rel"),
             "depth_diff_vs_step1": depth_diff,
             "gamma_mean": float(f_stats["gamma_mean"]),
             "linear_mean": float(f_stats["linear_mean"]),
@@ -1025,8 +1164,18 @@ def score_live_steps(
 
     b1 = raw_steps.get(base_tag, {})
     bN = raw_steps.get(end_tag, {})
-    base_luma = b1.get("gamma_mean") if b1.get("ray_traced") is not False else None
-    base_end_luma = bN.get("gamma_mean") if bN.get("ray_traced") is not False else None
+    b1_settled = b1.get("exposure_settled") is True
+    bN_settled = bN.get("exposure_settled") is True
+    base_luma = (
+        b1.get("gamma_mean")
+        if (b1.get("ray_traced") is not False and b1_settled)
+        else None
+    )
+    base_end_luma = (
+        bN.get("gamma_mean")
+        if (bN.get("ray_traced") is not False and bN_settled)
+        else None
+    )
     base_eff_exp = b1.get("effective_exposure_median")
 
     non_base_lumas = {
@@ -1047,6 +1196,9 @@ def score_live_steps(
             if entry["ray_traced"] is False:
                 out["measurement_status"] = "NOT_MEASURED"
                 out["reasons"] = ["not_ray_traced"]
+            elif entry["exposure_settled"] is not True:
+                out["measurement_status"] = "NOT_MEASURED"
+                out["reasons"] = ["exposure not settled"]
             elif entry["depth_diff_vs_step1"] is not None and entry["depth_diff_vs_step1"] > POSE_DEPTH_MAX_PIXELS:
                 out["measurement_status"] = "NOT_MEASURED"
                 out["reasons"] = ["intra_launch_pose_moved"]
@@ -1076,26 +1228,42 @@ def score_live_steps(
         if entry["ray_traced"] is False:
             out["measurement_status"] = "NOT_MEASURED"
             out["gate_pass"] = False
+            out["counts_as_proven_fix"] = False
             out["reasons"] = ["not_ray_traced"]
+        elif entry["exposure_settled"] is not True:
+            out["measurement_status"] = "NOT_MEASURED"
+            out["gate_pass"] = None
+            out["counts_as_proven_fix"] = False
+            out["reasons"] = ["exposure not settled"]
         elif not took_ok:
             out["measurement_status"] = "NOT_MEASURED"
             out["gate_pass"] = False
+            out["counts_as_proven_fix"] = False
             out["reasons"] = ["live_rtx_did_not_take"]
         elif entry["depth_diff_vs_step1"] is not None and entry["depth_diff_vs_step1"] > POSE_DEPTH_MAX_PIXELS:
             out["measurement_status"] = "NOT_MEASURED"
             out["gate_pass"] = False
+            out["counts_as_proven_fix"] = False
             out["reasons"] = ["intra_launch_pose_moved"]
+        elif not b1_settled or not bN_settled:
+            out["measurement_status"] = "NOT_MEASURED"
+            out["gate_pass"] = None
+            out["counts_as_proven_fix"] = False
+            out["reasons"] = ["exposure not settled"]
         elif de["status"] == "NOT_MEASURED":
             out["measurement_status"] = "NOT_MEASURED"
             out["gate_pass"] = None
+            out["counts_as_proven_fix"] = False
             out["reasons"] = [de["reason"]]
         elif not ref_placed or raster_img is None or entry["vs_raster"] is None:
             out["measurement_status"] = "NOT_MEASURED"
             out["gate_pass"] = None
+            out["counts_as_proven_fix"] = False
             out["reasons"] = [ref_place_reason or ref_err_reason or "missing_reference"]
         elif entry["vs_raster"].get("black_raster"):
             out["measurement_status"] = "NOT_MEASURED"
             out["gate_pass"] = None
+            out["counts_as_proven_fix"] = False
             out["reasons"] = ["black_raster"]
         else:
             out["measurement_status"] = "MEASURED"
@@ -1122,6 +1290,11 @@ def score_live_steps(
             if nw_delta > PASS_THRESHOLDS["max_near_white_delta"]:
                 reasons.append(f"near_white_excess (+{nw_delta:.4f} > +{PASS_THRESHOLDS['max_near_white_delta']})")
             out["gate_pass"] = len(reasons) == 0
+            out["counts_as_proven_fix"] = bool(
+                out["gate_pass"]
+                and not out.get("narrows_cause_only")
+                and not out.get("requires_dedicated_off_on_off")
+            )
             out["reasons"] = reasons
             if out["gate_pass"]:
                 passing_steps.append(stag)
@@ -1164,8 +1337,38 @@ def score_live_steps(
     else:
         verdict = "inconclusive"
 
+    diagnostic_isolation_variants = [
+        stag
+        for stag, v in steps_scored.items()
+        if not v.get("is_base") and v.get("step_role") == "diagnostic_cause_isolation"
+    ]
+    cause_narrowing_only_variants = [
+        stag
+        for stag, v in steps_scored.items()
+        if not v.get("is_base") and v.get("narrows_cause_only")
+    ]
+    candidate_fixes_needing_off_on_off = [
+        stag for stag in passing_steps if steps_scored[stag].get("requires_dedicated_off_on_off")
+    ]
+    confirmed_fixes = [stag for stag in passing_steps if steps_scored[stag].get("counts_as_proven_fix")]
+    if sweep_design == "multi_variant_screening":
+        cause_narrowing_note = (
+            "Multi-variant liveSteps launch narrows the cause and screens candidates only "
+            "(diagnostic_isolation_variants isolate Stage 1 autoExposure vs Stage 2 localtonemap.shadows; "
+            "remaining steps screen combined exposure/tonemap candidates). "
+            "base, variant, base_end in one dedicated 3-step off / on / off launch is required before any "
+            "passing candidate counts as a proven fix."
+        )
+    else:
+        cause_narrowing_note = (
+            "Single-variant 3-step base -> variant -> base_end (off / on / off) launch on one build; "
+            "a settled MEASURED non-diagnostic candidate in confirmed_fixes counts as a proven fix on this spot."
+        )
+
     return {
         "mode": "live_steps",
+        "sweep_design": sweep_design,
+        "settle_guard": EXPOSURE_SETTLE_SPEC,
         "live_dir": os.path.abspath(vdir),
         "spot": spot_name,
         "reference_tag": ref_tag,
@@ -1178,7 +1381,12 @@ def score_live_steps(
         "base_end_luma": base_end_luma,
         "base_drift_abs": drift_eval["base_drift_abs"],
         "base_drift_rel": drift_eval["base_drift_rel"],
+        "diagnostic_isolation_variants": diagnostic_isolation_variants,
+        "cause_narrowing_only_variants": cause_narrowing_only_variants,
         "passing_variants": passing_steps,
+        "candidate_fixes_needing_off_on_off": candidate_fixes_needing_off_on_off,
+        "confirmed_fixes": confirmed_fixes,
+        "cause_narrowing_note": cause_narrowing_note,
         "causal_verdict": verdict,
         "variants": steps_scored,
     }
@@ -1404,29 +1612,74 @@ def run_self_test() -> None:
             for fr in range(10, 21):
                 f.write(f"{fr},16.6,100,1000,10,5,c:0:0:10.0:20.0:30.0:1.0:0.0:0.0\n")
 
-        def _build_live_case(case_name: str, stuck_rtx: bool = False, move_depth: bool = False, far_cam: bool = False):
+        def _build_live_case(
+            case_name: str,
+            stuck_rtx: bool = False,
+            move_depth: bool = False,
+            far_cam: bool = False,
+            ramp_step3: bool = False,
+            ramp_base_end: bool = False,
+            single_candidate_off_on_off: bool = False,
+        ):
             cdir = os.path.join(tmp, case_name, "01_live_exposure")
             os.makedirs(cdir, exist_ok=True)
             with open(os.path.join(tmp, case_name, "manifest.json"), "w", encoding="utf-8") as f:
                 json.dump({"spots": ["con_custodial"], "variants": ["01_live_exposure"]}, f)
-            steps_meta = [
-                ("live_step1", 0.48, 5.75, 4.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "-2.0", "rtx.localtonemap.exposure": "0.75"}),
-                ("live_step2", 0.17, (5.75 if stuck_rtx else 1.0), (4.31 if stuck_rtx else 0.75), {"rtx.autoExposure.enabled": "False", "rtx.localtonemap.exposure": "0.75"}),
-                ("live_step3", 0.16, 1.75, 1.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "0.0", "rtx.localtonemap.exposure": "0.75", "rtx.localtonemap.shadows": "0.0"}),
-                ("live_step4", 0.481, 5.75, 4.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "-2.0", "rtx.localtonemap.exposure": "0.75"}),
-            ]
+            if single_candidate_off_on_off:
+                steps_meta = [
+                    ("live_step1", 0.48, 5.75, 4.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "-2.0", "rtx.localtonemap.exposure": "0.75"}),
+                    ("live_step2", 0.16, 1.75, 1.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "0.0", "rtx.localtonemap.exposure": "0.75", "rtx.localtonemap.shadows": "0.0"}),
+                    ("live_step3", 0.481, 5.75, 4.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "-2.0", "rtx.localtonemap.exposure": "0.75"}),
+                ]
+            else:
+                steps_meta = [
+                    ("live_step1", 0.48, 5.75, 4.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "-2.0", "rtx.localtonemap.exposure": "0.75"}),
+                    ("live_step2", 0.17, (5.75 if stuck_rtx else 1.0), (4.31 if stuck_rtx else 0.75), {"rtx.autoExposure.enabled": "False", "rtx.localtonemap.exposure": "0.75"}),
+                    ("live_step3", 0.16, 1.75, 1.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "0.0", "rtx.localtonemap.exposure": "0.75", "rtx.localtonemap.shadows": "0.0"}),
+                    ("live_step4", 0.481, 5.75, 4.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "-2.0", "rtx.localtonemap.exposure": "0.75"}),
+                ]
             wins = []
             t_rows = []
+            n_fr = 120  # 4.0 s at 33.33 ms/frame -> last 2.0 s covers ~61 frames
             for idx, (st, val, ae_v, eff_v, rtx_d) in enumerate(steps_meta):
-                f0 = 100 + idx * 30
-                wins.append({"name": st, "kind": "still", "telemetry": [f0, f0 + 19], "proxy": [f0, f0 + 19], "liveRtx": rtx_d})
+                f0 = 100 + idx * (n_fr + 10)
+                wins.append({"name": st, "kind": "still", "telemetry": [f0, f0 + n_fr - 1], "proxy": [f0, f0 + n_fr - 1], "liveRtx": rtx_d})
                 _write_uniform_pfm(os.path.join(cdir, "gate", f"{st}_final.pfm"), val)
                 _write_depth_pfm(
                     os.path.join(cdir, "gate", f"{st}_gamedepth.pfm"),
                     depth_moved if (move_depth and st == "live_step3") else depth_ok,
                 )
-                for fr in range(f0, f0 + 20):
-                    t_rows.append(json.dumps({"frame": fr, "rayTraced": True, "autoExposure": ae_v, "effectiveExposure": eff_v}))
+                for k in range(n_fr):
+                    fr = f0 + k
+                    qpc_ms = float(fr) * (1000.0 / 30.0)
+                    ae_cur, eff_cur = float(ae_v), float(eff_v)
+                    if st == "live_step3" and not single_candidate_off_on_off:
+                        if ramp_step3:
+                            # Still ramping across the entire 4 s step (last 2 s moves > 20% > 2.5% threshold)
+                            u = k / float(n_fr - 1)
+                            ae_cur = 2.80 + (ae_v - 2.80) * u
+                            eff_cur = 0.75 * ae_cur
+                        elif k < 40:
+                            # Early adaptation finishes in the first 1.3 s; last 2.0 s is flat and settled
+                            u = k / 40.0
+                            ae_cur = 2.80 + (ae_v - 2.80) * u
+                            eff_cur = 0.75 * ae_cur
+                    if ramp_base_end and idx == len(steps_meta) - 1:
+                        u = k / float(n_fr - 1)
+                        ae_cur = 4.20 + (ae_v - 4.20) * u
+                        eff_cur = 0.75 * ae_cur
+                    t_rows.append(
+                        json.dumps(
+                            {
+                                "frame": fr,
+                                "qpcMs": round(qpc_ms, 3),
+                                "frameTimeMs": 33.333,
+                                "rayTraced": True,
+                                "autoExposure": ae_cur,
+                                "effectiveExposure": eff_cur,
+                            }
+                        )
+                    )
             with open(os.path.join(cdir, "spot.json"), "w", encoding="utf-8") as f:
                 json.dump({"name": "con_custodial", "windows": wins}, f)
             with open(os.path.join(cdir, "telemetry.jsonl"), "w", encoding="utf-8") as f:
@@ -1434,13 +1687,44 @@ def run_self_test() -> None:
             cam_x = 25.0 if far_cam else 10.5
             with open(os.path.join(cdir, "proxy_frames.csv"), "w", encoding="utf-8") as f:
                 f.write("frame,dt,draws,prims,tex,lights,pub\n")
-                for fr in range(100, 230):
+                for fr in range(100, 100 + len(steps_meta) * (n_fr + 10)):
                     f.write(f"{fr},16.6,100,1000,10,5,c:0:0:{cam_x}:20.0:30.0:1.0:0.0:0.0\n")
             return os.path.join(tmp, case_name)
 
         live_ok = score_variants_sweep(_build_live_case("live_ok"), [live_ref])
         assert live_ok["mode"] == "live_steps" and live_ok["causal_verdict"] == "exposure_confirmed", live_ok
+        assert live_ok["sweep_design"] == "multi_variant_screening", live_ok
         assert live_ok["passing_variants"] == ["live_step2", "live_step3"], live_ok
+        assert live_ok["diagnostic_isolation_variants"] == ["live_step2"], live_ok
+        assert live_ok["cause_narrowing_only_variants"] == ["live_step2", "live_step3"], live_ok
+        assert live_ok["candidate_fixes_needing_off_on_off"] == ["live_step2", "live_step3"], live_ok
+        assert live_ok["confirmed_fixes"] == [], live_ok
+        assert live_ok["variants"]["live_step3"]["exposure_settled"] is True, live_ok["variants"]["live_step3"]
+
+        # Step whose exposure is still ramping over last 2 s -> NOT_MEASURED ("exposure not settled")
+        live_ramp = score_live_steps(_build_live_case("live_ramp", ramp_step3=True), [live_ref])
+        assert live_ramp["variants"]["live_step3"]["exposure_settled"] is False, live_ramp["variants"]["live_step3"]
+        assert live_ramp["variants"]["live_step3"]["measurement_status"] == "NOT_MEASURED", live_ramp
+        assert live_ramp["variants"]["live_step3"]["reasons"] == ["exposure not settled"], live_ramp
+        # Flat step in the same run is still scored
+        assert live_ramp["variants"]["live_step2"]["measurement_status"] == "MEASURED", live_ramp
+
+        # Unsettled base_end invalidates anchor -> NOT_MEASURED ("exposure not settled")
+        live_base_ramp = score_live_steps(_build_live_case("live_base_ramp", ramp_base_end=True), [live_ref])
+        assert live_base_ramp["variants"]["live_step4"]["measurement_status"] == "NOT_MEASURED", live_base_ramp
+        assert live_base_ramp["variants"]["live_step4"]["reasons"] == ["exposure not settled"], live_base_ramp
+        assert live_base_ramp["variants"]["live_step2"]["measurement_status"] == "NOT_MEASURED", live_base_ramp
+        assert live_base_ramp["variants"]["live_step2"]["reasons"] == ["exposure not settled"], live_base_ramp
+        assert live_base_ramp["causal_verdict"] == "NOT_MEASURED", live_base_ramp
+
+        # Dedicated 3-step off / on / off launch confirms a settled non-diagnostic candidate fix
+        live_3step = score_live_steps(
+            _build_live_case("live_3step", single_candidate_off_on_off=True), [live_ref]
+        )
+        assert live_3step["sweep_design"] == "dedicated_off_on_off", live_3step
+        assert live_3step["cause_narrowing_only_variants"] == [], live_3step
+        assert live_3step["candidate_fixes_needing_off_on_off"] == [], live_3step
+        assert live_3step["confirmed_fixes"] == ["live_step2"], live_3step
 
         live_stuck = score_live_steps(_build_live_case("live_stuck", stuck_rtx=True), [live_ref])
         assert live_stuck["variants"]["live_step2"]["measurement_status"] == "NOT_MEASURED", live_stuck
