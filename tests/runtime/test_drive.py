@@ -394,10 +394,33 @@ class MouseLag(unittest.TestCase):
     def test_game_turn_needs_the_camera_to_point_elsewhere(self):
         import math
         d = lambda deg: (math.cos(math.radians(deg)), math.sin(math.radians(deg)), 0.0)
-        dirs = [(980.0, d(10)), (995.0, d(10)), (1012.0, d(10.2)), (1030.0, d(13)), (1050.0, d(15))]
-        self.assertEqual(drive.first_turned(dirs, 1000.0), 1030.0)   # 0.2 degrees of wobble is not the turn
+        dirs = [(980.0, d(10), 1), (995.0, d(10), 2), (1012.0, d(10.2), 3), (1030.0, d(13), 4), (1050.0, d(15), 5)]
+        self.assertEqual(drive.first_turned(dirs, 1000.0), (1030.0, 4))   # 0.2 degrees of wobble is not the turn
         self.assertIsNone(drive.first_turned(dirs[:3], 1000.0))
         self.assertIsNone(drive.first_turned(dirs[2:], 1000.0))      # no frame before the turn to compare with
+
+    def test_an_unchanged_camera_logged_to_4_decimals_never_counts_as_turned(self):
+        # Worker C, 5aea373: the proxy logs the forward vector to 4 decimals, so (0.9997, -0.0196, 0) has length
+        # 0.99989 and the plain dot product with itself reads 1.19 degrees: every turn counted the first frame after
+        # SendInput. Normalised, the same vector is 0 degrees from itself; a 1.5 degree turn still counts.
+        import math
+        import numpy as np
+        same = (0.9997, -0.0196, 0.0)
+        dirs = [(990.0, same, 7), (1010.0, same, 8), (1030.0, same, 9)]
+        self.assertIsNone(drive.first_turned(dirs, 1000.0))
+
+        def old_first_turned(dirs, t0, degrees=0.5):   # drive.py before this fix, word for word
+            before = [d for t, d, _ in dirs if t < t0]
+            ref = np.array(before[-1])
+            for t, d, _ in dirs:
+                if t >= t0 and math.degrees(math.acos(max(-1.0, min(1.0, float(np.dot(ref, d)))))) > degrees:
+                    return t
+            return None
+        self.assertEqual(old_first_turned(dirs, 1000.0), 1010.0)   # the fault this test guards against
+        yaw = math.atan2(same[1], same[0]) + math.radians(1.5)
+        turned = (round(math.cos(yaw), 4), round(math.sin(yaw), 4), 0.0)
+        self.assertEqual(drive.first_turned(dirs[:2] + [(1030.0, turned, 9)], 1000.0), (1030.0, 9))
+        self.assertIsNone(drive.first_turned([(990.0, (0.0, 0.0, 0.0), 7), (1010.0, turned, 8)], 1000.0))
 
     def series_spot(self, clock, location, player=lambda: (1, 2), proxy_path=None):
         """A Spot for teleport_series on a fake clock: hold() and sleep() move the clock, move() records the base yaw
@@ -495,7 +518,7 @@ class MouseLag(unittest.TestCase):
             p = os.path.join(tmp, "f.csv")
             with open(p, "w") as fh:
                 fh.write("\n".join(["header"] + rows) + "\n")
-            self.assertEqual(drive.proxy_camera_dirs(p, 950.0), [(1000.5, (0.0, 1.0, 0.0))])
+            self.assertEqual(drive.proxy_camera_dirs(p, 950.0), [(1000.5, (0.0, 1.0, 0.0), 1)])
 
     def test_a_cutscene_spot_keeps_the_telemetry_of_the_whole_launch(self):
         # Benghazi, run 20261115-214203: the cutscene ended at frame 4987 and telemetry.jsonl began at 5033.
@@ -1767,10 +1790,12 @@ class Reference(unittest.TestCase):
             with mock.patch.object(drive.subprocess, "Popen", lambda *a, **k: mock.Mock(stdout=Out())), \
                     mock.patch.object(drive, "mouse_move_rel", lambda dx, dy: sent.append(dx)), \
                     mock.patch.object(drive, "proxy_camera_dirs", lambda path, since: []), \
-                    mock.patch.object(drive, "first_turned", lambda dirs, t0: t0 + 25.0):
+                    mock.patch.object(drive, "first_turned", lambda dirs, t0: (t0 + 25.0, 4321)):
                 r = s.mouse_lag()
             self.assertEqual(len(sent), 20, name)
             self.assertEqual([t["gameMs"] for t in r["trials"]], [25.0] * 20, name)
+            self.assertEqual([t["turnedFrame"] for t in r["trials"]], [4321] * 20, name)
+            self.assertTrue(all(isinstance(t["t0"], float) for t in r["trials"]), name)   # SendInput time kept
             self.assertIsNone(r["samples_ms"], name)
             self.assertTrue(all("error" in t and t["screenMs"] is None for t in r["trials"]), name)
             self.assertEqual(gate.spot_mouse_lag({"mouse_lag": r})["n"], 20, name)

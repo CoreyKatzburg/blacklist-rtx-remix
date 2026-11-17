@@ -510,9 +510,9 @@ def check_renderer(chained: tuple[str, str] | None, no_remix: bool) -> str:
     return kind
 
 
-def proxy_camera_dirs(path: str, since_ms: float) -> list[tuple[float, tuple]]:
-    """(ms, camera forward vector) of the game frames the proxy logged at or after since_ms. The ms column is
-    QueryPerformanceCounter time, the same clock as time.perf_counter."""
+def proxy_camera_dirs(path: str, since_ms: float) -> list[tuple[float, tuple, int]]:
+    """(ms, camera forward vector, frame number) of the game frames the proxy logged at or after since_ms. The ms
+    column is QueryPerformanceCounter time, the same clock as time.perf_counter."""
     with open(path, "rb") as f:
         f.seek(max(0, os.path.getsize(path) - 524288))
         lines = f.read().decode("latin-1").splitlines()[1:]
@@ -520,7 +520,7 @@ def proxy_camera_dirs(path: str, since_ms: float) -> list[tuple[float, tuple]]:
     for line in lines:
         row = line.split(",", 6)
         try:
-            ms = float(row[1])
+            frame, ms = int(row[0]), float(row[1])
         except (ValueError, IndexError):
             continue
         if ms < since_ms or len(row) < 7:
@@ -528,7 +528,7 @@ def proxy_camera_dirs(path: str, since_ms: float) -> list[tuple[float, tuple]]:
         for pub in row[6].split("|"):
             p = pub.split(":")
             if len(p) >= 9 and p[2] == "0":
-                out.append((ms, tuple(map(float, p[6:9]))))
+                out.append((ms, tuple(map(float, p[6:9])), frame))
                 break
     return out
 
@@ -578,15 +578,24 @@ def first_change(shots, t0: float, base, threshold: float) -> float | None:
     return None
 
 
-def first_turned(dirs, t0: float, degrees: float = 0.5) -> float | None:
-    """Time of the first game frame after t0 whose camera points more than `degrees` away from the last one before."""
-    before = [d for t, d in dirs if t < t0]
-    if not before:
+def first_turned(dirs, t0: float, degrees: float = 0.5) -> tuple[float, int] | None:
+    """(time, frame number) of the first game frame after t0 whose camera points more than `degrees` away from the last
+    one before; dirs are proxy_camera_dirs entries. Both vectors are normalised first: the proxy logs them to 4
+    decimals, so their length is not exactly 1, and with the plain dot product an unchanged (0.9997, -0.0196, 0) read
+    1.19 degrees from itself and the first frame after SendInput counted as turned (worker C, 5aea373: 100 of 100
+    Remix turns). A zero-length vector cannot point anywhere and never counts."""
+    def unit(v):
+        v = np.asarray(v, float)
+        n = float(np.linalg.norm(v))
+        return v / n if n > 0.0 else None
+    before = [d for t, d, _ in dirs if t < t0]
+    ref = unit(before[-1]) if before else None
+    if ref is None:
         return None
-    ref = np.array(before[-1])
-    for t, d in dirs:
-        if t >= t0 and math.degrees(math.acos(max(-1.0, min(1.0, float(np.dot(ref, d)))))) > degrees:
-            return t
+    for t, d, frame in dirs:
+        u = unit(d) if t >= t0 else None
+        if u is not None and math.degrees(math.acos(max(-1.0, min(1.0, float(np.dot(ref, u)))))) > degrees:
+            return t, frame
     return None
 
 
@@ -2089,8 +2098,11 @@ class Spot:
                 self.hold(0.6)
                 seen = None if "error" in grab else first_change(list(shots), t0, base, threshold)
                 turned = first_turned(proxy_camera_dirs(self.proxy.path, t0 - 500.0), t0) if self.proxy.path else None
+                # t0 (SendInput, proxy clock) and the frame that turned let the gate and offline scripts check each
+                # turn against the frame log (coordinator, Nov 17)
                 results.append({"screenMs": round(seen - t0, 1) if seen else None,
-                                "gameMs": round(turned - t0, 1) if turned else None, **grab})
+                                "gameMs": round(turned[0] - t0, 1) if turned else None, "t0": round(t0, 1),
+                                "turnedFrame": turned[1] if turned else None, **grab})
                 sign = -sign
             n, first, last = arrivals["n"], arrivals["first"], arrivals["last"]
             fps = (n - 1) * 1000.0 / (last - first) if n > 1 and last > first else 0.0
