@@ -108,7 +108,10 @@ three counts. The NVIDIA performance overlay's box (tests/analysis/overlay_mask.
 y 0..7) is always part of the mask, also for a spot with fewer than HUD_MIN_STILLS turn stills and for two files:
 the readout reaches column 258, left of what the learned mask covers, and is in Remix and no-Remix screen captures.
 The verdict is PASS only when the orb count and the lost-glow count pass. The puff count is report only until it can
-separate a floating glow from a surface Remix lights, with a fake case for each kind.
+separate a floating glow from a surface Remix lights, with a fake case for each kind. Two report-only splits follow
+the counts and never change the verdict: orbs whose original background is below ORIG_BLACK (the original is black
+there, as at paladin_1 y0_p-30 in 152548, where 27 of 27 are) against the rest, and lost glows of SPECK_PX or fewer
+pixels (con_boiler y270_p-30: 35 of 39) against larger ones.
 
   --remix-spot / --orig-spot / --still [--orig-still]: instead of the files, two gate spot folders and a window name;
             the stills and both cameras come from spot.json and proxy_frames.csv, and the pose test always runs.
@@ -136,6 +139,7 @@ SAT_LUMA, AREA_DROP_MIN = 250.0, 0.05
 CELL, CELL_WIN, PUFF_STEPS = 4, 15, 24.0
 KEEP_FRAC, STRONG_STEPS, DROP_MIN = 0.75, 100.0, 12.0
 HUD_MIN_STILLS = 8
+ORIG_BLACK, SPECK_PX = 2.0, 2     # report-only splits (coordinator, Nov 17): orbs on black original, lost specks
 
 
 def still(path: pathlib.Path) -> np.ndarray:
@@ -236,7 +240,8 @@ def judge(remix: np.ndarray, orig: np.ndarray, hud=None, match_px=MATCH_PX):
         gain = float(np.clip((br[y, x] + 1.0) / (bo[y, x] + 1.0), 1.0, GAIN_MAX))
         excess = peak - gain * max(orig_bump, 0.0)
         rows.append({"x": x, "y": y, "area": area, "peak": peak, "orig": orig_bump, "gain": gain,
-                     "excess": excess, "matched": orig_bump >= ORIG_STEPS or excess < BLOB_STEPS})
+                     "excess": excess, "matched": orig_bump >= ORIG_STEPS or excess < BLOB_STEPS,
+                     "orig_bg": float(bo[y, x])})
     return rows, skipped
 
 
@@ -468,9 +473,13 @@ def report(rows, skipped, out=print) -> bool:
     skip = ", ".join(f"{v} {k}" for k, v in skipped.items())
     out(f"glow_blobs: unmatched {len(bad)} of {len(rows)} blobs (skipped {skip}; excess >= {BLOB_STEPS:g} steps and "
         f"original bump < {ORIG_STEPS:g}): {'PASS' if ok else 'FAIL'}")
+    black = sum(r["orig_bg"] < ORIG_BLACK for r in bad)
+    out(f"glow_blobs: orbs on original background < {ORIG_BLACK:g}: {black}, elsewhere: {len(bad) - black} "
+        f"(report only; the orb verdict counts both)")
     for r in sorted(bad, key=lambda r: -r["excess"]):
         out(f"  unmatched at x {r['x']} y {r['y']}: area {r['area']} px, Remix contrast {r['peak']:.1f}, "
-            f"original bump {r['orig']:.1f} x gain {r['gain']:.2f}, excess {r['excess']:.1f}")
+            f"original bump {r['orig']:.1f} x gain {r['gain']:.2f}, excess {r['excess']:.1f}, "
+            f"original background {r['orig_bg']:.0f}")
     return ok
 
 
@@ -489,6 +498,9 @@ def report_lost(rows, skipped, out=print) -> bool:
     out(f"glow_blobs: lost {len(bad)} of {len(rows)} original glows (skipped {skip}; Remix bump < {ORIG_STEPS:g} and "
         f"Remix luma < {KEEP_FRAC:g} x the original's, gain-matched from contrast {STRONG_STEPS:g}): "
         f"{'PASS' if ok else 'FAIL'}")
+    specks = sum(r["area"] <= SPECK_PX for r in bad)
+    out(f"glow_blobs: lost specks <= {SPECK_PX} px: {specks}, larger: {len(bad) - specks} "
+        f"(report only; the lost verdict counts both)")
     for r in sorted(bad, key=lambda r: -r["peak"]):
         out(f"  lost at x {r['x']} y {r['y']}: area {r['area']} px, original contrast {r['peak']:.1f} luma "
             f"{r['orig_luma']:.0f} x gain {r['gain']:.2f}, Remix bump {r['remix_bump']:.1f} luma {r['remix_top']:.0f} "
@@ -694,6 +706,30 @@ def self_test() -> int:
     hud = (np.hypot(XX - 100, YY - 60) <= 8)
     lost_case("an original-only glow on the HUD mask is not lost", base, lamp, 0, hud)
     lost_case("no glow lost: Remix and original agree", base, orig, 0)
+
+    # Report-only splits (coordinator, Nov 17): they print, and the verdicts stay as the counts say.
+    def split_line(lines, prefix):
+        return next((ln for ln in lines if ln.startswith(prefix)), "missing")
+
+    black_o = orig.copy()
+    black_o[100:141, 180:221] = 0.0                       # the original is black around the orb
+    for name, o, want in (("an orb over a black original reads 'background < 2: 1, elsewhere: 0' and still FAILs",
+                           black_o, "< 2: 1, elsewhere: 0"),
+                          ("an orb over a dim, non-black original reads 'background < 2: 0, elsewhere: 1'",
+                           orig, "< 2: 0, elsewhere: 1")):
+        rows, skipped = judge(_dot(base, 200, 120).astype(np.float32), o.astype(np.float32))
+        lines = []
+        ok = report(rows, skipped, out=lines.append)
+        ln = split_line(lines, "glow_blobs: orbs on original background")
+        tally(name, not ok and want in ln and sum(not r["matched"] for r in rows) == 1, ln)
+    speck_o = _dot(orig, 150, 100, amp=80, sigma=2.5)
+    speck_o[50, 60] += 60.0                               # a 1 px speck next to a larger glow
+    rows, skipped = lost_glows(base.astype(np.float32), speck_o.astype(np.float32))
+    lines = []
+    ok = report_lost(rows, skipped, out=lines.append)
+    ln = split_line(lines, "glow_blobs: lost specks")
+    tally("a lost 1 px speck and a lost larger glow read 'specks <= 2 px: 1, larger: 1', and the verdict FAILs on 2",
+          not ok and "<= 2 px: 1, larger: 1" in ln and sum(r["lost"] for r in rows) == 2, ln)
 
     # Dimmed lamps (rule 9).
     def dim_case(name, on, changed, on_again, want):
