@@ -622,6 +622,69 @@ class Reference(unittest.TestCase):
         s.bench({"settle": 0, "frames": 1})
         self.assertNotIn("light_switch", [o[0] for o in order if isinstance(o, tuple)])
 
+    def test_switch_pose_limits(self):
+        # Worker B, Nov 17: a switch still counts only within 8 units, 1.5 deg yaw and 1.0 deg pitch of switch_base.
+        base = [-10700.0, -560.0, -380.0, -67.0, 0.0]
+        near = lambda dx=0.0, dyaw=0.0, dp=0.0: [base[0] + dx, base[1], base[2], base[3] + dyaw, base[4] + dp]
+        self.assertTrue(drive.switch_pose_apart(near(7.9, 1.4, 0.9), base)["ok"])
+        self.assertFalse(drive.switch_pose_apart(near(8.1), base)["ok"])
+        self.assertFalse(drive.switch_pose_apart(near(dyaw=1.6), base)["ok"])
+        self.assertFalse(drive.switch_pose_apart(near(dp=1.1), base)["ok"])
+        # Yaw wraps: -179.5 and 179.5 are 1 degree apart; an unwrapped difference reads 359 and refuses this pose.
+        self.assertTrue(drive.switch_pose_apart([0, 0, 0, -179.5, 0], [0, 0, 0, 179.5, 0])["ok"])
+        self.assertFalse(drive.switch_pose_apart(None, base)["ok"])
+
+    def test_switch_stills_retake_off_pose_and_mark_pose_off(self):
+        # con_custodial_switch3: switch_base, the fade, switch_light_off, a second press, switch_base_again. A later
+        # still off the base pose is renamed off_pose and taken again after a fresh teleport; off twice, it keeps
+        # "poseOff". With the pose check removed, the 10-unit-off still would be kept as switch_light_off.
+        def run(apart=None):
+            s = drive.Spot.__new__(drive.Spot)
+            s.windows, s.a, taps = [], mock.Mock(pid=1), []
+            s.spot = {"teleport": {"location": [-10723, -553, -447], "yaw": -67}}
+            s.hold = lambda *a, **k: None
+            s.move = lambda name, *a: s.windows.append({"name": name, "kind": "move"})
+            s.teleport = lambda tp: {"landed": tp["location"]}
+            s.light_fade = lambda flip: s.windows.append({"name": "light_switch", "kind": "switch"})
+
+            def window(name, kind, body, **k):
+                body()
+                s.windows.append({"name": name, "kind": kind, **k})
+                return s.windows[-1]
+            s.window = window
+            cams = iter([[0, 0, 0, -67, 0], [10, 0, 0, -67, 0], [1, 0, 0, -67.5, 0.2], [0, 0, 0, -65, 0],
+                         [0, 0, 0, -64, 0]])
+
+            def once(name, frames):
+                s.windows.append({"name": name, "kind": "switch", "camera": next(cams)})
+                return s.windows[-1]
+            s._switch_still_once = once
+            with mock.patch.object(drive, "game_window", lambda pid: None), \
+                    mock.patch.object(drive, "tap", taps.append), \
+                    mock.patch.object(drive, "switch_pose_apart", apart or drive.switch_pose_apart):
+                s.light_switch({"key": "SPACE", "seconds": 30, "dumpsAt": [1, 6, 18, 28],
+                                "stills": {"settle": 25, "frames": 60}})
+            return s.windows, taps
+        windows, taps = run()
+        kept = {w["name"]: w for w in windows if w["kind"] == "switch"}
+        self.assertEqual([w["name"] for w in windows if w["kind"] == "switch"],
+                         ["switch_base", "light_switch", "switch_light_off", "switch_base_again"])
+        self.assertEqual(kept["switch_light_off"]["camera"], [1, 0, 0, -67.5, 0.2])
+        self.assertTrue(kept["switch_light_off"]["poseVsBase"]["ok"])
+        off = [w for w in windows if w["kind"] == "off_pose"]
+        self.assertEqual([w["name"] for w in off], ["switch_light_off_poseoff1", "switch_base_again_poseoff1"])
+        self.assertFalse(kept["switch_base_again"]["poseOff"]["ok"])
+        self.assertNotIn("poseOff", kept["switch_light_off"])
+        self.assertEqual(taps, ["SPACE"])   # the second press; the first is inside the fade window
+        self.assertEqual(sum(w["kind"] == "teleport" for w in windows), 4)
+        names = [w["name"] for w in windows]
+        self.assertLess(names.index("light_switch"), names.index("switch_light_off_teleport1"))
+        self.assertLess(names.index("switch_press_again"), names.index("switch_base_again_teleport1"))
+        # rule removed: the pose check always says ok, and the still 10 units off is kept as switch_light_off
+        windows, _ = run(lambda cam, base: {"ok": True})
+        kept = {w["name"]: w for w in windows if w["kind"] == "switch"}
+        self.assertEqual(kept["switch_light_off"]["camera"], [10, 0, 0, -67, 0])
+
     def test_live_steps_set_the_display_state_and_wake_it_at_the_end(self):
         # Coordinator, Nov 16: idle GPU power follows the display state; the proof is live steps at one held pose,
         # awake / asleep / awake / asleep / awake, with no input sent while a step holds. Each step records what

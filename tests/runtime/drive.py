@@ -569,6 +569,21 @@ def median_camera(rows) -> list[float] | None:
                                          math.degrees(math.asin(float(np.clip(m[5], -1, 1)))))]
 
 
+SWITCH_POSE_LIMITS = (8.0, 1.5, 1.0)   # camera units, yaw and pitch degrees: glow_blobs' measured limits (worker B)
+
+
+def switch_pose_apart(cam, base) -> dict:
+    """How far a switch still's median camera [x, y, z, yaw, pitch] stands from switch_base's, and whether it is within
+    SWITCH_POSE_LIMITS (yaw wrapped, so -179.5 and 179.5 are 1 degree apart). No camera on either side is never ok."""
+    if not cam or not base:
+        return {"ok": False, "why": "no camera for this still or for switch_base"}
+    d = float(np.linalg.norm(np.subtract(cam[:3], base[:3])))
+    dyaw, dpitch = abs(gate.wrap(float(cam[3]) - float(base[3]))), abs(float(cam[4]) - float(base[4]))
+    lim = SWITCH_POSE_LIMITS
+    return {"distance": round(d, 2), "yawDeg": round(dyaw, 2), "pitchDeg": round(dpitch, 2),
+            "limits": list(lim), "ok": d <= lim[0] and dyaw <= lim[1] and dpitch <= lim[2]}
+
+
 def first_change(shots, t0: float, base, threshold: float) -> float | None:
     """Arrival time of the first screen shot after t0 whose mean absolute difference from `base` exceeds `threshold`
     (grey levels of 255)."""
@@ -1987,6 +2002,81 @@ class Spot:
         return found
 
     def light_switch(self, flip: dict) -> None:
+        """The light switch: the fade window alone, or with flip["stills"] worker B's three stills around it."""
+        if flip.get("stills"):
+            self.switch_stills(flip)
+        else:
+            self.light_fade(flip)
+
+    def switch_stills(self, flip: dict) -> None:
+        """flip["stills"] {"settle", "frames"} (worker B, Nov 17, con_custodial_switch3): lights_lamps_dimmed read NOT
+        MEASURED at con_custodial because the only after-switch picture was the fade recording, taken where the press
+        had moved Sam about 44 cm. So three stills at one pose, Sam re-teleported before each later one:
+        switch_base (lights settled on), the fade window, switch_light_off, a second press, switch_base_again. The
+        names are the on / change / on_again triplet gate.py's lights_lamps_dimmed already reads."""
+        st, key = flip["stills"], flip.get("key", "SPACE")
+        settle, frames = float(st.get("settle", 25)), int(st.get("frames", 60))
+        self.move("to_light_switch", 0.0, 0.0, 1.0)
+        self.hold(settle)
+        base = self.switch_still("switch_base", frames, None)
+        self.light_fade(flip)
+        self.switch_still("switch_light_off", frames, base)
+        hwnd = game_window(self.a.pid)
+        if hwnd:
+            front(hwnd)
+        # Worker B's guess: a second press turns the light back on; switch_base_again's picture shows whether it did.
+        self.window("switch_press_again", "press", lambda: tap(key), key=key)
+        self.hold(settle)
+        self.switch_still("switch_base_again", frames, base)
+
+    def switch_still(self, name: str, frames: int, base_cam: list[float] | None) -> list[float] | None:
+        """One still of switch_stills, kind "switch": screen frames, Remix's dump (or without Remix the screen raster),
+        one light dump (switch\\<name>_lights.tsv) and the stop position. A later still (base_cam given) first stands
+        Sam back on the spot's teleport and faces the switch, and its median camera must lie within
+        switch_pose_apart's limits of switch_base's. Outside: renamed <name>_poseoff1 (kind "off_pose", which no
+        check reads; its files are overwritten by the retake), re-teleported and taken once more; still outside, it is
+        kept with "poseOff" so worker B's scorer reads NOT MEASURED. Returns the kept still's camera."""
+        for attempt in (1, 2):
+            if base_cam is not None:
+                self.window(f"{name}_teleport{attempt}", "teleport", lambda: None,
+                            teleport=self.teleport(self.spot["teleport"]))
+                self.move(f"to_{name}_{attempt}", 0.0, 0.0, 1.0)
+            w = self._switch_still_once(name, frames)
+            if base_cam is None:
+                return w.get("camera")
+            apart = switch_pose_apart(w.get("camera"), base_cam)
+            w["poseVsBase"] = apart
+            print(f"SWITCH STILL {name} try {attempt}: {json.dumps(apart)}", flush=True)
+            if apart["ok"]:
+                return w.get("camera")
+            if attempt == 1:
+                w["name"], w["kind"], w["filesOverwrittenByRetake"] = f"{name}_poseoff1", "off_pose", True
+        w["poseOff"] = apart
+        return w.get("camera")
+
+    def _switch_still_once(self, name: str, frames: int) -> dict:
+        rel = f"frames/{name}.gray"
+        os.makedirs(os.path.join(self.out, "switch"), exist_ok=True)
+        if self.no_remix:   # mouse steering alone leaves no-Remix stops off by degrees (see snap_pose)
+            self.snap_pose()
+        self.hold(0.5)
+        waited = self.steady()
+
+        def body():
+            self.capture(rel, frames)
+            if not self.no_remix:
+                self.dump(name)
+        w = self.window(name, "switch", body, frames=rel, frameSize=[CAP_W, CAP_H], steadyWait=waited,
+                        switch={"name": name, "still": True}, **({} if self.no_remix else {"dump": name}))
+        if self.no_remix:   # the original's picture; in a Remix run the picture is Remix's own final.pfm
+            w.update(self._try_raster(name, "no_remix"))
+        w["lights"] = self.light_dump(os.path.join(self.out, "switch", f"{name}_lights.tsv"))
+        w["gamePose"] = [self.rel_pose()]
+        self.stop_position(w)
+        w["samMoved"] = self.sam_moved(name)
+        return w
+
+    def light_fade(self, flip: dict) -> None:
         """Faces the reference pose, presses the use key (the spot stands Sam at a light switch) and records the
         screen for flip["seconds"], so the time the room takes to go dark can be measured."""
         self.move("to_light_switch", 0.0, 0.0, 1.0)
