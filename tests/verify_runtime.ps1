@@ -193,6 +193,30 @@ if ($Evaluate) { exit (Gate $Evaluate) }
 
 . (Join-Path (Split-Path $Tests) 'play-setup\RemixPlayCommon.ps1')
 . (Join-Path $Runtime 'run_files.ps1')
+# True after removing $path, when it is a Play-script lock ($LockTag) whose start time is not before $since (the start
+# of this run's own Play script). Corey's lock, or one written before this run's Play script started, stays.
+function Remove-OwnPlayLock([string]$path, [datetime]$since) {
+    $text = Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue
+    if (-not $text -or -not $text.StartsWith($LockTag) -or $text -notmatch '\(started (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) UTC') { return $false }
+    $started = [datetime]::SpecifyKind([datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', $null), 'Utc')
+    if ($started -lt $since.ToUniversalTime().AddSeconds(-1)) { return $false }
+    Remove-Item -LiteralPath $path
+    $true
+}
+# -RestoreFrom of a killed run: the Play script dies with it and leaves its GAME_IN_USE lock (Nov 17 18:43: run 183718
+# was stopped, -RestoreFrom removed only the agent lock, and the next launch refused on "lock present"). The run's
+# latest play-HHmmss.log names when its last Play script started (a time before the run folder's means after
+# midnight); the lock is removed only by Remove-OwnPlayLock's rule against that time.
+function Remove-RunPlayLock([string]$path, [string]$runDir) {
+    if ((Split-Path -Leaf $runDir) -notmatch '^(\d{8})-(\d{6})') { return $false }
+    $day = $Matches[1]; $runStart = [datetime]::ParseExact("$day$($Matches[2])", 'yyyyMMddHHmmss', $null)
+    $starts = @(Get-ChildItem -LiteralPath $runDir -Filter 'play-*.log' -File -ErrorAction SilentlyContinue |
+        Where-Object Name -match '^play-(\d{6})\.log$' | ForEach-Object {
+            $t = [datetime]::ParseExact("$day$($_.Name.Substring(5, 6))", 'yyyyMMddHHmmss', $null)
+            if ($t -lt $runStart) { $t.AddDays(1) } else { $t } })
+    if (-not $starts.Count) { return $false }
+    Remove-OwnPlayLock $path ($starts | Sort-Object | Select-Object -Last 1)
+}
 # Puts back what a run changed: each step on its own, so one failure cannot skip the rest. Returns the failures.
 function Restore-AfterRun([string]$runDir) {
     $failed = @()
@@ -211,6 +235,7 @@ if ($RestoreFrom) {
     if ($running) { throw "$($running.Name) is running (pid $($running.Id)): close it first." }
     $failed = @(Restore-AfterRun $RestoreFrom)
     if ((Test-Path $GameLock) -and (Get-Content $GameLock -Raw).Contains($RestoreFrom)) { Remove-Item -LiteralPath $GameLock; Write-Step 'Game lock of that run removed.' }
+    if (Remove-RunPlayLock $Lock $RestoreFrom) { Write-Step "GAME_IN_USE lock left by that run's killed Play script removed." }
     Show-PutBackFailures $failed
     if ($failed.Count) { exit 3 }
     Write-Step "Put back from $RestoreFrom; play-setup mismatches: $(@(Get-PlayMismatches) -join ', ')"
@@ -412,17 +437,6 @@ function Test-SleepsDisplays($spot) {
 function Get-LaunchProblem($s) {
     $why = @((Get-CSpaceProblem $s.freeMB $MinCFreeMB), (Get-MemoryProblem $s $MinCommitRoomMB)) | Where-Object { $_ }
     if ($why) { $why -join ' ' }
-}
-
-# True after removing $path, when it is a Play-script lock ($LockTag) whose start time is not before $since (the start
-# of this run's own Play script). Corey's lock, or one written before this run's Play script started, stays.
-function Remove-OwnPlayLock([string]$path, [datetime]$since) {
-    $text = Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue
-    if (-not $text -or -not $text.StartsWith($LockTag) -or $text -notmatch '\(started (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) UTC') { return $false }
-    $started = [datetime]::SpecifyKind([datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', $null), 'Utc')
-    if ($started -lt $since.ToUniversalTime().AddSeconds(-1)) { return $false }
-    Remove-Item -LiteralPath $path
-    $true
 }
 
 # Ubisoft's launcher can close the first game exe and start it again (Nov 16 08:49: pid 42432 exited before the Remix

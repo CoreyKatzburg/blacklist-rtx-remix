@@ -5,7 +5,7 @@ param([string]$Gate = (Join-Path (Split-Path $PSScriptRoot) 'verify_runtime.ps1'
       [string]$Common = (Join-Path $PSScriptRoot '..\..\play-setup\RemixPlayCommon.ps1'))
 $ErrorActionPreference = 'Stop'
 $ast = [Management.Automation.Language.Parser]::ParseFile($Gate, [ref]$null, [ref]$null)
-foreach ($n in 'Remove-OwnPlayLock', 'Wait-RestartedGame', 'Get-DisplayProblem', 'Test-LaunchDead', 'Get-CSpaceProblem', 'Get-MemoryProblem',
+foreach ($n in 'Remove-OwnPlayLock', 'Remove-RunPlayLock', 'Wait-RestartedGame', 'Get-DisplayProblem', 'Test-LaunchDead', 'Get-CSpaceProblem', 'Get-MemoryProblem',
            'Get-DisplayAwakeProblem', 'Get-DisplayDuring', 'Test-SleepsDisplays', 'Invoke-UbiLogin', 'Get-SuiteRecord', 'Get-MonitorStateProblem', 'Test-MonitorsOff',
            'Get-RunSpots', 'Get-RunIniKeys', 'Select-Previous', 'Get-InstalledRemixCommit') {
     $f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true) | Select-Object -First 1
@@ -27,6 +27,30 @@ Set-Content $lock 'AGENT worker X has the game (started 2026-11-16 23:59:59 UTC)
 Check 'lock with another tag stays' ((-not (Remove-OwnPlayLock $lock $since)) -and (Test-Path $lock))
 Remove-Item $lock
 Check 'no lock: nothing removed' (-not (Remove-OwnPlayLock $lock $since))
+
+# -RestoreFrom of a killed run (Nov 17 183718): its Play script's lock goes, judged by the run's play-HHmmss.log.
+function New-Run($name, [string[]]$plays) {
+    $d = Join-Path $dir $name; New-Item -ItemType Directory $d -Force | Out-Null
+    foreach ($p in $plays) { Set-Content (Join-Path $d "play-$p.log") 'Play Blacklist with Remix' }
+    $d
+}
+function Write-LockAt([datetime]$local) { Write-Lock 'PLAY-SETUP' $local.ToUniversalTime() }
+$r1 = New-Run '20261117-183718' @('183735')
+Write-LockAt ([datetime]'2026-11-17 18:37:41')
+Check 'killed run: lock its Play script wrote is removed' ((Remove-RunPlayLock $lock $r1) -and -not (Test-Path $lock))
+Write-LockAt ([datetime]'2026-11-17 18:30:00')
+Check 'killed run: lock older than its Play script stays' ((-not (Remove-RunPlayLock $lock $r1)) -and (Test-Path $lock))
+$r0 = New-Run '20261117-190000' @()
+Check 'run with no play log: nothing removed' ((-not (Remove-RunPlayLock $lock $r0)) -and (Test-Path $lock))
+# Across midnight: play-000130 belongs to Nov 18, so a lock from 23:59:50 on Nov 17 is older and stays.
+$r2 = New-Run '20261117-235900' @('235910', '000130')
+Write-LockAt ([datetime]'2026-11-17 23:59:50')
+Check 'midnight run: lock older than its last Play script stays' ((-not (Remove-RunPlayLock $lock $r2)) -and (Test-Path $lock))
+# Fake: reading play-000130 on the run folder's own day (no midnight rule) removes that older lock.
+$naive = [datetime]'2026-11-17 00:01:30'
+Check 'fake: no midnight rule removes the older lock' ((Remove-OwnPlayLock $lock $naive) -and -not (Test-Path $lock))
+Write-LockAt ([datetime]'2026-11-18 00:01:40')
+Check 'midnight run: lock its last Play script wrote is removed' ((Remove-RunPlayLock $lock $r2) -and -not (Test-Path $lock))
 
 # Restart: a fake "game" (ping.exe) exits and a new one starts 3 s later.
 $old = Start-Process ping -ArgumentList '-n', '2', '127.0.0.1' -PassThru -WindowStyle Hidden
