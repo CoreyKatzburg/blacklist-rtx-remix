@@ -22,9 +22,16 @@ import gate  # noqa: E402
 NEAR_BLACK, FULL_WHITE = 8, 250
 
 
-def picture_stats(frames: np.ndarray | None) -> dict:
+def picture_stats(frames: np.ndarray | None, masked: bool = False) -> dict:
+    """masked: gate.window_frames set the NVIDIA overlay box to 0 in these screen-capture frames; the box is left out
+    of the shares and the mean instead of counting as near black."""
     if frames is None or not len(frames):
         return {}
+    if masked:
+        keep = np.ones(frames.shape[1:], bool)
+        x0, y0, x1, y1 = gate.overlay_mask.box_at(frames.shape[2], frames.shape[1])
+        keep[y0:y1 + 1, x0:x1 + 1] = False
+        frames = frames[:, keep]
     return {"brightness": round(float(frames.mean()) / 255.0, 4),
             "nearBlack": round(float((frames < NEAR_BLACK).mean()), 4),
             "fullWhite": round(float((frames >= FULL_WHITE).mean()), 4)}
@@ -69,7 +76,8 @@ def report(folder: str) -> dict:
             continue
         frames, source = gate.window_frames(spot, w)
         tele = [telemetry[f] for f in gate.frames_in(w, "telemetry") if f in telemetry]
-        row = {"variant": w["switch"]["name"], "change": w["switch"], "pictureSource": source, **picture_stats(frames)}
+        row = {"variant": w["switch"]["name"], "change": w["switch"], "pictureSource": source,
+               **picture_stats(frames, "overlay box masked" in (source or ""))}
         if tele:
             row["frameMs"] = round(float(np.median([t.get("frameTimeMs", np.nan) for t in tele])), 2)
             row["rayTraced"] = round(float(np.mean([bool(t.get("rayTraced")) for t in tele])), 3)

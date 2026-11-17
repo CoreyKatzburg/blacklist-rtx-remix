@@ -35,19 +35,23 @@ class SwitchReport(unittest.TestCase):
         return {r["variant"]: r for r in switch_report.report(self.dir)["variants"]}
 
     def test_variant_compared_with_base(self):
+        # Screen-capture frames: the NVIDIA overlay box (x 1990..2559, y 0..63 at 2560x1440) is columns 24..31 of row
+        # 0 at 32x18. gate blanks it to 0; it must be left out, not counted as near black. 576 - 8 = 568 pixels count.
+        keep = W * H - 8
         base = np.full((30, H, W), 100)
-        base[:, 0, :] = 255                         # one full-white row of 18
+        base[:, H - 1, :] = 255                     # one full-white row, outside the box
+        base[:, 0, 24:] = 255                       # white inside the box: must not count
         self.add("base", base, "settings\tready=1\nlight\tnode=1\twanted=1\ttracked=1\nlight\tnode=2\twanted=0\ttracked=0\n"
                                "flare\tnode=3\nflare\tnode=4\n")
         fog = np.full((30, H, W), 60)
-        fog[:, :9, :] = 0                           # half the picture near black
+        fog[:, :9, :] = 0                           # the top half near black, 8 of its pixels inside the box
         self.add("fog_off", fog, "light\tnode=1\twanted=1\ttracked=1\n")
         rows = self.run_report()
-        self.assertAlmostEqual(rows["base"]["fullWhite"], 1 / 18, places=3)
+        self.assertAlmostEqual(rows["base"]["fullWhite"], W / keep, places=4)
         self.assertEqual(rows["base"]["nearBlack"], 0.0)
         self.assertEqual((rows["base"]["lights"], rows["base"]["lightsWanted"], rows["base"]["lightsSent"], rows["base"]["flares"]), (2, 1, 1, 2))
-        self.assertAlmostEqual(rows["fog_off"]["nearBlack"], 0.5, places=3)
-        expected = (60 * 9 / 18) / 255 - (100 * 17 / 18 + 255 / 18) / 255
+        self.assertAlmostEqual(rows["fog_off"]["nearBlack"], (9 * W - 8) / keep, places=4)
+        expected = (60 * 9 * W / keep) / 255 - (100 * (keep - W) + 255 * W) / keep / 255
         self.assertAlmostEqual(rows["fog_off"]["vsBase"]["brightness"], expected, places=3)
         self.assertEqual(rows["fog_off"]["vsBase"]["lights"], -1)
 
