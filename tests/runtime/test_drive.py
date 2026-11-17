@@ -1311,8 +1311,8 @@ class Reference(unittest.TestCase):
         with self.assertRaises(ValueError):
             drive.amp_hold_wanted({"ampWindow": "hidden"})
 
-        def run(restore_in=None, minimize_takes=True, found=True, fail_in=None):
-            calls, fake = [], {"min": False, "n": 0}
+        def run(restore_in=None, minimize_takes=True, found=True, fail_in=None, focus_moves=False):
+            calls, fake = [], {"min": False, "n": 0, "fg": 0}
             s = drive.Spot.__new__(drive.Spot)
             s.out, s.windows, s.yaw, s.pitch = "out", [], 0.0, 0.0
             s.counters = lambda: {"telemetry": 0, "proxy": 0}
@@ -1321,6 +1321,10 @@ class Reference(unittest.TestCase):
             def mini(h):
                 calls.append("minimize")
                 fake["min"] = minimize_takes
+
+            def foreground():   # the game's window; another window once the watchdog has started, if focus_moves
+                fake["fg"] += 1
+                return 77 if fake["fg"] > 1 and focus_moves else 66
 
             def body():
                 fake["n"] += 1
@@ -1337,6 +1341,7 @@ class Reference(unittest.TestCase):
                     mock.patch.object(drive.amp_window, "minimize", mini), \
                     mock.patch.object(drive.amp_window, "restore",
                                       lambda h: calls.append("restore") or fake.update(min=False)), \
+                    mock.patch.object(drive.user32, "GetForegroundWindow", foreground), \
                     mock.patch.object(drive.time, "sleep", lambda x: None):
                 try:
                     s.amp_hold_start()
@@ -1365,6 +1370,11 @@ class Reference(unittest.TestCase):
         s, calls = run(fail_in=2)                                                     # a step fails while minimized
         self.assertEqual(calls[-1], "restore")
         self.assertFalse(s.amp_hold["after"]["minimized"])
+        self.assertEqual(s.amp_hold["foreground"], [66, 66])
+        s, calls = run(focus_moves=True)            # 20261117-122718: the watchdog's console took the game's focus
+        self.assertIn("error: VOID: minimizing the Amp window moved the focus (foreground window 66 -> 77)", calls)
+        self.assertEqual(s.windows, [])
+        self.assertEqual(calls[-1], "restore")
         s, calls = run(found=False)                                                   # no Amp app running
         self.assertNotIn("minimize", calls)
         self.assertNotIn("ampMinimized", s.windows[0])

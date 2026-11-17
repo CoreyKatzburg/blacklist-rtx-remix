@@ -1697,16 +1697,24 @@ class Spot:
         rec = {"asked": "minimized", "found": True, "hwnd": hwnd, "before": amp_window.state(with_webview=True),
                "watchdogLog": log, "watchdogDeadline": time.strftime("%H:%M:%S", time.localtime(deadline)),
                "notMinimized": []}
+        fg0 = user32.GetForegroundWindow()
         rec["watchdogPid"] = amp_window.start_watchdog(hwnd, deadline, log)
         self.amp_hold = rec
         amp_window.minimize(hwnd)
         self.hold(2.0)
         rec["start"] = amp_window.state()
         rec["readBack"] = amp_window.read_back("minimized", rec["start"])
+        # 20261117-122718: the watchdog's start opened a console window that took the focus from the game, and the
+        # mouse calibration after it read no turn at all. The hold must not move the focus.
+        rec["foreground"] = [fg0, user32.GetForegroundWindow()]
         print(f"AMP WINDOW minimized for the launch: read back {rec['readBack']}; watchdog pid {rec['watchdogPid']} "
-              f"restores it at {rec['watchdogDeadline']}", flush=True)
+              f"restores it at {rec['watchdogDeadline']}; foreground window {rec['foreground'][0]} -> "
+              f"{rec['foreground'][1]}", flush=True)
         if not rec["readBack"]:
             raise RuntimeError("VOID: the Amp window did not read back minimized before the measured steps")
+        if rec["foreground"][0] != rec["foreground"][1]:
+            raise RuntimeError(f"VOID: minimizing the Amp window moved the focus (foreground window "
+                               f"{rec['foreground'][0]} -> {rec['foreground'][1]})")
 
     def amp_minimized(self) -> bool | None:
         """While the launch holds the Amp window minimized: whether it still reads minimized; None when not held."""

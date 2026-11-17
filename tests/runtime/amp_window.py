@@ -18,6 +18,8 @@ minimized, whatever happened to the caller, and writes one line to its log.
   amp_window.py minimize | restore            act on the Amp main window, print the state read back
   amp_window.py watchdog --hwnd H --at EPOCH [--log FILE]
   amp_window.py --self-test                   the pure parts (monitor naming, read-back rule); touches no window
+  amp_window.py --quiet-check [--break-flags] live, no game: a watchdog start opens no window and leaves the focus
+                                              alone (exit 0); --break-flags starts it the old way and must exit 1
 """
 from __future__ import annotations
 
@@ -165,11 +167,19 @@ def read_back(asked: str, st: dict) -> bool:
     return bool(st.get("found")) and st.get("minimized") == (asked == "minimized")
 
 
-def start_watchdog(hwnd: int, deadline: float, log: str) -> int:
-    """A detached process, outside this process tree and its job, that restores the window at `deadline` (epoch s)."""
-    flags = 0x00000008 | 0x00000200 | 0x01000000   # DETACHED_PROCESS, CREATE_NEW_PROCESS_GROUP, BREAKAWAY_FROM_JOB
-    args = [sys.executable, "-I", os.path.abspath(__file__), "watchdog", "--hwnd", str(hwnd), "--at", f"{deadline:.1f}",
-            "--log", log]
+# CREATE_NO_WINDOW, CREATE_NEW_PROCESS_GROUP, BREAKAWAY_FROM_JOB. Not DETACHED_PROCESS: the venv's python.exe is a
+# launcher that starts the real python.exe as a console child, and a console child of a process with no console gets
+# a new console window, which takes the focus. In 20261117-122718 that window took it from the game at the watchdog's
+# start (proxy.log WindowLog WM_ACTIVATE 0 at 12:29:20.29) and every calibration move after it read no turn.
+WATCHDOG_FLAGS = 0x08000000 | 0x00000200 | 0x01000000
+OLD_DETACHED_FLAGS = 0x00000008 | 0x00000200 | 0x01000000   # kept only for quiet_check's fake case
+
+
+def start_watchdog(hwnd: int, deadline: float, log: str | None, flags: int = WATCHDOG_FLAGS) -> int:
+    """A process outside this process tree's job, with no window, that restores the window at `deadline` (epoch s)."""
+    args = [sys.executable, "-I", os.path.abspath(__file__), "watchdog", "--hwnd", str(hwnd), "--at", f"{deadline:.1f}"]
+    if log:
+        args += ["--log", log]
     try:
         p = subprocess.Popen(args, creationflags=flags, close_fds=True, stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -177,6 +187,68 @@ def start_watchdog(hwnd: int, deadline: float, log: str) -> int:
         p = subprocess.Popen(args, creationflags=flags & ~0x01000000, close_fds=True, stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return p.pid
+
+
+def process_tree(root: int) -> set[int]:
+    """root and every process descended from it (Toolhelp snapshot)."""
+    class PE(ctypes.Structure):
+        _fields_ = [("dwSize", wt.DWORD), ("cntUsage", wt.DWORD), ("th32ProcessID", wt.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wt.DWORD), ("cntThreads", wt.DWORD),
+                    ("th32ParentProcessID", wt.DWORD), ("pcPriClassBase", ctypes.c_long), ("dwFlags", wt.DWORD),
+                    ("szExeFile", ctypes.c_wchar * 260)]
+    kernel32.CreateToolhelp32Snapshot.restype = wt.HANDLE
+    kernel32.Process32FirstW.argtypes = kernel32.Process32NextW.argtypes = [wt.HANDLE, ctypes.POINTER(PE)]
+    kernel32.CloseHandle.argtypes = [wt.HANDLE]
+    snap = kernel32.CreateToolhelp32Snapshot(0x2, 0)
+    parent = {}
+    try:
+        e = PE(); e.dwSize = ctypes.sizeof(PE)
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(e))
+        while ok:
+            parent[e.th32ProcessID] = e.th32ParentProcessID
+            ok = kernel32.Process32NextW(snap, ctypes.byref(e))
+    finally:
+        kernel32.CloseHandle(snap)
+    tree, grew = {root}, True
+    while grew:
+        new = {p for p, pp in parent.items() if pp in tree and p not in tree}
+        tree |= new
+        grew = bool(new)
+    return tree
+
+
+def visible_windows(pids: set[int]) -> list[dict]:
+    found = []
+
+    @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    def cb(h, _):
+        pid = wt.DWORD()
+        user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+        if pid.value in pids and user32.IsWindowVisible(h):
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(h, buf, 256)
+            found.append({"hwnd": h, "pid": pid.value, "class": buf.value})
+        return True
+    user32.EnumWindows(cb, 0)
+    return found
+
+
+def quiet_check(flags: int = WATCHDOG_FLAGS) -> dict:
+    """Live, no game needed: start a watchdog the way a launch does (a window that does not exist, a deadline 5 s out)
+    and check it opens no visible window and leaves the foreground window alone. ok only when both hold."""
+    fg0 = user32.GetForegroundWindow()
+    pid = start_watchdog(0, time.time() + 5.0, None, flags)
+    time.sleep(2.0)
+    pids = process_tree(pid)
+    wins = visible_windows(pids)
+    fg1 = user32.GetForegroundWindow()
+    out = {"pids": sorted(pids), "visibleWindows": wins, "foregroundBefore": fg0, "foregroundAfter": fg1,
+           "foregroundChanged": fg0 != fg1}
+    out["ok"] = not wins and not out["foregroundChanged"]
+    time.sleep(4.0)   # let it reach its deadline and exit ("window gone")
+    if out["foregroundChanged"] and fg0:
+        user32.SetForegroundWindow(fg0)
+    return out
 
 
 def watchdog(hwnd: int, at: float, log: str | None) -> int:
@@ -217,6 +289,13 @@ def self_test() -> int:
 def main(argv: list[str]) -> int:
     if argv[:1] == ["--self-test"]:
         return self_test()
+    if argv[:1] == ["--quiet-check"]:
+        broken = "--break-flags" in argv
+        r = quiet_check(OLD_DETACHED_FLAGS if broken else WATCHDOG_FLAGS)
+        print(json.dumps(r))
+        print(f"quiet check{' (fake case: the old DETACHED_PROCESS start)' if broken else ''}:",
+              "PASS" if r["ok"] else "FAIL", flush=True)
+        return 0 if r["ok"] else 1
     if argv[:1] == ["state"]:
         print(json.dumps(state(with_webview=True)))
         return 0

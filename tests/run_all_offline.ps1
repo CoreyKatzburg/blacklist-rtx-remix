@@ -67,6 +67,9 @@ foreach ($rel in 'analysis\brightness\pfm_brightness.py', 'analysis\brightness\a
     $p = Join-Path $testsDir $rel
     if (Test-Path $p) { Step (Split-Path $rel -Leaf) { Native $py @($p, '--self-test') } }
 }
+# Live, no game: the Amp-window watchdog a launch starts must open no window and leave the focus alone. In
+# 20261117-122718 its console window took the focus from the game and the mouse calibration read no turn.
+Step 'amp_window.py --quiet-check' { Native $py @((Join-Path $testsDir 'runtime\amp_window.py'), '--quiet-check') }
 foreach ($file in Get-ChildItem $testsDir -Filter 'verify_materials_*.py' | Sort-Object Name) {
     Step $file.Name { Native $py @($file.FullName) }
 }
