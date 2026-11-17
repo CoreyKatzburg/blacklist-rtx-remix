@@ -104,7 +104,9 @@ degrees away.
 HUD: with --orig-spot, pixels that stand out (contrast >= ORIG_STEPS) at the same screen place in at least half of
 the original spot's stills, although the camera turned between them, are the HUD; the mask is that set grown by 2 px
 with enclosed holes (the radar disc) filled. Blobs, puffs and glows whose peak lies on the HUD are skipped in all
-three counts. Without --orig-spot (two files) there is no HUD mask, and the output says so.
+three counts. The NVIDIA performance overlay's box (tests/analysis/overlay_mask.py, worker G; grid x 248..319,
+y 0..7) is always part of the mask, also for a spot with fewer than HUD_MIN_STILLS turn stills and for two files:
+the readout reaches column 258, left of what the learned mask covers, and is in Remix and no-Remix screen captures.
 The verdict is PASS only when the orb count and the lost-glow count pass. The puff count is report only until it can
 separate a floating glow from a surface Remix lights, with a fake case for each kind.
 
@@ -121,6 +123,8 @@ Usage: glow_blobs.py --remix R.gray --orig O.gray [--pose P] [--crops DIR]
 """
 import argparse, json, math, pathlib, re, sys
 import numpy as np
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from overlay_mask import box_at   # the NVIDIA performance overlay box (worker G), the one shared definition
 
 W, H = 320, 180
 WIN = 25
@@ -183,9 +187,27 @@ def blobs(c: np.ndarray):
 YY, XX = np.mgrid[0:H, 0:W]
 
 
+def overlay_box():
+    """The NVIDIA performance overlay's box (overlay_mask.box_at) on the 320x180 grid, as a mask."""
+    x0, y0, x1, y1 = box_at(W, H)
+    m = np.zeros((H, W), bool)
+    m[y0:y1 + 1, x0:x1 + 1] = True
+    return m
+
+
+OVERLAY = overlay_box()
+
+
+def scene(hud):
+    """Pixels that carry the scene: all but the overlay box where the mask has it. The box is cut out of blobs and of
+    every neighbourhood a count reads, so a glow touching it keeps its own peak and the readout never excuses it."""
+    return np.ones((H, W), bool) if hud is None else ~(hud & OVERLAY)
+
+
 def small_blobs(img, c, bg, hud, skipped):
     """Blobs of contrast map c that rule 2 keeps, with the distance map around each peak; skips are tallied."""
-    for area, (y, x), peak in blobs(c):
+    keep = scene(hud)
+    for area, (y, x), peak in blobs(np.where(keep, c, -np.inf)):
         if area > BLOB_MAX_PX:
             skipped["big"] += 1
             continue
@@ -196,7 +218,7 @@ def small_blobs(img, c, bg, hud, skipped):
             skipped["hud"] += 1
             continue
         d = np.hypot(YY - y, XX - x)
-        ring = img[(d >= 6) & (d <= 12)]
+        ring = img[(d >= 6) & (d <= 12) & keep]
         if np.mean(ring > bg[y, x] + 0.5 * peak) > RING_BRIGHT_MAX:
             skipped["area edge"] += 1
             continue
@@ -208,8 +230,9 @@ def judge(remix: np.ndarray, orig: np.ndarray, hud=None, match_px=MATCH_PX):
     cr, br = contrast(remix)
     co, bo = contrast(orig)
     rows, skipped = [], {"big": 0, "border": 0, "hud": 0, "area edge": 0}
+    keep = scene(hud)
     for area, y, x, peak, d in small_blobs(remix, cr, br, hud, skipped):
-        orig_bump = float(co[d <= match_px].max())
+        orig_bump = float(co[(d <= match_px) & keep].max())
         gain = float(np.clip((br[y, x] + 1.0) / (bo[y, x] + 1.0), 1.0, GAIN_MAX))
         excess = peak - gain * max(orig_bump, 0.0)
         rows.append({"x": x, "y": y, "area": area, "peak": peak, "orig": orig_bump, "gain": gain,
@@ -222,8 +245,9 @@ def lost_glows(remix: np.ndarray, orig: np.ndarray, hud=None, match_px=MATCH_PX)
     cr, br = contrast(remix)
     co, bo = contrast(orig)
     rows, skipped = [], {"big": 0, "border": 0, "hud": 0, "area edge": 0}
+    keep = scene(hud)
     for area, y, x, peak, d in small_blobs(orig, co, bo, hud, skipped):
-        near = d <= match_px
+        near = (d <= match_px) & keep
         bump, top = float(cr[near].max()), float(remix[near].max())
         gain = float(np.clip((br[y, x] + 1.0) / (bo[y, x] + 1.0), 1.0, GAIN_MAX)) if peak >= STRONG_STEPS else 1.0
         need = KEEP_FRAC * min(255.0, gain * float(orig[y, x]))
@@ -244,8 +268,9 @@ def puffs(remix: np.ndarray, orig: np.ndarray, hud=None):
     """Rules 5 and 6: one row per group of unexplained cells larger than BLOB_MAX_PX pixels."""
     cr, co = cell_contrast(remix), cell_contrast(orig)
     mask = (cr >= PUFF_STEPS) & (co < ORIG_STEPS)
-    rows, skipped = [], {"hud": 0}
     h, w = mask.shape
+    mask &= scene(hud)[: h * CELL, : w * CELL].reshape(h, CELL, w, CELL).all(axis=(1, 3))
+    rows, skipped = [], {"hud": 0}
     seen = np.zeros_like(mask)
     for y0, x0 in zip(*np.nonzero(mask)):
         if seen[y0, x0]:
@@ -274,10 +299,11 @@ def puffs(remix: np.ndarray, orig: np.ndarray, hud=None):
 
 
 def hud_mask(stills):
-    """Pixels that stand out at the same screen place in at least half of the stills (the HUD), grown by 2 px, with
-    enclosed holes filled; None when there are fewer than HUD_MIN_STILLS stills to tell the HUD from the scene."""
+    """The overlay box, plus the pixels that stand out at the same screen place in at least half of the stills (the
+    HUD), grown by 2 px, with enclosed holes filled; the box alone when there are fewer than HUD_MIN_STILLS stills to
+    tell the HUD from the scene."""
     if len(stills) < HUD_MIN_STILLS:
-        return None
+        return overlay_box()
     m = (np.stack([contrast(s)[0] for s in stills]) >= ORIG_STEPS).mean(axis=0) >= 0.5
     grown = m.copy()
     for dy in range(-2, 3):
@@ -294,7 +320,7 @@ def hud_mask(stills):
             if 0 <= yy < H and 0 <= xx < W and not grown[yy, xx] and not outside[yy, xx]:
                 outside[yy, xx] = True
                 stack.append((yy, xx))
-    return ~outside
+    return ~outside | overlay_box()
 
 
 def spot_hud(spot: pathlib.Path):
@@ -474,7 +500,8 @@ def dimmed_lamps(orig, on, changed, on_again, hud=None):
     """Rule 9: rows for every strong original glow, with "dimmed" set when the change takes Remix's glow there away."""
     co, bo = contrast(orig)
     skipped = {"big": 0, "border": 0, "hud": 0, "area edge": 0}
-    near = lambda y, x: np.hypot(YY - y, XX - x) <= MATCH_PX
+    keep = scene(hud)
+    near = lambda y, x: (np.hypot(YY - y, XX - x) <= MATCH_PX) & keep
     cs = [contrast(img)[0] for img in (on, changed, on_again)]
     rows = []
     for area, y, x, peak, d in small_blobs(orig, co, bo, hud, skipped):
@@ -706,6 +733,49 @@ def self_test() -> int:
     tally("dimmed areas: an original with no area over BLOB_MAX_PX at luma >= SAT_LUMA gives no rows",
           dimmed_areas(orig.astype(np.float32), lit, lit, lit) == [], "")
 
+    # The NVIDIA performance overlay box (worker G, Nov 17) is in every HUD mask, in all four checks.
+    box = hud_mask([])
+    bx0, by0, bx1, by1 = box_at(W, H)
+    tally("the overlay box on the 320x180 grid is x 248..319, y 0..7, and a spot with 3 turn stills gets it",
+          (bx0, by0, bx1, by1) == (248, 0, 319, 7) and np.array_equal(hud_mask([base] * 3), box)
+          and int(box.sum()) == 72 * 8, f"box {bx0},{by0},{bx1},{by1}, {int(box.sum())} px")
+    plain = (40 + 20 * (XX / W) + np.random.default_rng(7).normal(0, 1.5, (H, W))).astype(np.float32)
+    readout = plain.copy()
+    readout[by0:by1 + 1, bx0:bx1 + 1] = 12.0                    # the overlay's dark backdrop
+    readout[by0 + 2:by1:2, bx0 + 3:bx1:4] = 230.0               # and its bright digits
+    for who, r, o in (("only Remix", readout, plain), ("only the original", plain, readout)):
+        for mask, want in ((box, True), (None, False)):
+            lines = []
+            ok, n = check_all(r, o, mask, out=lines.append)
+            good = (ok and n == (0, 0, 0)) if want else n != (0, 0, 0)
+            tally(f"overlay: {who} shows the readout (the pair differs only inside the box), "
+                  f"{'with the box: no orb, puff or lost glow' if want else 'without the box: counted'}",
+                  good, f"orbs {n[0]}, puffs {n[1]}, lost {n[2]}")
+    on = _dot(readout, 150, 100, amp=150)                       # a real lamp both steps show, away from the box,
+    off = _dot(plain, 150, 100, amp=150)                        # and the readout, which is gone in the changed step
+    for mask, want in ((box, 0), (None, 1)):
+        rows, _ = dimmed_lamps(_dot(readout, 150, 100, amp=150), on, off, on, mask)
+        got = sum(r["dimmed"] for r in rows)
+        tally(f"overlay: the readout gone in the changed step, {'with' if want == 0 else 'without'} the box: "
+              f"{'no' if want == 0 else 'some'} dimmed lamp", (got == 0) if want == 0 else got >= 1,
+              f"dimmed {got} of {len(rows)}")
+    panel = plain.copy()
+    panel[by0:by1 + 1, bx0:bx1 + 1] = 255.0                     # a saturated overlay panel in the original
+    for mask, want in ((box, 0), (None, 1)):
+        rows = dimmed_areas(panel, panel, plain, panel, mask)
+        got = sum(r["dimmed"] for r in rows)
+        tally(f"overlay: a saturated panel inside the box dims in the changed step, "
+              f"{'with the box: no area' if want == 0 else 'without the box: dimmed'}", got == want,
+              f"{len(rows)} areas, dimmed {got}")
+    for x, y, where in ((284, by1 + 1, "one row below the box"), (bx0 - 1, 4, "one column left of the box")):
+        orb = _dot(readout, x, y)
+        rows = judge(orb, readout, box)[0]
+        n_orb = sum(not q["matched"] and abs(q["x"] - x) <= 1 and abs(q["y"] - y) <= 1 for q in rows)
+        lrows = lost_glows(readout, _dot(readout, x, y, amp=120), box)[0]
+        n_lost = sum(q["lost"] and abs(q["x"] - x) <= 1 and abs(q["y"] - y) <= 1 for q in lrows)
+        tally(f"overlay: a glow {where} (x {x} y {y}) is still found, as an orb and as a lost glow",
+              n_orb == 1 and n_lost == 1, f"orb {n_orb}, lost {n_lost}")
+
     # Rule 11 limits and the field-of-view reader.
     for spec, want, why in (("0,0,0,-90,0;0,0,0,-87,0", True, "3 deg of yaw, same place: aligned"),
                             ("0,0,0,-90,0;0,0,0,-86,0", False, "4 deg of yaw (over ALIGN_YAW_DEG): refused"),
@@ -749,6 +819,13 @@ def self_test() -> int:
 
         tally("the HUD mask is built from the original spot's turn stills", og_hud is not None and og_hud.sum() > 500,
               f"{'none' if og_hud is None else int(og_hud.sum())} px")
+        tally("the learned HUD mask of 000454 con_bright_hall also covers the whole overlay box (to column 248)",
+              bool(og_hud[box].all()), f"{int(og_hud[box].sum())} of {int(box.sum())} box px")
+        few = gate / "reference-20261116-175705" / "con_green_hall"
+        n_turn = sum(1 for w in json.loads((few / "spot.json").read_text()).get("windows", [])
+                     if re.fullmatch(r"y-?\d+_p-?\d+", w["name"]))
+        tally(f"175705 con_green_hall, {n_turn} turn stills (under {HUD_MIN_STILLS}), gets the overlay box",
+              n_turn < HUD_MIN_STILLS and np.array_equal(spot_hud(few), box), f"{n_turn} turn stills")
         real("142638 y0_p0 (stand-in balls on) fails on orbs", "y0_p0", (False, 12, None, 0))
         real("142638 switch step with the balls off (FlareStandIns=0) passes all three counts",
              "switch_flare_balls_off", (True, 0, 0, 0))
@@ -994,7 +1071,7 @@ def main():
         hud = spot_hud(a.orig_spot)
         al = place(orig, opose, rpose, hud)
     elif a.remix and a.orig:
-        remix, orig = still(a.remix), still(a.orig)
+        remix, orig, hud = still(a.remix), still(a.orig), hud_mask([])
         if pose is not None:
             ok, dist, dyaw, dpitch = pose_ok(pose)
             if not ok:
