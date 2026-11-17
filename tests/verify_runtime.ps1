@@ -158,8 +158,20 @@ function Get-BuildNote($folder, $prev) {
     $a, $b = (Get-RunBuild $folder), (Get-RunBuild $prev)
     if (-not $a -or -not $b) { return "the previous run $(Split-Path $prev -Leaf) and this run cannot be tied to builds (no build in a manifest), so the FPS comparison may mix builds." }
     $diff = @(foreach ($k in 'remixRuntimeSha256', 'remixClientSha256', 'proxySha256') { if ($a.$k -ne $b.$k) { $k } })
-    if ($diff.Count) { return "the previous run $(Split-Path $prev -Leaf) used other builds ($($diff -join ', ') differ; dxvk-remix $($b.remixCommit) then, $($a.remixCommit) now), so the FPS comparison measures the build change too." }
+    $installed = { param($m) if ($m.remixInstalledCommit) { $m.remixInstalledCommit } else { $m.remixCommit } }   # older manifests
+    if ($diff.Count) { return "the previous run $(Split-Path $prev -Leaf) used other builds ($($diff -join ', ') differ; dxvk-remix installed $(& $installed $b) then, $(& $installed $a) now), so the FPS comparison measures the build change too." }
     $null
+}
+# The dxvk-remix build pkg holds now: the commit play-setup\STAGED_REMIX.json records, and only while pkg's runtime
+# still has the hash it records. Not the dxvk-remix source HEAD, which may be built but not staged. run_all_offline.ps1
+# loads this same function from this file for its suite record.
+function Get-InstalledRemixCommit([string]$stagedPath, [string]$runtimeDll) {
+    if (-not (Test-Path -LiteralPath $stagedPath)) { return 'unknown: no play-setup\STAGED_REMIX.json' }
+    $rec = Get-Content -LiteralPath $stagedPath -Raw | ConvertFrom-Json
+    $hash = if (Test-Path -LiteralPath $runtimeDll) { (Get-FileHash -LiteralPath $runtimeDll -Algorithm SHA256).Hash }
+    $short = "$($rec.commit)".Substring(0, [Math]::Min(7, "$($rec.commit)".Length))
+    if ($rec.runtimeSha256 -ne $hash) { return "unknown: pkg\.trex\d3d9.dll is not the build STAGED_REMIX.json records ($short)" }
+    $short
 }
 
 if ($DryRun) {
@@ -619,12 +631,12 @@ Get-ChildItem (Join-Path $Setup 'logs') -Directory -Filter 'before-*' -ErrorActi
 # Which builds this run used, so a run can always be tied to a build (coordinator, Nov 16). The dxvk-remix commit
 # comes from the record written when pkg was staged, and only counts while pkg's runtime still has the recorded hash.
 $runtimeHash = Get-Hash (Join-Path $RuntimeSource 'd3d9.dll')
-$staged = Join-Path $Setup 'STAGED_REMIX.json'
-$stagedRec = if (Test-Path $staged) { Get-Content $staged -Raw | ConvertFrom-Json } else { $null }
-$remixCommit = if (-not $stagedRec) { 'unknown: no play-setup\STAGED_REMIX.json' }
-               elseif ($stagedRec.runtimeSha256 -ne $runtimeHash) { "unknown: pkg\.trex\d3d9.dll is not the build STAGED_REMIX.json records ($($stagedRec.commit))" }
-               else { $stagedRec.commit }
-$build = [ordered]@{ remixCommit = $remixCommit; remixRuntimeSha256 = $runtimeHash; remixClientSha256 = $RemixClientHash
+$remixCommit = Get-InstalledRemixCommit (Join-Path $Setup 'STAGED_REMIX.json') (Join-Path $RuntimeSource 'd3d9.dll')
+$remixSourceCommit = git -C $RemixSrc rev-parse --short HEAD 2>$null
+# remixInstalledCommit is the build the game loads; remixSourceCommit is the dxvk-remix checkout, which may hold a
+# newer build that is not staged (coordinator, Nov 17: one "remixCommit" read as the installed build when it was not).
+$build = [ordered]@{ remixInstalledCommit = $remixCommit; remixSourceCommit = $remixSourceCommit
+                     remixRuntimeSha256 = $runtimeHash; remixClientSha256 = $RemixClientHash
                      proxySha256 = Get-Hash (Join-Path $Setup 'd3d9.dll') }
 # The last full offline suite (run_all_offline.ps1 writes $SuiteRecord when it ends) against the tree this launch uses.
 # sameTree only when that run passed, the tools commit, dxvk-remix commit, proxy and staged runtime all match, and no
@@ -636,8 +648,9 @@ function Get-SuiteRecord([string]$path, $now) {
     if (-not $pass) { $diff += 'no recorded full-suite pass' }
     else {
         if ($rec.lastRun -and -not $rec.lastRun.passed) { $diff += "the last run, at $($rec.lastRun.finished), failed" }
-        foreach ($k in 'toolsCommit', 'remixCommit', 'proxySha256', 'runtimeSha256') {
-            if ("$($pass.$k)" -ne "$($now.$k)") { $diff += "$k $($pass.$k) then, $($now.$k) now" }
+        foreach ($k in 'toolsCommit', 'remixSourceCommit', 'remixInstalledCommit', 'proxySha256', 'runtimeSha256') {
+            $was = if ("$($pass.$k)") { $pass.$k } else { 'not recorded' }
+            if ("$($pass.$k)" -ne "$($now.$k)") { $diff += "$k $was then, $($now.$k) now" }
         }
         if (@($pass.toolsModified).Count) { $diff += "modified when it passed: $(@($pass.toolsModified).Trim() -join ', ')" }
         if (@($now.toolsModified).Count) { $diff += "modified now: $(@($now.toolsModified).Trim() -join ', ')" }
@@ -652,13 +665,13 @@ function Get-SuiteRecord([string]$path, $now) {
 # "only the touched tests ran on <commit>"), the last recorded full-suite run, and the tests commit with modified files.
 $testsModified = @(git -C (Split-Path $Tests) status --porcelain --untracked-files=no 2>$null)
 $suiteRec = Get-SuiteRecord $SuiteRecord ([ordered]@{ toolsCommit = (git -C (Split-Path $Tests) rev-parse --short HEAD 2>$null)
-    remixCommit = (git -C $RemixSrc rev-parse --short HEAD 2>$null); proxySha256 = $build.proxySha256
+    remixSourceCommit = $remixSourceCommit; remixInstalledCommit = $remixCommit; proxySha256 = $build.proxySha256
     runtimeSha256 = $runtimeHash; toolsModified = $testsModified })
 $suite = [ordered]@{ note = $SuiteNote; record = $suiteRec; testsCommit = (git -C (Split-Path $Tests) rev-parse --short HEAD 2>$null)
                      testsModified = $testsModified }
 @{ spots = @($selected | ForEach-Object name); started = $Stamp; noRemix = [bool]$NoRemix; build = $build; offlineSuite = $suite
    variants = @(if ($sweep) { $runs | ForEach-Object dir }) } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $runDir 'manifest.json')
-Write-Step "Builds: dxvk-remix $remixCommit, proxy $($build.proxySha256.Substring(0, 12))"
+Write-Step "Builds: dxvk-remix installed $remixCommit (source checkout $remixSourceCommit), proxy $($build.proxySha256.Substring(0, 12))"
 Write-Step $suiteRec.line
 
 # The pid line tells the Play script this run is alive (it refuses Corey's launch) and that the Play script this run

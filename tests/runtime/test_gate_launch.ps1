@@ -7,7 +7,7 @@ $ErrorActionPreference = 'Stop'
 $ast = [Management.Automation.Language.Parser]::ParseFile($Gate, [ref]$null, [ref]$null)
 foreach ($n in 'Remove-OwnPlayLock', 'Wait-RestartedGame', 'Get-DisplayProblem', 'Test-LaunchDead', 'Get-CSpaceProblem', 'Get-MemoryProblem',
            'Get-DisplayAwakeProblem', 'Get-DisplayDuring', 'Test-SleepsDisplays', 'Invoke-UbiLogin', 'Get-SuiteRecord', 'Get-MonitorStateProblem', 'Test-MonitorsOff',
-           'Get-RunSpots', 'Select-Previous') {
+           'Get-RunSpots', 'Select-Previous', 'Get-InstalledRemixCommit') {
     $f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true) | Select-Object -First 1
     if (-not $f) { throw "missing $n" }
     . ([scriptblock]::Create($f.Extent.Text))
@@ -211,19 +211,22 @@ Check 'rule broken (watcher moved before the wake): the order check fails' `
 $suiteFile = Join-Path $env:TEMP "suiterecord-$PID.json"
 function Rec([hashtable]$change = @{}) {
     $n = [ordered]@{ finished = '2026-11-16 22:57:00'; passed = $true; checks = 35; failed = @(); toolsCommit = '13ef9b5'
-                     toolsModified = @(); remixCommit = '1d1cb86'; proxySha256 = 'FC8E'; runtimeSha256 = 'B72B' }
+                     toolsModified = @(); remixSourceCommit = '1d1cb86'; remixInstalledCommit = 'ee695ff'; proxySha256 = 'FC8E'
+                     runtimeSha256 = 'B72B' }
     foreach ($k in $change.Keys) { $n[$k] = $change[$k] }; $n
 }
 $passRec = Rec
 function Write-SuiteFile($lastRun, $lastPass) { [ordered]@{ lastRun = $lastRun; lastPass = $lastPass } | ConvertTo-Json -Depth 4 | Set-Content $suiteFile }
 function Now([hashtable]$change = @{}) {
-    $n = [ordered]@{ toolsCommit = '13ef9b5'; remixCommit = '1d1cb86'; proxySha256 = 'FC8E'; runtimeSha256 = 'B72B'; toolsModified = @() }
+    $n = [ordered]@{ toolsCommit = '13ef9b5'; remixSourceCommit = '1d1cb86'; remixInstalledCommit = 'ee695ff'; proxySha256 = 'FC8E'
+                     runtimeSha256 = 'B72B'; toolsModified = @() }
     foreach ($k in $change.Keys) { $n[$k] = $change[$k] }; $n
 }
 Write-SuiteFile $passRec $passRec
 $r = Get-SuiteRecord $suiteFile (Now)
 Check 'suite record: same tree reads yes with the recorded time and commit' ($r.sameTree -and $r.line -eq 'full suite last passed at 2026-11-16 22:57:00 on 13ef9b5; same tree now: yes')
-foreach ($c in @(@{ toolsCommit = '0f76bd9' }, @{ remixCommit = 'ee695ff' }, @{ proxySha256 = 'AAAA' }, @{ runtimeSha256 = 'CCCC' },
+foreach ($c in @(@{ toolsCommit = '0f76bd9' }, @{ remixSourceCommit = 'ee695ff' }, @{ remixInstalledCommit = '1d1cb86' },
+                 @{ proxySha256 = 'AAAA' }, @{ runtimeSha256 = 'CCCC' },
                  @{ toolsModified = @(' M tests/runtime/gate.py') })) {
     $r = Get-SuiteRecord $suiteFile (Now $c)
     $k = @($c.Keys)[0]
@@ -242,7 +245,30 @@ Check 'suite record: never passed reads no recorded pass' ((-not $r.sameTree) -a
 Remove-Item $suiteFile
 $r = Get-SuiteRecord $suiteFile (Now)
 Check 'suite record: no file reads no recorded pass' ((-not $r.sameTree) -and $r.line -eq 'full suite: no recorded pass')
+# A record from before the split (one "remixCommit", Nov 17 00:20) cannot read as the same tree: both new keys are
+# missing, and the line says "not recorded" rather than an empty commit.
+$oldRec = Rec; $oldRec.Remove('remixSourceCommit'); $oldRec.Remove('remixInstalledCommit'); $oldRec['remixCommit'] = '1d1cb86'
+Write-SuiteFile $oldRec $oldRec
+$r = Get-SuiteRecord $suiteFile (Now)
+Check 'suite record: an old record with only remixCommit is not the same tree' ((-not $r.sameTree) -and
+    $r.line -like '*remixSourceCommit not recorded then, 1d1cb86 now*' -and $r.line -like '*remixInstalledCommit not recorded then, ee695ff now*')
+# The installed build (coordinator, Nov 17: the source HEAD 1d1cb86 was read as the installed build ee695ff): the commit
+# STAGED_REMIX.json records, only while pkg's runtime has the recorded hash.
+$stDir = Join-Path $env:TEMP "staged-$PID"; New-Item -ItemType Directory -Force $stDir | Out-Null
+$stJson = Join-Path $stDir 'STAGED_REMIX.json'; $stDll = Join-Path $stDir 'd3d9.dll'
+[IO.File]::WriteAllText($stDll, 'runtime bytes')
+$dllHash = (Get-FileHash -LiteralPath $stDll -Algorithm SHA256).Hash
+@{ commit = 'ee695ffff4a02007ac983dd35ed4859c17ffefb3'; runtimeSha256 = $dllHash } | ConvertTo-Json | Set-Content $stJson
+Check 'installed commit: the staged record when pkg has its runtime' ((Get-InstalledRemixCommit $stJson $stDll) -eq 'ee695ff')
+[IO.File]::WriteAllText($stDll, 'a newer build copied into pkg')
+Check 'installed commit: unknown when pkg holds another runtime' ((Get-InstalledRemixCommit $stJson $stDll) -like 'unknown: *(ee695ff)')
+Check 'installed commit: unknown without STAGED_REMIX.json' ((Get-InstalledRemixCommit (Join-Path $stDir 'none.json') $stDll) -like 'unknown: no *')
+Remove-Item -Recurse -Force $stDir
 $suiteText = Get-Content -Raw (Join-Path (Split-Path $Gate) 'run_all_offline.ps1')
+Check 'the suite records the source and installed dxvk-remix commits, with the gate''s own installed rule' (
+    $suiteText.Contains('remixSourceCommit = ') -and $suiteText.Contains('remixInstalledCommit = (Get-InstalledRemixCommit ') -and
+    $suiteText.Contains("`$a.Name -eq 'Get-InstalledRemixCommit'") -and -not $suiteText.Contains('remixCommit = ') -and
+    $gateText.Contains('remixInstalledCommit = $remixCommit; remixSourceCommit = $remixSourceCommit'))
 Check 'the suite writes the record the gate reads' ($suiteText.Contains("'experiments\remix-gate\offline_suite_last.json'") -and
     $gateText.Contains("`$ResultsRoot = 'D:\BlacklistOverhaul\experiments\remix-gate'") -and $gateText.Contains("Join-Path `$ResultsRoot 'offline_suite_last.json'"))
 

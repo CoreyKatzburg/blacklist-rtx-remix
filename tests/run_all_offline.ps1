@@ -87,10 +87,16 @@ $failed = @($results | Where-Object Result -ne 'PASS')
 # it ran on. lastPass keeps the newest passing run, so a later failure on the same tree still shows.
 $record = Join-Path (Split-Path (Split-Path $remixDir)) 'experiments\remix-gate\offline_suite_last.json'
 $hashOf = { param($p) if (Test-Path -LiteralPath $p) { (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash } }
+# remixSourceCommit: the dxvk-remix checkout; remixInstalledCommit: the build pkg holds (verify_runtime.ps1's own
+# Get-InstalledRemixCommit, loaded from that file so both read the same rule).
+$vrAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $testsDir 'verify_runtime.ps1'), [ref]$null, [ref]$null)
+. ([scriptblock]::Create($vrAst.Find({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and
+    $a.Name -eq 'Get-InstalledRemixCommit' }, $true).Extent.Text))
 $run = [ordered]@{ finished = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); passed = (-not $failed.Count); checks = $results.Count
     failed = @($failed | ForEach-Object Check); toolsCommit = (git -C $remixDir rev-parse --short HEAD)
     toolsModified = @(git -C $remixDir status --porcelain --untracked-files=no)
-    remixCommit = (git -C (Join-Path $remixDir 'src\dxvk-remix') rev-parse --short HEAD)
+    remixSourceCommit = (git -C (Join-Path $remixDir 'src\dxvk-remix') rev-parse --short HEAD)
+    remixInstalledCommit = (Get-InstalledRemixCommit (Join-Path $remixDir 'play-setup\STAGED_REMIX.json') (Join-Path $remixDir 'pkg\.trex\d3d9.dll'))
     proxySha256 = (& $hashOf (Join-Path $remixDir 'play-setup\d3d9.dll')); runtimeSha256 = (& $hashOf (Join-Path $remixDir 'pkg\.trex\d3d9.dll')) }
 $old = if (Test-Path -LiteralPath $record) { Get-Content -LiteralPath $record -Raw | ConvertFrom-Json }
 [ordered]@{ lastRun = $run; lastPass = $(if ($run.passed) { $run } elseif ($old) { $old.lastPass }) } |
