@@ -371,7 +371,10 @@ def score_cinematic_spot(spot_dir: str, spot_name: str, reference_dirs: list[str
 
 def summarize_gate_run(run_dir: str, reference_dirs: list[str] | str | None = None,
                        max_pose_error_deg: float = DEFAULT_MAX_POSE_ERROR_DEG,
-                       thresholds: dict[str, float] | None = None) -> dict:
+                       thresholds: dict[str, float] | None = None, stop_ok=None) -> dict:
+    """stop_ok(spot_dir, ref_spot_dir, tag) -> (bool, why), optional (gate.py's reference position rule): a raster
+    taken from a reference run counts only when it returns True; otherwise the stop is off pose, with the reason in
+    the stop's "position" field."""
     if reference_dirs is None:
         refs: list[str] = []
     elif isinstance(reference_dirs, str):
@@ -421,6 +424,9 @@ def summarize_gate_run(run_dir: str, reference_dirs: list[str] | str | None = No
                     pose_errs = [e for e in (run_pose_err, ref_pose_err) if e is not None]
                     worst_pose_err = max(pose_errs) if pose_errs else None
                     on_pose = (worst_pose_err is None) or (worst_pose_err <= max_pose_error_deg)
+                    if stop_ok is not None and os.path.abspath(ref_spot_dir) != os.path.abspath(spot_dir):
+                        placed, entry["position"] = stop_ok(spot_dir, ref_spot_dir, tag)
+                        on_pose = on_pose and placed
                     r_img = gate.read_pfm(rp)
                     cmp = compare_final_to_raster(f_img, r_img, mask_hud=True)
                     entry["raster_path"] = rp

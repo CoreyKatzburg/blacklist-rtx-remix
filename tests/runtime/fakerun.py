@@ -456,13 +456,13 @@ CASES = {
     "no_mouse_lag": ((), ("input_latency_ms",)),        # missing mouse_lag in spot.json: NOT MEASURED, fails the gate
     "fps_regression": (("fps_regression",), ()),        # 15% below the previous run
     "fps_drop_9pct": ((), ()),                          # 9% below the previous run: passes
-    "no_reference": ((), ("input_latency_ms", "lamps_without_flare", "scene_brightness", "lights_orbs_unmatched", "lights_puffs", "lights_glows_lost")),
+    "no_reference": ((), ("reference_position", "input_latency_ms", "lamps_without_flare", "scene_brightness", "lights_orbs_unmatched", "lights_puffs", "lights_glows_lost")),
     "too_dark": (("scene_brightness",), ()),
     "too_dark_vs_raster": (("scene_brightness",), ()),
     "too_bright_vs_raster": (("scene_brightness",), ()),
     "too_white_vs_raster": (("scene_brightness",), ()),
     "blurry_angles": (("angled_sharpness",), ()),
-    "pose_off": (("pose",), ()),
+    "pose_off": (("pose",), ("reference_position",)),   # y135_p0 turned 10 deg: no reference stop there
     "pan_short": (("pose",), ()),
     "goggles_missing": (("goggles",), ()),
     "goggles_untoggled": ((), ("goggles",)),
@@ -501,7 +501,7 @@ CASES = {
                            "remix_ray_tracing")),
     "no_thumbs": ((), ()),                       # still measurable from the screen captures (pan at full rate)
     "half_rate_capture": ((), ("flashes",)),     # screen capture saw half the game frames of the pan
-    "spot_error": (("s1: setup",), ("frames_over_50ms", "present_stalls", "frame_gap_over_50ms", "min_median_fps",
+    "spot_error": (("s1: setup",), ("reference_position", "frames_over_50ms", "present_stalls", "frame_gap_over_50ms", "min_median_fps",
                                     "latency_overhead_ms", "lights_orbs_unmatched", "lights_puffs", "lights_glows_lost",
                                     "input_latency_ms", "skinned_min", "remix_dropped_character_frames",
                                     "static_blas_rebuilds", "inward_fraction", "frame_join_clock",

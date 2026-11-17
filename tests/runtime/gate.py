@@ -172,7 +172,7 @@ THRESHOLDS = {
 # are the session lines freeze_gaps_excluded and quit_gap_ms. lights_lamps_dimmed applies only to runs with switch_base,
 # a change and switch_base_again; its NOT MEASURED says why in the detail.
 SOFT_NM: frozenset[str] = frozenset({"input_latency_screen_ms", "lights_puffs", "freeze_gaps_excluded", "quit_gap_ms",
-                                     "lights_lamps_dimmed"})
+                                     "lights_lamps_dimmed", "reference_position"})
 TELEMETRY_FIELDS = ("frame", "frameTimeMs", "gpuTimeMs", "instances", "skinnedInstances", "staticBlasRebuilds",
                     "cameraCut", "textureMemoryMB", "vramUsedMB")
 THUMB_W, THUMB_H = 128, 72
@@ -1477,7 +1477,7 @@ def glow_checks(run: Run, good: list[dict], reference: dict[str, dict] | None, r
         for name in _GLOW_COUNTS:
             run.add(name, NOT_MEASURED, None, threshold, why, src)
         return
-    jobs, missing = [], []
+    jobs, missing, apart = [], [], []
     for s in good:
         ref = reference.get(s["name"])
         if ref is None:
@@ -1488,12 +1488,17 @@ def glow_checks(run: Run, good: list[dict], reference: dict[str, dict] | None, r
             if not w.get("frames") or w["kind"] not in ("still", "switch"):
                 continue
             orig = w["name"] if w["name"] in ref_stills else ("y0_p0" if w["kind"] == "switch" else None)
-            if orig in ref_stills:
+            if orig not in ref_stills:
+                continue
+            placed, why = reference_position(s, w["name"], ref, orig)
+            if placed:
                 jobs.append((s["name"], s["_dir"], ref["_dir"], w["name"], orig))
+            else:
+                apart.append(f"{s['name']} {why}")      # the reference position rule: not compared
     with concurrent.futures.ThreadPoolExecutor(4) as pool:
         outs = list(pool.map(lambda j: glow_blobs_stop(j[1], j[2], j[3], j[4]), jobs))
     counts = {name: [] for name in _GLOW_COUNTS}    # name -> [(label, n, of)] per compared stop
-    apart, errors = [], []
+    errors = []
     for (spot, _, _, stop, orig), (code, out) in zip(jobs, outs):
         first = (out.splitlines()[0] if out else f"exit {code}").replace("glow_blobs: ", "")
         found = {name: rx.search(out) for name, rx in _GLOW_COUNTS.items()}
@@ -1590,11 +1595,129 @@ def window_poses(spot: dict) -> dict[str, np.ndarray]:
     return out
 
 
-def nearest_reference_still(on_pose, ref: dict) -> tuple[str | None, str]:
-    """(name, note): the reference still nearest the on step's camera among those glow_blobs.pose_ok accepts (25 cm,
-    1.5 deg), or (None, why) when none does (worker B, Nov 16: never fixed to y0_p0)."""
+# Reference position rule (coordinator, Nov 16 evening). Worker E2 found that reference 175705's con_boiler y0_p0 passed
+# the angle checks at 0.00 deg but was taken from another place: Sam 7.9 units off and the camera 65 units forward of
+# launch 085935. A reference stop now counts only when Sam's location (the stop's <window>_raster.json "location") and
+# the camera position (median render camera in proxy_frames.csv) both match the Remix stop, as well as the angles
+# (glow_blobs.pose_ok's yaw and pitch limits). Limits measured over every Nov 15-16 gate run: between Remix launches
+# that agree, Sam differs by at most 1.9 units at one stop (the next value, 4.0 to 5.4, is con_custodial's second
+# landing spot: 063147/123628/165842 against 085935/101111/130630), and where Sam agrees the camera differs by at
+# most 3.7 units (con_custodial y270_p0; 2.3 at every other stop).
+REF_SAM_UNITS, REF_CAM_UNITS = 2.0, 4.0
+
+
+def stop_positions(spot: dict) -> dict[str, tuple[list | None, np.ndarray | None]]:
+    """name -> (Sam's location, camera (x, y, z, yaw, pitch)) for each still or switch window with frames. Sam's
+    location is the window's own raster json "location"; a window without one takes its stretch's location when every
+    location in the stretch agrees within REF_SAM_UNITS (a stretch ends at each teleport window, whose landed point
+    counts in the next stretch); otherwise None. Cached in spot["_positions"]."""
+    if "_positions" in spot:
+        return spot["_positions"]
+    stretches: list[list] = [[]]
+    for w in spot["windows"]:
+        if w["kind"] == "teleport":
+            landed = (w.get("teleport") or {}).get("landed")
+            stretches.append([(None, landed)] if landed else [])
+        elif w["kind"] in ("still", "switch") and w.get("frames"):
+            rj = os.path.join(spot["_dir"], "gate", f"{w['name']}_raster.json")
+            loc = (load_json(rj) or {}).get("location") if os.path.exists(rj) else None
+            stretches[-1].append((w["name"], loc))
+    sam: dict[str, list | None] = {}
+    for st in stretches:
+        locs = [np.array(l, float) for _, l in st if l]
+        same = bool(locs) and max(float(np.linalg.norm(a - locs[0])) for a in locs) <= REF_SAM_UNITS
+        for n, l in st:
+            if n:
+                sam[n] = l or ([float(v) for v in np.median(locs, axis=0)] if same else None)
+    cams = window_poses(spot)
+    spot["_positions"] = {n: (loc, cams.get(n)) for n, loc in sam.items()}
+    return spot["_positions"]
+
+
+def reference_position(remix: dict, stop: str, ref: dict, ref_stop: str) -> tuple[bool | None, str]:
+    """Whether the reference stop was taken where the Remix stop was: (True, distances), (False, distances) when Sam,
+    the camera or the angles are apart, (None, why) when either side has no camera in the trace. A side with no
+    recorded Sam location (no raster json) is placed by the camera alone, and the line says "Sam location not
+    recorded". Only True may be compared; False and None both make the stop NOT MEASURED, never FAIL."""
     gb = glow_blobs_module()
-    best, closest = None, None
+    a, b = stop_positions(remix).get(stop, (None, None)), stop_positions(ref).get(ref_stop, (None, None))
+    lab = f"{stop}" + (f" vs {ref_stop}" if ref_stop != stop else "")
+    # Coordinator, Nov 16: the camera fixes the view and Sam is the second guard, so a side with no raster json
+    # (runs before it existed, such as 140515 and 142638) is placed by the camera alone, and the line says so.
+    unplaced = []
+    for side, (loc, cam), name in (("Remix", a, stop), ("reference", b, ref_stop)):
+        if cam is None:
+            return None, f"{lab}: no camera in the {side} trace for {name}"
+        if loc is None:
+            unplaced.append(side)
+    ds = None if unplaced else float(np.linalg.norm(np.subtract(a[0], b[0])))
+    dc = float(np.linalg.norm(a[1][:3] - b[1][:3]))
+    dyaw, dpitch = abs(wrap(float(a[1][3] - b[1][3]))), abs(float(a[1][4] - b[1][4]))
+    ok = ((ds is None or ds <= REF_SAM_UNITS) and dc <= REF_CAM_UNITS and dyaw <= gb.POSE_DEG
+          and dpitch <= gb.POSE_PITCH_DEG)
+    sam = (f"Sam location not recorded ({' and '.join(unplaced)}, no raster json)" if unplaced
+           else f"Sam {ds:.1f} apart")
+    return ok, (f"{lab}: {sam}, camera {dc:.1f} apart, yaw {dyaw:.2f}, pitch {dpitch:.2f} deg"
+                + ("" if ok else f" (limits {REF_SAM_UNITS:g} and {REF_CAM_UNITS:g} units, {gb.POSE_DEG:g} and "
+                                 f"{gb.POSE_PITCH_DEG:g} deg)"))
+
+
+def reference_position_check(run: Run, good: list[dict], reference: dict[str, dict] | None) -> None:
+    """reference_position: every Remix still and switch stop against the same spot's reference stop (switch steps
+    against y0_p0, as glow_checks pairs them). PASS when all match; NOT MEASURED listing each stop that does not, with
+    its distances. It is a guard for the checks that compare with the reference (scene_brightness, lights_*), which
+    leave those stops out themselves, so its NOT MEASURED is in SOFT_NM."""
+    name, src = "reference_position", "<window>_raster.json location + proxy_frames.csv camera, both runs"
+    thr = f"Sam <= {REF_SAM_UNITS:g}, camera <= {REF_CAM_UNITS:g} units"
+    if reference is None:
+        run.add(name, NOT_MEASURED, None, thr, "no reference run given (--reference)", src)
+        return
+    ok_n, bad, missing = 0, [], []
+    for s in good:
+        ref = reference.get(s["name"])
+        if ref is None:
+            missing.append(f"{s['name']}: no reference spot")
+            continue
+        ref_stills = {w["name"] for w in ref["windows"] if w.get("frames")}
+        for w in s["windows"]:
+            if not w.get("frames") or w["kind"] not in ("still", "switch"):
+                continue
+            orig = w["name"] if w["name"] in ref_stills else ("y0_p0" if w["kind"] == "switch" else None)
+            if orig not in ref_stills:
+                continue
+            ok, why = reference_position(s, w["name"], ref, orig)
+            if ok:
+                ok_n += 1
+            else:
+                bad.append(f"{s['name']} {why}")
+    detail = (f"{ok_n} of {ok_n + len(bad)} stops match" + (f"; not comparable: {'; '.join(bad)}" if bad else "")
+              + (f"; {'; '.join(missing)}" if missing else ""))
+    run.add(name, PASS if ok_n and not bad and not missing else NOT_MEASURED, len(bad), thr, detail, src)
+
+
+def _reference_stop_ok(good: list[dict], reference: dict[str, dict] | None):
+    """pfm_brightness's stop_ok hook: a raster taken from the reference run counts only when reference_position
+    accepts that stop; spots it cannot find are refused with the reason."""
+    by_dir = {os.path.normcase(os.path.abspath(s["_dir"])): s for s in good}
+    refs = {os.path.normcase(os.path.abspath(r["_dir"])): r for r in (reference or {}).values()}
+
+    def ok(spot_dir: str, ref_spot_dir: str, tag: str) -> tuple[bool, str]:
+        s = by_dir.get(os.path.normcase(os.path.abspath(spot_dir)))
+        r = refs.get(os.path.normcase(os.path.abspath(ref_spot_dir)))
+        if s is None or r is None:
+            return False, f"{tag}: spot not loaded for the reference position rule"
+        placed, why = reference_position(s, tag, r, tag)
+        return bool(placed), why
+    return ok
+
+
+def nearest_reference_still(on_pose, ref: dict, remix: dict | None = None,
+                            on: str | None = None) -> tuple[str | None, str]:
+    """(name, note): the reference still nearest the on step's camera among those glow_blobs.pose_ok accepts (8 cm,
+    1.5 and 1.0 deg since 33dce35) and, given the Remix spot and on step, reference_position accepts; or (None, why)
+    when none does (worker B, Nov 16: never fixed to y0_p0)."""
+    gb = glow_blobs_module()
+    best, closest, misplaced = None, None, []
     for n, p in window_poses(ref).items():
         if not n.startswith("y"):
             continue                       # stills only (y<yaw>_p<pitch>...), not the reference's own switch steps
@@ -1602,10 +1725,17 @@ def nearest_reference_still(on_pose, ref: dict) -> tuple[str | None, str]:
         key = (dist, dyaw + dpitch)
         if closest is None or key < closest[0]:
             closest = (key, n, dist, dyaw, dpitch)
+        if ok and remix is not None:
+            placed, why = reference_position(remix, on, ref, n)
+            if not placed:
+                misplaced.append(why)      # the camera is near, but Sam or the camera is not where Remix had them
+                continue
         if ok and (best is None or key < best[0]):
             best = (key, n)
     if best:
         return best[1], ""
+    if misplaced:
+        return None, "reference position rule: " + "; ".join(misplaced)
     if closest is None:
         return None, "the reference has no still with a camera"
     _, n, dist, dyaw, dpitch = closest
@@ -1642,7 +1772,8 @@ def lamps_dimmed_check(run: Run, good: list[dict], reference: dict[str, dict] | 
             missing.append(f"{s['name']}: no reference spot")
             continue
         on_pose = window_poses(s).get(pair[0])
-        orig, why = nearest_reference_still(on_pose, ref) if on_pose is not None else (None, "no camera for the on step")
+        orig, why = (nearest_reference_still(on_pose, ref, s, pair[0]) if on_pose is not None
+                     else (None, "no camera for the on step"))
         if orig is None:
             missing.append(f"{s['name']}: {why}")
             continue
@@ -1827,6 +1958,7 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
     frame_interval_check(run, good, ref_spots, no_remix)
     ref_manifest = os.path.join(reference, "manifest.json") if reference else None
     ref_no_remix = bool(ref_manifest and os.path.exists(ref_manifest) and load_json(ref_manifest).get("noRemix"))
+    reference_position_check(run, good, ref_spots)
     glow_checks(run, good, ref_spots, ref_no_remix)
     lamps_dimmed_check(run, good, ref_spots, ref_no_remix)
     latency_contributors = build_latency_contributors(good, pick(SCENE))
@@ -2123,7 +2255,8 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
             "min_spot_median_ratio", "max_spot_median_ratio", "max_near_white_delta",
         )}
         b_sum = pfm_brightness.summarize_gate_run(
-            folder, reference_dirs=[reference] if reference else None, max_pose_error_deg=1.0, thresholds=b_th
+            folder, reference_dirs=[reference] if reference else None, max_pose_error_deg=1.0, thresholds=b_th,
+            stop_ok=_reference_stop_ok(good, ref_spots)
         )
         b_spots = [b_sum["spots"][s["name"]] for s in good if s["name"] in b_sum.get("spots", {})]
         if len(b_spots) < len(good) or any(sp["status"] == pfm_brightness.NOT_MEASURED for sp in b_spots):
@@ -2392,36 +2525,51 @@ def evaluate_session(folder: str) -> dict:
 
 
 def pose_check(run: Run, spots: list[dict]) -> None:
-    """The camera direction in the proxy's trace must follow the requested yaw/pitch (relative to the first stop;
-    the sign convention is learnt from the first pure-yaw and first pitched stop), and the pan must turn >= 350 deg."""
+    """The camera direction in the proxy's trace must follow the requested yaw/pitch (relative to the first stop of
+    its stretch; the sign convention is learnt from the first pure-yaw and first pitched stop), and the pan must turn
+    >= 350 deg. drive.py asks each still's yaw relative to the last teleport's yaw, so a stretch ends at each teleport
+    window and wherever Sam's raster-json location moves more than REF_SAM_UNITS from the stretch's (the return
+    teleport after referenceStills/switchPoses records no window). Scoring a stretch against the spot's first stop gave
+    96.94 deg on 191120 con_bright_hall lampsA (teleport yaw 170)."""
     src = "d3d9_proxy_frames.csv camera trace"
     worst, problems, missing = 0.0, [], []
     for s in spots:
         proxy = s["_data"]["proxy"]
-        stops = []
+        stops, stretch, here = [], 0, None
         for w in s["windows"]:
+            if w["kind"] == "teleport":
+                stretch, here = stretch + 1, None
+                continue
             if w["kind"] != "still":
                 continue
+            rj = os.path.join(s["_dir"], "gate", f"{w['name']}_raster.json") if s.get("_dir") else ""
+            loc = (load_json(rj) or {}).get("location") if rj and os.path.exists(rj) else None
+            if loc:
+                if here is not None and float(np.linalg.norm(np.subtract(loc, here))) > REF_SAM_UNITS:
+                    stretch, here = stretch + 1, None
+                here = loc if here is None else here
             angles = [a for f in frames_in(w, "proxy") if f in proxy and (a := camera_angles(proxy[f]))]
             if not angles:
                 missing.append(f"{s['name']}/{w['name']}: no camera in the trace"); continue
             y0 = angles[0][0]
             stops.append((w["yaw"], w["pitch"], y0 + float(np.median([wrap(a[0] - y0) for a in angles])),
-                          float(np.median([a[1] for a in angles]))))
+                          float(np.median([a[1] for a in angles])), stretch))
         if not stops or (stops[0][0], stops[0][1]) != (0, 0):
             missing.append(f"{s['name']}: no measured first stop at yaw 0 pitch 0"); continue
-        _, _, by, bp = stops[0]
+        _, _, by, bp, main = stops[0]
         sign_y = sign_p = 1
-        y1 = next(((ry, my) for ry, rp, my, mp in stops if ry and not rp), None)
+        y1 = next(((ry, my) for ry, rp, my, mp, k in stops if k == main and ry and not rp), None)
         if y1:
             d = wrap(y1[1] - by)
             sign_y = 1 if abs(wrap(d - y1[0])) <= abs(wrap(d + y1[0])) else -1
-        p1 = next(((rp, mp) for ry, rp, my, mp in stops if rp), None)
+        p1 = next(((rp, mp) for ry, rp, my, mp, k in stops if k == main and rp), None)
         if p1:
             d = p1[1] - bp
             sign_p = 1 if abs(d - p1[0]) <= abs(d + p1[0]) else -1
-        for ry, rp, my, mp in stops:
-            worst = max(worst, abs(wrap(sign_y * wrap(my - by) - ry)), abs(sign_p * (mp - bp) - rp))
+        first: dict[int, tuple] = {}
+        for ry, rp, my, mp, k in stops:
+            ry0, rp0, my0, mp0, _ = first.setdefault(k, (ry, rp, my, mp, k))
+            worst = max(worst, abs(wrap(sign_y * wrap(my - my0) - (ry - ry0))), abs(sign_p * (mp - mp0) - (rp - rp0)))
         for w in s["windows"]:
             if w["kind"] == "pan":
                 yaws = [a[0] for f in frames_in(w, "proxy") if f in proxy and (a := camera_angles(proxy[f]))]

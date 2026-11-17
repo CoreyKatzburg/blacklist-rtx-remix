@@ -364,6 +364,7 @@ class FakeRunTest(unittest.TestCase):
             gate.lamps_dimmed_check(run, good, ref, True)
             return run.metrics[0]
 
+        # 142638 records no Sam location (no raster json), so the reference position rule places it by the camera alone.
         m = score()
         self.assertEqual((m["status"], m["value"]), (gate.PASS, 0), m)
         self.assertIn("0 of 4 changes", m["detail"])
@@ -386,7 +387,7 @@ class FakeRunTest(unittest.TestCase):
                                                 (0, "glow_blobs: dimmed 0 of 5 lamps the original shows (fake): PASS"))
             rename = {"switch_base": "switch_on", "switch_flare_balls_off": "switch_off",
                       "switch_base_again": "switch_on_again"}
-            probe = dict(good[0], windows=[dict(w, name=rename[w["name"]]) if w["name"] in rename else w
+            probe = dict({k: v for k, v in good[0].items() if k != "_positions"}, windows=[dict(w, name=rename[w["name"]]) if w["name"] in rename else w
                                            for w in good[0]["windows"] if w["kind"] != "switch" or w["name"] in rename])
             run = gate.Run.__new__(gate.Run)
             run.dir, run.manifest, run.metrics = "", {}, []
@@ -399,10 +400,129 @@ class FakeRunTest(unittest.TestCase):
             run.metrics.clear()
             gate.lamps_dimmed_check(run, good, far, True)
             self.assertEqual(run.metrics[0]["status"], gate.NOT_MEASURED, run.metrics[0])
-            self.assertIn("no reference still within 25 cm", run.metrics[0]["detail"])
+            self.assertIn("no reference still within 8 cm", run.metrics[0]["detail"])
             self.assertEqual(calls, [])
         finally:
             gate.glow_dimmed_stop = real
+
+    @staticmethod
+    def _pose_spot(td, name, stills, loc_of=None, teleport_before=None, trace=True):
+        """A fake spot: stills = [(name, yaw asked, pitch asked, camera xyz, world yaw, world pitch)], one 5-frame
+        window each, in order; loc_of: name -> Sam's raster-json location; teleport_before: still name preceded by a
+        teleport window."""
+        d = os.path.join(td, name)
+        os.makedirs(os.path.join(d, "gate"))
+        rows, wins = [], []
+        for i, (n, ry, rp, xyz, wy, wp) in enumerate(stills):
+            if n == teleport_before:
+                wins.append({"name": f"{n}_teleport", "kind": "teleport", "teleport": {"landed": (loc_of or {}).get(n)}})
+            fx, fy, fz = (math.cos(math.radians(wp)) * math.cos(math.radians(wy)),
+                          math.cos(math.radians(wp)) * math.sin(math.radians(wy)), math.sin(math.radians(wp)))
+            for fr in range(i * 5 + 1, i * 5 + 6):
+                rows.append(f"{fr},0,16,1,100,1,G:0:0:{xyz[0]}:{xyz[1]}:{xyz[2]}:{fx}:{fy}:{fz}\n")
+            wins.append({"name": n, "kind": "still", "yaw": ry, "pitch": rp, "frames": [i * 5, i * 5 + 5],
+                         "proxy": [i * 5, i * 5 + 5]})
+            if (loc_of or {}).get(n):
+                write(os.path.join(d, "gate", f"{n}_raster.json"), json.dumps({"location": loc_of[n]}))
+        path = os.path.join(d, "proxy_frames.csv")
+        if trace:
+            write(path, "".join(rows))
+        return {"name": name, "_dir": d, "windows": wins, "_data": {"proxy": gate.read_csv_frames(path, 7)}}
+
+    @staticmethod
+    def _stub_run():
+        run = gate.Run.__new__(gate.Run)
+        run.dir, run.manifest, run.metrics = "", {}, []
+        return run
+
+    def test_pose_after_teleport_is_relative_to_the_teleport(self):
+        """Worker B's 96.94 deg case: drive.py asks a still's yaw relative to the last teleport's yaw. A still after a
+        teleport (yaw 170) asked at yaw 0 and measured at world 170 must read 0 deg off, whether the teleport window is
+        recorded or only Sam's raster-json location moved (the unrecorded return teleport). Without either marker it
+        is scored against the spawn's stop and reads 170, which is what the old rule did."""
+        base = [("y0_p0", 0, 0, (0, 0, 0), 0.0, 0.0), ("y90_p0", 90, 0, (0, 0, 0), 90.0, 0.0),
+                ("lampsA", 0, 0, (300, 0, 0), 170.0, 0.0)]
+        here, there = [0.0, 0.0, 0.0], [300.0, 0.0, 0.0]
+        cases = {"teleport window": (None, "lampsA", 0.0),
+                 "location only": (dict(y0_p0=here, y90_p0=here, lampsA=there), None, 0.0),
+                 "no marker (old rule)": (None, None, 170.0)}
+        with tempfile.TemporaryDirectory() as td:
+            for i, (case, (locs, tp, want)) in enumerate(cases.items()):
+                with self.subTest(case):
+                    run = self._stub_run()
+                    gate.pose_check(run, [self._pose_spot(td, f"s{i}", base, locs, tp)])
+                    self.assertAlmostEqual(run.metrics[0]["value"], want, delta=0.05, msg=run.metrics[0])
+
+    def test_reference_position_rule_on_real_con_boiler(self):
+        """E2's find: references 175705 and 174116 took con_boiler y0_p0 from another place (Sam 7.9 and 7.3 units
+        off, the camera 65 forward) at a matching angle; 045456 matches Remix launch 085935 within the limits. With the
+        position limits opened up, 175705 passes, so the new rule is what rejects it."""
+        g = r"D:\BlacklistOverhaul\experiments\remix-gate"
+        runs = ("20261116-085935", "reference-20261116-175705", "reference-20261116-174116",
+                "reference-20261116-045456")
+        if not all(os.path.isdir(os.path.join(g, r)) for r in runs):
+            self.skipTest("con_boiler runs not on this machine")
+
+        def sp(r, name):
+            d = os.path.join(g, r, name)
+            s = gate.load_json(os.path.join(d, "spot.json"))
+            s["_dir"] = d
+            return s
+
+        def check(r):
+            return gate.reference_position(sp(runs[0], "capture_boiler_custodial"), "con_boiler_y0_p0",
+                                           sp(r, "con_boiler"), "y0_p0")
+
+        for r, sam, cam in ((runs[1], "Sam 7.9", "camera 65.1"), (runs[2], "Sam 7.3", "camera 64.4")):
+            ok, why = check(r)
+            self.assertIs(ok, False, why)
+            self.assertIn(sam, why)
+            self.assertIn(cam, why)
+        ok, why = check(runs[3])
+        self.assertIs(ok, True, why)
+        self.assertIn("Sam 1.0 apart, camera 2.9 apart", why)
+        saved = gate.REF_SAM_UNITS, gate.REF_CAM_UNITS
+        try:
+            gate.REF_SAM_UNITS = gate.REF_CAM_UNITS = 1e9
+            self.assertIs(check(runs[1])[0], True)
+        finally:
+            gate.REF_SAM_UNITS, gate.REF_CAM_UNITS = saved
+
+    def test_reference_position_rule_fake_spots(self):
+        """Fake stops: the rule accepts a reference within 2 units of Sam and 4 of the camera at the same angle, and
+        rejects Sam 3 apart, the camera 5 apart, and a matching place with the yaw 3 deg off (the old angle rule).
+        No Sam location on one side is placed by the camera alone, with "Sam location not recorded" in the line: the
+        camera within the limit is accepted, 5 apart rejected. No camera trace reads None, with or without Sam. reference_position_check turns a rejected stop into NOT
+        MEASURED with both distances, never FAIL."""
+        sam, cam = [-12165.0, -2519.0, -676.5], (-11974.0, -2476.0, -629.0)
+
+        def stop(xyz=cam, yaw=0.0, loc=sam):
+            return [("y0_p0", 0, 0, xyz, yaw, 0.0)], ({"y0_p0": loc} if loc else None)
+
+        with tempfile.TemporaryDirectory() as td:
+            remix = self._pose_spot(td, "remix", *stop())
+            cases = {"near": (stop((cam[0] + 3, cam[1], cam[2]), loc=[sam[0] + 1.5, sam[1], sam[2]]), True, True),
+                     "sam 3 apart": (stop(loc=[sam[0], sam[1] + 3, sam[2]]), True, False),
+                     "camera 5 apart": (stop((cam[0] + 5, cam[1], cam[2])), True, False),
+                     "yaw 3 deg off": (stop(yaw=3.0), True, False),
+                     "no camera trace": (stop(), False, None),
+                     "no Sam, camera near": (stop((cam[0] + 3, cam[1], cam[2]), loc=None), True, True),
+                     "no Sam, camera 5 apart": (stop((cam[0] + 5, cam[1], cam[2]), loc=None), True, False),
+                     "no camera, no Sam": (stop(loc=None), False, None)}
+            for i, (case, ((stills, locs), trace, want)) in enumerate(cases.items()):
+                with self.subTest(case):
+                    ref = self._pose_spot(td, f"ref{i}", stills, locs, trace=trace)
+                    ok, why = gate.reference_position(remix, "y0_p0", ref, "y0_p0")
+                    self.assertIs(ok, want, why)
+                    if case.startswith("no Sam"):
+                        self.assertIn("Sam location not recorded (reference", why)
+                    run = self._stub_run()
+                    remix["name"] = ref["name"]
+                    gate.reference_position_check(run, [remix], {ref["name"]: ref})
+                    m = run.metrics[0]
+                    self.assertEqual(m["status"], gate.PASS if want else gate.NOT_MEASURED, m)
+                    if want is False:
+                        self.assertRegex(m["detail"], r"Sam (location not recorded|[\d.]+ apart).*, camera [\d.]+ apart")
 
     def test_session_mode_fake_sessions(self):
         with tempfile.TemporaryDirectory() as td:
