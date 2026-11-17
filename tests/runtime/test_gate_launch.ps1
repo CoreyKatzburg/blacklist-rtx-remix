@@ -6,7 +6,7 @@ param([string]$Gate = (Join-Path (Split-Path $PSScriptRoot) 'verify_runtime.ps1'
 $ErrorActionPreference = 'Stop'
 $ast = [Management.Automation.Language.Parser]::ParseFile($Gate, [ref]$null, [ref]$null)
 foreach ($n in 'Remove-OwnPlayLock', 'Wait-RestartedGame', 'Get-DisplayProblem', 'Test-LaunchDead', 'Get-CSpaceProblem', 'Get-MemoryProblem',
-           'Get-DisplayAwakeProblem', 'Get-DisplayDuring', 'Test-SleepsDisplays') {
+           'Get-DisplayAwakeProblem', 'Get-DisplayDuring', 'Test-SleepsDisplays', 'Invoke-UbiLogin') {
     $f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true) | Select-Object -First 1
     if (-not $f) { throw "missing $n" }
     . ([scriptblock]::Create($f.Extent.Text))
@@ -63,6 +63,15 @@ Check 'starter exits at 11 s: dead 20 s later, not sooner' ((FirstDead (0..10) 1
 Check 'starter runs until the game: never dead' ((FirstDead (0..120) 120) -eq 0)
 Check 'starter not seen yet (slow Steam): never dead' ((FirstDead @() 120) -eq 0)
 Check 'starter back after a gap: the gap is forgotten' ((FirstDead (@(0..10) + @(20..24)) 120) -eq 45)
+# Sign-in with Ubisoft Connect gone (run 190131, Nov 16 19:07): ubi_login.ps1 throws 'Cannot find a process with the
+# name "upc"'. The launch must carry on to the dead-start check and only report the failure.
+$fakeLogin = Join-Path $env:TEMP "ubilogin-$PID.ps1"
+Set-Content $fakeLogin '$ErrorActionPreference = ''Stop''; Get-Process upc-not-running-fake -ErrorAction Stop | Out-Null'
+$loginMsg = try { Invoke-UbiLogin $fakeLogin } catch { 'THROWN' }
+Check 'sign-in script throws (no upc): reported, launch carries on' ($loginMsg -and $loginMsg -ne 'THROWN' -and $loginMsg -match 'Cannot find a process')
+Set-Content $fakeLogin '"signed in"'
+Check 'sign-in works: nothing reported, its output dropped' ($null -eq (Invoke-UbiLogin $fakeLogin))
+Remove-Item $fakeLogin
 # C: space (Nov 16 12:22:49): a launch that started with 17,100 MB free fell to 8,299 MB. Started with less than the
 # 8,801 MB it took, it would have run C: out; the gate's limit must refuse that, and allow the 17,100 MB start.
 $limit = [int]((Select-String -LiteralPath $Gate -Pattern '^\$MinCFreeMB = (\d+)').Matches[0].Groups[1].Value)

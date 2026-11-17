@@ -393,6 +393,13 @@ function Test-LaunchDead($watch, [bool]$starterRunning, [double]$now, [double]$g
     ($now - $watch.goneAt) -ge $grace
 }
 
+# ubi_login.ps1 throws when Ubisoft Connect ("upc") is not running. In run 190131 (Nov 16 19:07) Ubisoft Connect had
+# died with "FATAL Cannot switch modes after logging in", that throw ended the spot, and the Steam re-ask never ran.
+# A failed sign-in is now only reported; Test-LaunchDead still decides whether the start is dead.
+function Invoke-UbiLogin([string]$script) {
+    try { & $script | Out-Null; $null } catch { "Ubisoft Connect sign-in failed, carrying on: $($_.Exception.Message)" }
+}
+
 # Steam -> launcher -> game; then Space, Space, Enter (title, "press any key", "resume at checkpoint") until
 # Test-LevelLive says a level is rendering. Never Esc (quits from menus).
 function Start-GameAtCheckpoint {
@@ -425,7 +432,8 @@ function Start-GameAtCheckpoint {
         if ($asked.Elapsed.TotalSeconds -gt 300) { throw 'The game did not start within 5 minutes.' }
         if (-not $loginTried -and $t.Elapsed.TotalSeconds -gt 60 -and (Get-Process UbisoftGameLauncher -ErrorAction SilentlyContinue)) {
             $loginTried = $true
-            & (Join-Path (Split-Path $Tests) 'stutter-recorder\ubi_login.ps1') | Out-Null   # password from 1Password, never printed
+            $loginFail = Invoke-UbiLogin (Join-Path (Split-Path $Tests) 'stutter-recorder\ubi_login.ps1')   # password from 1Password, never printed
+            if ($loginFail) { Write-Step $loginFail }
         }
         Start-Sleep 2
     }
