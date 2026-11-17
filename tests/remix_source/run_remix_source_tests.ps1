@@ -7,6 +7,7 @@
 #   runtime_logic_test      camera-cut rule, instance trace classification, texture slot retire,
 #                           telemetry line format and writer
 #   check_telemetry_contract.py  telemetry sample matches the Phase 5 JSONL contract
+#   draw_log_test           per-draw scene log line format, texcoord source rule, arming (rtx_draw_log.h)
 #   bridge_queue_test       command batching in the bridge queue (needs the x64 bridge built once:
 #                           build_custom_remix.ps1 -Target bridge)
 #   bridge_reply_wrap_test  server replies wrap their data queue without waiting on the game
@@ -60,6 +61,11 @@ if (Invoke-Cl 'capture_analysis_test' "/W4 /WX `"$here\capture_analysis_test.cpp
 if (Invoke-Cl 'runtime_logic_test' "/W4 /WX /wd4267 `"$here\runtime_logic_test.cpp`"") {
     Invoke-Check 'runtime_logic_test' { & "$build\runtime_logic_test.exe" $build }
     Invoke-Check 'check_telemetry_contract.py' { & $python -I "$here\check_telemetry_contract.py" (Join-Path $build 'telemetry_sample.jsonl') }
+}
+
+# 2b. Per-draw scene log (rtx.drawLog.tag): line format, texcoord source rule, arming.
+if (Invoke-Cl 'draw_log_test' "/W4 /WX `"$here\draw_log_test.cpp`"") {
+    Invoke-Check 'draw_log_test' { & "$build\draw_log_test.exe" }
 }
 
 # 3. Bridge command queue (real header, linked with the x64 bridge util library).
