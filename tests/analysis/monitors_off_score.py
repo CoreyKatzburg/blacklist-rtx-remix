@@ -100,6 +100,18 @@ def detached(snap: list[dict] | None) -> bool:
     return len(mine) == len(MONITORS) and all(not m.get("available") and not m.get("active") for m in mine)
 
 
+def held_s(w: dict) -> float | None:
+    """How long the window was held: drive.py's "heldS" (written only when it detaches monitors), else the window's own
+    "clock" span [start, end] as HH:MM:SS.fff (a window with the monitors as found has only that). None if neither."""
+    if w.get("heldS") is not None:
+        return w["heldS"]
+    try:
+        a, b = (sum(float(x) * m for x, m in zip(c.split(":"), (3600, 60, 1))) for c in w["clock"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return round((b - a) % 86400, 1)
+
+
 def attached(snap: list[dict] | None) -> bool:
     mine = [m for m in snap or [] if m.get("name") in MONITORS]
     return len(mine) == len(MONITORS) and all(m.get("available") and m.get("active") for m in mine)
@@ -160,15 +172,16 @@ def score(off: str, on_runs: list[str] = ON_RUNS, want: str = display_state.PLUG
         if w.get("skipped"):
             problems.append(f"{w['name']} skipped: {w['skipped']}")
             continue
-        if (w.get("heldS") or 0) < MIN_HELD_S:
-            problems.append(f"{w['name']} held {w.get('heldS')} s, under {MIN_HELD_S}")
+        held = held_s(w)
+        if (held or 0) < MIN_HELD_S:
+            problems.append(f"{w['name']} held {held} s, under {MIN_HELD_S}")
         mons = w.get("monitors", {})
         if not (state_ok(mons.get("start")) and state_ok(mons.get("end"))):
             problems.append(f"{w['name']} monitors not both {state_word} at start and end")
         g, n = window_gap(gaps, w)
         results.append((w["name"], g, n))
         extra = sorted(set(others(mons.get("start")) + others(mons.get("end"))))
-        lines.append(f"{w['name']:12} frame gap {g} ms over {n} frames, held {w.get('heldS')} s"
+        lines.append(f"{w['name']:12} frame gap {g} ms over {n} frames, held {held} s"
                      + (f"; other display(s) active: {', '.join(extra)}" if extra else ""))
     if problems:
         return 1, lines + [f"NOT MEASURED: {p}" for p in problems]
@@ -195,7 +208,7 @@ def score(off: str, on_runs: list[str] = ON_RUNS, want: str = display_state.PLUG
 
 def _fake(root: str, src: str, gap_scale: float = 1.0, bright_scale: float = 1.0, steps=("both_off", "both_off"),
           mon_avail: bool = False, held: float = 45.0, skip: bool = False, phantom: bool = False,
-          machine: dict | None = display_state.OFF_002048) -> str:
+          machine: dict | None = display_state.OFF_002048, clock_span: float | None = None) -> str:
     """A monitors-off spot folder made from a monitors-on one: its both_on / both_on_again windows renamed to the given
     steps, frame gaps and the final picture scaled; machine_before.json is `machine` (002048's plug-off record)."""
     os.makedirs(os.path.join(root, "gate"), exist_ok=True)
@@ -210,6 +223,10 @@ def _fake(root: str, src: str, gap_scale: float = 1.0, bright_scale: float = 1.0
     wins = []
     for w, step in zip(on, steps):
         w = dict(w, monitorStep=step, heldS=held, monitors={"start": snap, "end": snap})
+        if clock_span is not None:   # a window with the monitors as found: no heldS, only its clock span
+            del w["heldS"]
+            end = 50.25 + clock_span   # starts 23:59:50.250, so a span over 9.75 s also crosses midnight
+            w["clock"] = ["23:59:50.250", f"00:00:{end - 60:06.3f}" if end >= 60 else f"23:59:{end:06.3f}"]
         if skip:
             w = {"name": w["name"], "monitorStep": step, "skipped": "the both_off state was not reached within 45 s"}
         wins.append(w)
@@ -267,6 +284,8 @@ def self_test() -> int:
             ("plug on asked, machine_before reads plug off", {"machine": display_state.OFF_002048}, 1, "want plug on"),
             ("plug on asked, monitors read detached", {"mon_avail": False}, 1, "monitors not both attached"),
             ("plug on asked, both_off steps", {"steps": ("both_off", "both_off")}, 1, "want only both_on"),
+            ("plug on, no heldS, clock spans 45 s", {"clock_span": 45.0}, 0, "held 45.0 s"),
+            ("plug on, no heldS, clock spans 30 s", {"clock_span": 30.0}, 1, "held 30.0 s, under"),
             ]
         for i, (name, kw, want, line) in enumerate(on_cases):
             args = dict({"steps": ("both_on", "both_on"), "mon_avail": True, "machine": display_state.ON_212703}, **kw)
