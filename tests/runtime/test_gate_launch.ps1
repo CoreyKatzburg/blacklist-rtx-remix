@@ -6,7 +6,8 @@ param([string]$Gate = (Join-Path (Split-Path $PSScriptRoot) 'verify_runtime.ps1'
 $ErrorActionPreference = 'Stop'
 $ast = [Management.Automation.Language.Parser]::ParseFile($Gate, [ref]$null, [ref]$null)
 foreach ($n in 'Remove-OwnPlayLock', 'Wait-RestartedGame', 'Get-DisplayProblem', 'Test-LaunchDead', 'Get-CSpaceProblem', 'Get-MemoryProblem',
-           'Get-DisplayAwakeProblem', 'Get-DisplayDuring', 'Test-SleepsDisplays', 'Invoke-UbiLogin', 'Get-SuiteRecord', 'Get-MonitorStateProblem', 'Test-MonitorsOff') {
+           'Get-DisplayAwakeProblem', 'Get-DisplayDuring', 'Test-SleepsDisplays', 'Invoke-UbiLogin', 'Get-SuiteRecord', 'Get-MonitorStateProblem', 'Test-MonitorsOff',
+           'Get-RunSpots', 'Select-Previous') {
     $f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true) | Select-Object -First 1
     if (-not $f) { throw "missing $n" }
     . ([scriptblock]::Create($f.Extent.Text))
@@ -260,6 +261,55 @@ Check 'bench monitorsOff true reads as asked' (Test-MonitorsOff ([pscustomobject
 Check 'no monitorsOff key reads as not asked' (-not (Test-MonitorsOff ([pscustomobject]@{ bench = [pscustomobject]@{ liveSteps = @() } })))
 Check 'monitorsOff false reads as not asked' (-not (Test-MonitorsOff ([pscustomobject]@{ bench = [pscustomobject]@{ monitorsOff = $false } })))
 Check 'Add-MachineState passes the spot''s monitorsOff on' ($gateText.Contains('Add-MachineState $runDir $run.dir $spotDir (Test-MonitorsOff $spot)'))
+
+# Display state (coordinator, Nov 17 00:30: plug off ran about 12 % faster per frame than plug on): gate.py's FPS check
+# gets a previous run only in the same display state class; a given -Previous in another state reads NOT COMPARABLE.
+$Py = 'D:\BlacklistOverhaul\tools\upscalers\py314\Scripts\python.exe'; $Runtime = $PSScriptRoot
+$ResultsRoot = Join-Path ([IO.Path]::GetTempPath()) "gate-display-$PID"
+$monOn = '{"display":"on","monitorsOn":2,"monitors":["DISPLAY\\ACI27A8\\a","DISPLAY\\HKC2731\\b"]}'
+$monOff = '{"display":"on","monitorsOn":0,"monitors":[],"displays":{"name":"ASUS MG278","primary":true,"refreshHz":60.0}}'
+function FakeRun($name, $machine) {
+    $d = Join-Path $ResultsRoot $name
+    New-Item -ItemType Directory -Force (Join-Path $d 'con_custodial') | Out-Null
+    '{"spots":["con_custodial"]}' | Set-Content (Join-Path $d 'manifest.json')
+    '{}' | Set-Content (Join-Path $d 'result.json')
+    if ($machine) { $machine | Set-Content (Join-Path $d 'con_custodial\machine_before.json') }
+    $d
+}
+$onOld = FakeRun '20990101-000001' $monOn
+$offNew = FakeRun '20990101-000002' $monOff
+$onNow = FakeRun '20990101-000003' $monOn
+$offNow = FakeRun '20990101-000004' $monOff
+$oldRun = FakeRun '20990101-000005' $null
+$p = Select-Previous $onNow ''
+Check 'plug-on run: the newest earlier plug-on run, not the newer plug-off one' ($p.prev -eq $onOld -and -not $p.note)
+$p = Select-Previous $offNow ''
+Check 'plug-off run: the plug-off run' ($p.prev -eq $offNew -and -not $p.note)
+$p = Select-Previous $onNow $offNew
+Check 'plug-on run with -Previous a plug-off run: refused, NOT COMPARABLE' (-not $p.prev -and $p.note -like 'fps_regression NOT COMPARABLE: display state plug on*plug off*')
+$p = Select-Previous $onNow $onOld
+Check 'plug-on run with -Previous a plug-on run: compared' ($p.prev -eq $onOld)
+$p = Select-Previous $oldRun ''
+Check 'run without a display record: no previous run, NOT COMPARABLE' (-not $p.prev -and $p.note -like '*NOT COMPARABLE: display state unknown*')
+$f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq 'Select-Previous' }, $true) | Select-Object -First 1
+. ([scriptblock]::Create($f.Extent.Text.Replace('if ($LASTEXITCODE -eq 0)', 'if ($true)')))
+$p = Select-Previous $onNow $offNew
+Check 'rule removed (display state not checked), case fails: the plug-off run is compared' ($p.prev -eq $offNew)
+. ([scriptblock]::Create($f.Extent.Text))
+# Add-MachineState with the recorded state of launch 20261117-002048 (MG278 alone at 60 Hz) writes plug off into the
+# launch's machine_before.json and the run manifest.
+$f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq 'Add-MachineState' }, $true) | Select-Object -First 1
+. ([scriptblock]::Create($f.Extent.Text))
+function Write-Step($t) { }
+function Get-MachineState { [ordered]@{ time = '00:21:10'; display = 'on'; displayWake = $onWake; monitorsOn = 0; monitors = @()
+    displays = @([pscustomobject]@{ name = 'ASUS MG278'; primary = $true; width = 2560; height = 1440; x = 0; y = 0; refreshHz = 60.0 }); idleGpuPowerW = 76.31 } }
+$mrun = FakeRun '20990101-000006' $null
+Add-MachineState $mrun 'l1' (Join-Path $mrun 'con_custodial') $true
+$man = Get-Content (Join-Path $mrun 'manifest.json') -Raw | ConvertFrom-Json
+$mbj = Get-Content (Join-Path $mrun 'con_custodial\machine_before.json') -Raw | ConvertFrom-Json
+Check 'Add-MachineState: plug off in machine_before.json and the manifest' ($mbj.displayState -eq 'plug off' -and $man.displayState.class -eq 'plug off' -and $man.machineBefore.l1.displayState -eq 'plug off')
+Remove-Item $ResultsRoot -Recurse -Force
+Check 'Add-MachineState records the display state class' ($gateText.Contains("display_state.py') launch `$mb") -and $gateText.Contains("Add-Member displayState"))
 
 "failures $fail"
 exit [int]($fail -gt 0)

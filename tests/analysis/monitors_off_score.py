@@ -32,6 +32,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "brightness"))
 import pfm_brightness  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "runtime"))
+import display_state  # noqa: E402
 
 GATE = r"D:\BlacklistOverhaul\experiments\remix-gate"
 ON_RUNS = [os.path.join(GATE, r, "01_monitors") for r in ("20261116-222500-settings", "20261116-225845-settings")]
@@ -111,6 +113,9 @@ def check_on_runs(on_runs: list[str]) -> list[str]:
                 bad.append(f"{run} {w['monitorStep']} frame gap {window_gap(gaps, w)[0]} is not the fixed {want}")
         if abs(brightness(folder) - ON_BRIGHT[run]) > 0.000015:
             bad.append(f"{run} brightness {brightness(folder)} is not the fixed {ON_BRIGHT[run]}")
+        ds = display_state.launch_state(folder)
+        if ds["class"] != display_state.PLUG_ON:
+            bad.append(f"{run} display state {ds['class']} ({ds['why']}), want plug on")
     return bad
 
 
@@ -129,6 +134,10 @@ def score(off: str, on_runs: list[str] = ON_RUNS) -> tuple[int, list[str]]:
         return 1, lines + [f"NOT MEASURED: {e}"]
     wins = [w for w in spot["windows"] if w.get("monitorStep")]
     problems = []
+    ds = display_state.launch_state(off)
+    lines.append(f"display state before the launch: {ds['class']} ({ds['why']})")
+    if ds["class"] != display_state.PLUG_OFF:
+        problems.append(f"display state {ds['class']} before the launch, want plug off")
     if not wins or any(w["monitorStep"] != "both_off" for w in wins):
         problems.append(f"steps {[w['monitorStep'] for w in wins]}, want only both_off")
     results = []
@@ -170,11 +179,14 @@ def score(off: str, on_runs: list[str] = ON_RUNS) -> tuple[int, list[str]]:
 
 
 def _fake(root: str, src: str, gap_scale: float = 1.0, bright_scale: float = 1.0, steps=("both_off", "both_off"),
-          mon_avail: bool = False, held: float = 45.0, skip: bool = False, phantom: bool = False) -> str:
+          mon_avail: bool = False, held: float = 45.0, skip: bool = False, phantom: bool = False,
+          machine: dict | None = display_state.OFF_002048) -> str:
     """A monitors-off spot folder made from a monitors-on one: its both_on / both_on_again windows renamed to the given
-    steps, frame gaps and the final picture scaled."""
+    steps, frame gaps and the final picture scaled; machine_before.json is `machine` (002048's plug-off record)."""
     os.makedirs(os.path.join(root, "gate"), exist_ok=True)
     os.makedirs(os.path.join(root, "frames"), exist_ok=True)
+    if machine is not None:
+        json.dump(machine, open(os.path.join(root, "machine_before.json"), "w"))
     spot = json.load(open(os.path.join(src, "spot.json")))
     snap = [{"name": n, "available": mon_avail, "active": mon_avail} for n in ("HKC2731", "ACI27A8")]
     if phantom:
@@ -224,7 +236,9 @@ def self_test() -> int:
         ("both_off held only 20 s", {"held": 20.0}, 1, "held 20.0 s"),
         ("both_off skipped", {"skip": True}, 1, "skipped"),
         ("a both_on step in the launch", {"steps": ("both_on", "both_off")}, 1, "want only both_off"),
-    ]
+        ("machine_before reads plug on", {"machine": display_state.ON_212703}, 1, "want plug off"),
+        ("no machine_before", {"machine": None}, 1, "display state unknown before the launch"),
+        ]
     fails = 0
     try:
         for i, (name, kw, want, line) in enumerate(cases):

@@ -100,23 +100,46 @@ function Select-Reference($folder, $stamp) {
     @{ spots = @($chosen.Keys); chosenFrom = $chosen } | ConvertTo-Json | Set-Content (Join-Path $merged 'manifest.json')
     $merged
 }
-function Gate($folder) {
+# The run gate.py's FPS check compares with: -Previous when given, else the newest earlier run of the same kind with the
+# same spots. Either way only a run in the same display state (runtime\display_state.py compare: same class, not
+# unknown), since plug off ran about 12 % faster per frame than plug on (Nov 17 00:21). Returns @{ prev; note }: prev
+# $null and a NOT COMPARABLE note when the given or every candidate run is in another state.
+function Select-Previous($folder, [string]$given) {
     $name = Split-Path $folder -Leaf
     $stamp = $name -replace '^reference-', ''
     $spotsHere = (Get-RunSpots $folder) -join ','
     # a reference run is compared only with earlier reference runs, a Remix run only with earlier Remix runs
     $kind = if ($name -like 'reference-*') { '^reference-\d{8}-\d{6}$' } else { '^\d{8}-\d{6}$' }
-    $prev = if ($Previous) { $Previous } else {
-        Get-ChildItem $ResultsRoot -Directory | Where-Object { $_.Name -match $kind -and ($_.Name -replace '^reference-', '') -lt $stamp -and
+    $cands = if ($given) { @($given) } else {
+        @(Get-ChildItem $ResultsRoot -Directory | Where-Object { $_.Name -match $kind -and ($_.Name -replace '^reference-', '') -lt $stamp -and
             (Test-Path (Join-Path $_.FullName 'result.json')) -and ((Get-RunSpots $_.FullName) -join ',') -eq $spotsHere } |
-            Sort-Object Name | Select-Object -Last 1 -ExpandProperty FullName }
+            Sort-Object Name -Descending | ForEach-Object FullName) }
+    $first = $null
+    foreach ($c in $cands) {
+        $why = & $Py -I (Join-Path $Runtime 'display_state.py') compare $folder $c
+        if ($LASTEXITCODE -eq 0) { return @{ prev = $c; note = $null } }
+        if (-not $first) { $first = $why }
+    }
+    if (-not $cands.Count) { return @{ prev = $null; note = $null } }
+    @{ prev = $null; note = "fps_regression $first$(if (-not $given) { " (and no other earlier run with the same spots is in the same display state)" })" }
+}
+function Gate($folder) {
+    $name = Split-Path $folder -Leaf
+    $stamp = $name -replace '^reference-', ''
+    $pick = Select-Previous $folder $Previous
+    $prev = $pick.prev
     $ref = if ($Reference) { $Reference } elseif ($name -like 'reference-*') { $null } else { Select-Reference $folder $stamp }
     $gateArgs = @((Join-Path $Runtime 'gate.py'), $folder)
     if ($prev) { $gateArgs += @('--previous', $prev) }
     if ($ref) { $gateArgs += @('--reference', $ref) }
-    Write-Host "  gate: previous run $(if ($prev) { $prev } else { '(none with the same spots)' }); no-Remix reference $(if ($ref) { $ref } else { '(none)' })"
+    Write-Host "  gate: previous run $(if ($prev) { $prev } elseif ($pick.note) { '(none in the same display state)' } else { '(none with the same spots)' }); no-Remix reference $(if ($ref) { $ref } else { '(none)' })"
     & $Py @gateArgs | Out-Host
     $code = $LASTEXITCODE
+    if ($pick.note) {
+        Write-Host "  gate: $($pick.note)" -ForegroundColor Yellow
+        $md = Join-Path $folder 'result.md'
+        if (Test-Path $md) { Add-Content $md "`r`n**Display state:** $($pick.note)" }
+    }
     # The FPS check against --previous is only like for like when both runs used the same builds: say so when not.
     $note = Get-BuildNote $folder $prev
     if ($note) {
@@ -313,13 +336,20 @@ function Get-MachineState {
 function Add-MachineState([string]$runDir, [string]$launch, [string]$spotDir, [bool]$monitorsOff = $false) {
     $m = Get-MachineState
     $m.monitorsOffAsked = $monitorsOff
-    $m | ConvertTo-Json | Set-Content (Join-Path $spotDir 'machine_before.json')
+    $mb = Join-Path $spotDir 'machine_before.json'
+    $m | ConvertTo-Json | Set-Content $mb
+    # Display state class (runtime\display_state.py; Nov 17: plug off ran about 12 % faster per frame than plug on),
+    # per launch here and for the whole run under manifest displayState; gate frame-time comparisons need it equal.
+    $cls = & $Py -I (Join-Path $Runtime 'display_state.py') launch $mb | ConvertFrom-Json
+    $m.displayState = $cls.class; $m.displayStateWhy = $cls.why
+    $m | ConvertTo-Json | Set-Content $mb
     $path = Join-Path $runDir 'manifest.json'
     $man = Get-Content $path -Raw | ConvertFrom-Json
     if (-not $man.PSObject.Properties['machineBefore']) { $man | Add-Member machineBefore ([pscustomobject]@{}) }
     $man.machineBefore | Add-Member $launch ([pscustomobject]$m) -Force
+    $man | Add-Member displayState (& $Py -I (Join-Path $Runtime 'display_state.py') run $runDir | ConvertFrom-Json) -Force
     $man | ConvertTo-Json -Depth 6 | Set-Content $path
-    Write-Step "$launch`: displays $($m.display) ($(@($m.displays | ForEach-Object { "$($_.name) $($_.refreshHz) Hz$(if ($_.primary) { ' primary' })" }) -join ', ')), $($m.monitorsOn) monitor(s) present, idle GPU power $($m.idleGpuPowerW) W$(if ($monitorsOff) { ', monitors off asked' })"
+    Write-Step "$launch`: display state $($m.displayState) ($($m.displayStateWhy)); displays $($m.display) ($(@($m.displays | ForEach-Object { "$($_.name) $($_.refreshHz) Hz$(if ($_.primary) { ' primary' })" }) -join ', ')), $($m.monitorsOn) monitor(s) present, idle GPU power $($m.idleGpuPowerW) W$(if ($monitorsOff) { ', monitors off asked' })"
     $why = Get-MonitorStateProblem $m $monitorsOff
     if ($why) { throw $why }
 }

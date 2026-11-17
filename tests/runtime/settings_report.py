@@ -17,6 +17,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import display_state  # noqa: E402
 import gate  # noqa: E402
 
 WINDOW = "bench_y0_p0"
@@ -87,7 +88,7 @@ def gpu_run(path: str) -> dict:
 
 
 def variant_row(folder: str) -> dict:
-    row: dict = {"variant": os.path.basename(folder)}
+    row: dict = {"variant": os.path.basename(folder), "displayState": display_state.launch_state(folder)["class"]}
     vpath = os.path.join(folder, "variant.json")
     if os.path.exists(vpath):
         v = gate.load_json(vpath)
@@ -123,12 +124,16 @@ def report(run: str) -> tuple[list[dict], str]:
     # them (worker C runs the base first and last) is the run-to-run noise a setting's change has to beat.
     bases = [r for r in rows if r["variant"].endswith("_base") or "_base_" in r["variant"]]
     base = next((r for r in bases if r.get("frameMs")), next((r for r in rows if r.get("frameMs")), None))
+    # Each variant is its own launch: a frame time is compared with the base only in the same known display state
+    # (display_state.py; Nov 17: plug off ran about 12 % faster per frame than plug on).
+    same = (lambda r: base is not None and r["displayState"] == base["displayState"] != display_state.UNKNOWN)
     for r in rows:
         if base and r.get("frameMs") and r is not base:
-            r["frameMsVsBase"] = round(r["frameMs"] - base["frameMs"], 2)
+            r["frameMsVsBase"] = round(r["frameMs"] - base["frameMs"], 2) if same(r) else "NOT COMPARABLE"
         if r.get("frameMs") and r.get("endFrameMs"):
             r["endVsStartMs"] = round(r["endFrameMs"] - r["frameMs"], 2)
     cols = [("variant", "variant"), ("change", "change"), ("rtxLoaded", "loaded"), ("proxyLoaded", "proxy keys"),
+            ("displayState", "display state"),
             ("frameMs", "frame ms"), ("frameMsP95", "p95 ms"), ("frameMsVsBase", "vs base"), ("fps", "FPS"),
             ("gpuTimeMs", "GPU ms"), ("rrMs", "RR ms"), ("endRrMs", "end RR ms"), ("rr", "RR created"),
             ("runGpuMHzMed", "GPU MHz"), ("runTempMax", "temp max"), ("runPowerWMed", "power W"), ("runThrottle", "clock events"),
@@ -141,11 +146,13 @@ def report(run: str) -> tuple[list[dict], str]:
              "Frame ms = median time between Presents in the proxy frame log over the bench window (every variant); "
              "GPU ms and the Remix memory columns come from Remix telemetry (empty when it is off). smi = nvidia-smi, "
              "whole GPU. 'loaded' = remix-dxvk.log lists each changed rtx key with the new value. 'end' columns = the "
-             "same pose measured again after one look round the room, at the end of the launch.", "",
+             "same pose measured again after one look round the room, at the end of the launch. 'vs base' and the "
+             "run-to-run noise use only variants in the base's display state (plug on / plug off, display_state.py); "
+             "any other reads NOT COMPARABLE.", "",
              "| " + " | ".join(c[1] for c in cols) + " |", "|" + "---|" * len(cols)]
     for r in rows:
         lines.append("| " + " | ".join("" if r.get(k) is None else str(r.get(k)) for k, _ in cols) + " |")
-    timed = [r for r in bases if r.get("frameMs")]
+    timed = [r for r in bases if r.get("frameMs") and same(r)]
     if len(timed) >= 2:
         ms = [r["frameMs"] for r in timed]
         noise = round(max(ms) - min(ms), 2)
