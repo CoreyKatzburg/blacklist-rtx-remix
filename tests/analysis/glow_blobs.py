@@ -7,7 +7,7 @@ the cause turns out to be.
 Inputs: two stills of the same pose, each a .gray file (320x180 u8 luma, one or more frames; their mean is used).
   --remix   the Remix still          --orig   the original game's still (a no-Remix run)
   --pose    optional: "x,y,z,yaw,pitch;x,y,z,yaw,pitch" for the two cameras (from proxy_frames.csv); the check
-            refuses to judge (NOT MEASURED, exit 2) when they differ by more than POSE_CM or POSE_DEG.
+            refuses to judge (NOT MEASURED, exit 2) when they differ by more than POSE_CM, POSE_DEG (yaw) or POSE_PITCH_DEG.
 
 Rule:
   1. Local contrast of each picture: the pixel minus the median of the 25x25 window around it (its background).
@@ -18,7 +18,14 @@ Rule:
   3. Remix lights the whole scene brighter than the original (picture means 118 against 47 at con_bright_hall), so
      the original is compared after matching brightness locally: gain = Remix background / original background at
      the blob, clamped to 1..GAIN_MAX. The original's bump is its highest contrast within MATCH_PX of the blob's peak
-     (MATCH_PX covers a 1.5 degree pose difference: 1.5 / 90 x 320 = 5.3 px).
+     (MATCH_PX covers a 1.5 degree yaw difference: 2.8 px per degree at the screen centre).
+  Pose tolerance, measured (worker B, Nov 16) by shifting the 142638 y225_p0 Remix still against the original's y225_p0
+  (0.3 degrees apart): the lost and dimmed counts hold up to 5 px sideways and 3 px up or down; at 6 px sideways the
+  lost count reports a glow that is there, at 8 px the dimmed count misses an erased lamp, and at 4 px vertical it
+  misses one of 5. At 2.8 px per degree that is 1.8 degrees of yaw and 1.1 of pitch, so POSE_DEG (yaw) is 1.5 and
+  POSE_PITCH_DEG 1.0. A camera that moved sideways shifts a lamp 2.5 m away by 5 px at 7.8 cm, so POSE_CM is 8.
+  Two original stills 3.2 degrees apart (reference-20261116-191120 lampsB against y225_p0) count 1 lost glow and
+  3 orbs that are not there.
   4. The original shows the blob when its bump reaches ORIG_STEPS (a distinct bright spot of its own), or when
      excess = Remix peak contrast - gain x original bump stays under BLOB_STEPS (Remix only brightened what the
      original has). Any other blob is counted. PASS when the count is at most ALLOWED, else FAIL.
@@ -87,7 +94,7 @@ W, H = 320, 180
 WIN = 25
 BLOB_STEPS, ORIG_STEPS, BLOB_MAX_PX, MATCH_PX, BORDER_PX, ALLOWED = 24.0, 12.0, 200, 6, 3, 0
 GAIN_MAX, RING_BRIGHT_MAX = 6.0, 0.2
-POSE_CM, POSE_DEG = 25.0, 1.5
+POSE_CM, POSE_DEG, POSE_PITCH_DEG = 8.0, 1.5, 1.0
 CELL, CELL_WIN, PUFF_STEPS = 4, 15, 24.0
 KEEP_FRAC, STRONG_STEPS, DROP_MIN = 0.75, 100.0, 12.0
 HUD_MIN_STILLS = 8
@@ -286,7 +293,7 @@ def pose_ok(spec):
     dist = float(np.linalg.norm(a[:3] - b[:3]))
     dyaw = abs((a[3] - b[3] + 180) % 360 - 180)
     dpitch = abs(a[4] - b[4])
-    return dist <= POSE_CM and dyaw <= POSE_DEG and dpitch <= POSE_DEG, dist, dyaw, dpitch
+    return dist <= POSE_CM and dyaw <= POSE_DEG and dpitch <= POSE_PITCH_DEG, dist, dyaw, dpitch
 
 
 def report(rows, skipped, out=print) -> bool:
@@ -444,6 +451,10 @@ def self_test() -> int:
     case("an orb in the 3 px border is skipped", _dot(base, 1, 90), orig, True, 0)
     ok, *_ = pose_ok("0,0,0,-90,0;0,0,0,-87,0")
     tally("a 3 degree pose difference is refused", not ok, "pose_ok says " + str(ok))
+    ok, *_ = pose_ok("0,0,0,-90,0;0,0,0,-90,1.2")
+    tally("a 1.2 degree pitch difference is refused", not ok, "pose_ok says " + str(ok))
+    ok, *_ = pose_ok("0,0,0,-90,0;0,10,0,-90,0")
+    tally("a camera 10 cm to the side is refused", not ok, "pose_ok says " + str(ok))
 
     # Puffs (rules 5 and 6).
     disc = lambda img, x, y, amp=50.0, r=12: img + amp / (1 + np.exp((np.hypot(XX - x, YY - y) - r) / 1.5))
@@ -569,6 +580,27 @@ def self_test() -> int:
         report_dimmed(rows, out=lines.append)
         tally("142638 balls off at y0_p0 dims no lamp the original shows (no close lamp in this view)",
               sum(r["dimmed"] for r in rows) == 0 and len(rows) > 0, lines[0])
+
+        # Pose tolerance (POSE_DEG, POSE_PITCH_DEG): inside it the erased lamp at x 214 y 57 is still caught, outside it
+        # the comparison breaks. Remix is shifted against the original y225_p0 of reference-20261116-191120.
+        ref3 = gate / "reference-20261116-191120" / "con_bright_hall"
+        o3, o3_pose = spot_still(ref3, "y225_p0")
+
+        def moved(dx, dy):
+            img = np.roll(rx_225, (dy, dx), (0, 1))
+            img[:, :dx], img[:dy] = rx_225[:, :1], rx_225[:1]
+            rows = dimmed_lamps(o3, img, erase(214 + dx, 57 + dy)(img), img, og_hud)[0]
+            return any(r["dimmed"] and abs(r["x"] - 214) <= 3 and abs(r["y"] - 57) <= 3 for r in rows)
+        tally("Remix 5 px sideways (1.8 deg yaw at the centre): the erased lamp at x 214 y 57 is still dimmed",
+              moved(5, 0), "")
+        tally("Remix 3 px down (1.1 deg pitch): still dimmed", moved(0, 3), "")
+        tally("outside the tolerance, Remix 8 px sideways (2.9 deg): the erased lamp is missed", not moved(8, 0), "")
+        b3, b3_pose = spot_still(ref3, "lampsB")
+        pok, dist, dyaw, dpitch = pose_ok((b3_pose, o3_pose))
+        false = sum(r["lost"] for r in lost_glows(b3, o3, og_hud)[0]) + sum(not r["matched"] for r in judge(b3, o3, og_hud)[0])
+        tally("two original stills 3.2 deg apart (191120 lampsB against y225_p0): refused, and compared anyway they "
+              "count glows and orbs that are not there", not pok and dyaw > 3 and false >= 1,
+              f"yaw {dyaw:.2f} deg, false counts {false}")
     except (OSError, SystemExit) as e:
         tally("real-picture cases", False, f"data missing ({e})")
     print("self-test:", "all passed" if not fails else f"FAILED {fails}")
