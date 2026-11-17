@@ -246,6 +246,7 @@ def tap(key: str) -> None:
         for k in order:
             i = _INPUT(type=1, u=_INPUT_UNION(ki=_KEYBDINPUT(0, SCAN[k], 0x8 | up | (1 if k in EXTENDED else 0), 0, None)))
             user32.SendInput(1, ctypes.byref(i), ctypes.sizeof(_INPUT))
+            display.note_send()
             time.sleep(0.12)
 
 
@@ -320,6 +321,7 @@ def mouse_move_rel(dx: int, dy: int) -> None:
         return
     i = _INPUT(type=0, u=_INPUT_UNION(mi=_MOUSEINPUT(int(dx), int(dy), 0, 0x0001, 0, None)))
     user32.SendInput(1, ctypes.byref(i), ctypes.sizeof(_INPUT))
+    display.note_send()
 
 
 def mouse_fire_burst(shots: int = 5, interval: float = 0.12) -> None:
@@ -329,6 +331,7 @@ def mouse_fire_burst(shots: int = 5, interval: float = 0.12) -> None:
         user32.SendInput(1, ctypes.byref(down), ctypes.sizeof(_INPUT))
         time.sleep(0.04)
         user32.SendInput(1, ctypes.byref(up), ctypes.sizeof(_INPUT))
+        display.note_send()
         time.sleep(interval)
 def start_capture(path: str, frames: int = 0, fps: int = 30, seconds: float = 0.0) -> subprocess.Popen:
     """Primary monitor, scaled to 320x180 gray, raw; stops after `frames` frames or `seconds` seconds.
@@ -599,6 +602,16 @@ class Spot:
                                f"moved him); the stops after this would not be at the spot")
         return round(d, 1)
 
+    def stop_position(self, w: dict) -> None:
+        """Worker A's pairing fields for a still or switch stop: samLanded, Sam's location [x, y, z] (the raster json's
+        "location"), and camera [x, y, z, yaw, pitch], the median render camera over the window's proxy frames
+        (publish slot 0), so the gate can tell whether a reference stop stood where its Remix stop did. Also in
+        drive.log."""
+        w["samLanded"] = [round(float(v), 1) for v in self.game.location(self.pawn)]
+        rows = proxy_rows(self.proxy.path, w["proxy"][0], w["proxy"][1]) if self.proxy.path else []
+        w["camera"] = median_camera(rows)
+        print(f"STOP POSITION {w['name']}: samLanded {w['samLanded']} camera {w['camera']}", flush=True)
+
     def counters(self) -> dict:
         return {"telemetry": self.telemetry.last_frame(), "proxy": self.proxy.last_frame()}
 
@@ -611,7 +624,8 @@ class Spot:
         self.hold(8.0)
         got = [float(v) for v in self.game.location(self.pawn)]
         side, drop = float(np.hypot(got[0] - want[0], got[1] - want[1])), want[2] - got[2]
-        info = {"asked": want, "landed": [round(v, 1) for v in got], "sideways": round(side, 1), "drop": round(drop, 1)}
+        info = {"asked": want, "landed": [round(v, 1) for v in got], "yaw": float(tp["yaw"]), "sideways": round(side, 1),
+                "drop": round(drop, 1)}
         if side > 150 or drop > 300:
             raise RuntimeError(f"teleport did not hold: {info}")
         self.base_yaw, self.base_pitch = float(tp["yaw"]), float(tp.get("pitch", 0.0))
@@ -641,6 +655,40 @@ class Spot:
             print("CHECKPOINT RESET", json.dumps(resets[-1]), flush=True)
             self.controller, self.pawn = self.wait_player(self.cp)
         raise RuntimeError(f"the game put Sam back on the checkpoint after all {tries} teleports: {resets}")
+
+    def land_within(self, tp: dict, rule: dict) -> dict:
+        """spot "landWithin" {"max", "tries", "remixLandings" {name: [x, y, z]}} (coordinator, Nov 16, from worker G's
+        fall test: the same asked teleport lands up to 8 units apart without Remix, and the six con_boiler Remix
+        landings spread 1.87 units among themselves). The spot's teleport is taken again until Sam's landing, read 8 s
+        after it, lies within max units sideways (x, y) of EVERY recorded Remix landing, not of one: a landing 2 units
+        from one of them can be nearly 4 from another, and worker A pairs each reference stop with one Remix launch.
+        Before a retry Sam goes back on the checkpoint position for spot["spawnHold"] s (5), as in the fall test.
+        Returns {max, remixLandings, tries [{try, landed, dist {name: units}, pass}], tryUsed, result LANDED or NOT
+        MEASURED, teleport (the kept teleport's info)}."""
+        targets = {k: [float(v) for v in p] for k, p in rule["remixLandings"].items()}
+        limit, tries = float(rule.get("max", 2.0)), int(rule.get("tries", 6))
+        rec: dict = {"max": limit, "remixLandings": targets, "tries": [], "tryUsed": None, "result": "NOT MEASURED"}
+        for n in range(1, tries + 1):
+            t: dict = {"try": n, "landed": None, "pass": False}
+            try:
+                if n > 1:
+                    self.game.set_location(self.pawn, [float(v) for v in self.cp["location"]])
+                    self.base_yaw, self.base_pitch = float(self.cp["yaw"]), float(self.cp["pitch"])
+                    self.hold(float(self.spot.get("spawnHold", 5.0)))
+                info = self.first_teleport(tp)
+                got = info["landed"]
+                far = {k: float(math.hypot(got[0] - p[0], got[1] - p[1])) for k, p in targets.items()}
+                t.update(landed=got, dist={k: round(d, 2) for k, d in far.items()},
+                         **{"pass": all(d <= limit for d in far.values())})
+            except (RuntimeError, blmem.MemoryError_) as e:
+                t["error"] = f"{type(e).__name__}: {e}"
+                self.controller, self.pawn = self.wait_player(self.cp)
+            rec["tries"].append(t)
+            print("LAND TRY", json.dumps(t), flush=True)
+            if t["pass"]:
+                rec.update(tryUsed=n, result="LANDED", teleport=info)
+                return rec
+        return rec
 
     def teleport_series(self, series: list[dict]) -> list[dict]:
         """Worker G, Nov 16 (con_boiler fall test, coordinator): the same teleports many times in one launch, to tell
@@ -1084,11 +1132,16 @@ class Spot:
                 if not self.pose_teleport(v, self.spot["teleport"]):
                     continue
             elif moved:
-                self.teleport(self.spot["teleport"]); moved = False
+                self.return_teleport(); moved = False
             self.move(f"to_{v['name']}", float(v["yaw"]), float(v["pitch"]), 0.5)
             self.stop(v["name"], frames=int(v.get("frames", 20)))
         if moved:
-            self.teleport(self.spot["teleport"])
+            self.return_teleport()
+
+    def return_teleport(self) -> None:
+        """Sam back to the spot's own teleport after poses elsewhere, as its own teleport window (worker A: every
+        teleport is recorded with asked, landed and yaw)."""
+        self.window("return_teleport", "teleport", lambda: None, teleport=self.teleport(self.spot["teleport"]))
 
     def pose_teleport(self, p: dict, default: dict) -> bool:
         """Teleports Sam for an extra pose p {"name", "teleport", "fallback"}: p["teleport"] (else `default`), then
@@ -1115,6 +1168,7 @@ class Spot:
         missed, offPose true so a check can refuse it."""
         rel = f"frames/{name}.gray"
         missed: list[dict] = []
+        readings: list = []   # every game-memory direction read in all tries (the stuck-view check below)
         for attempt in range(1, self.POSE_TRIES + 1):
             if attempt > 1:
                 self.move(f"to_{name}_retry{attempt}", self.yaw, self.pitch, 0.3)
@@ -1140,6 +1194,7 @@ class Spot:
             if snapped is not None:
                 w["poseWrites"] = snapped
             w["offPoseDeg"] = self.pose_error(w["gamePose"] + trace)
+            readings += w["gamePose"] + trace
             w["poseTraceFailedReads"] = failed[0] if failed else 0
             if not trace:   # no reading during the capture: the start and end alone cannot show it held still
                 w["poseTraceEmpty"] = True
@@ -1157,6 +1212,18 @@ class Spot:
         if off:
             w["offPose"] = True
             print(f"OFF POSE {name}: {w['offPoseDeg']} degrees from the asked view after {attempt} tries")
+        # Health run 210808 (Nov 16 21:13): from y90_p-30 on, every stop read yaw 45.1 pitch -29.91 at its start and
+        # end through all tries, and 8 minutes of stops that could not succeed followed. A stop that ends off the asked
+        # view with not one direction read differing in any try is frozen; the second frozen stop in a row ends the spot.
+        frozen = off and len(readings) > 2 * attempt and len({tuple(p) for p in readings}) == 1   # read during capture
+        w["viewFrozen"] = frozen
+        self.frozen_run = getattr(self, "frozen_run", []) + [name] if frozen else []
+        if len(self.frozen_run) >= 2:
+            self.view_stuck = {"stops": self.frozen_run, "pose": readings[0]}
+            print("VIEW DOES NOT RESPOND", json.dumps(self.view_stuck), flush=True)
+            raise RuntimeError(f"view does not respond: stops {', '.join(self.frozen_run)} read {readings[0]} "
+                               f"throughout every try; no more stills at this spot")
+        self.stop_position(w)
         w["samMoved"] = self.sam_moved(name)
         if not self.no_remix and name in self.spot.get("rasterStops", ["y0_p0"]):
             self.raster_rt_off(name)
@@ -1381,7 +1448,7 @@ class Spot:
                     self.switch_test()
             finally:
                 self.spot = base
-            self.teleport(base["teleport"])
+            self.return_teleport()
             self.hold(settle)
         # cfg["switches"] (worker B, Nov 16): switch steps at the same stop once the fade has settled
         # (switchesAfter more seconds), in the one variant launch that lists them.
@@ -1617,6 +1684,7 @@ class Spot:
                 if proof:
                     w["logProof"] = proof
                 w["gamePose"] = [self.rel_pose()]
+                self.stop_position(w)
                 w["samMoved"] = self.sam_moved(f"switch_{name}")
                 # v["rasterRtOff"] (worker E2, Nov 16): the game's own picture in this step (ray tracing off, checked
                 # off in telemetry, grabbed, back on) as gate\\switch_<name>_raster.pfm; two such grabs in one launch
@@ -2122,6 +2190,7 @@ def main() -> int:
         return 0
     spot, cp = gate.load_json(a.spot), gate.load_json(a.checkpoint)
     os.makedirs(a.out, exist_ok=True)
+    display.send_log = os.path.join(a.out, display.SENDS_PREFIX + "_drive.csv")   # display.csv's input column
     result = {"name": spot["name"], "mission": spot.get("mission"), "nearField": spot.get("nearField", 300),
               "error": None, "windows": []}
     s = None
@@ -2144,7 +2213,13 @@ def main() -> int:
         if gap > 150:
             raise RuntimeError(f"Sam spawned {gap:.0f} units from the recorded checkpoint position")
         s.home = list(loc)
-        if "teleport" in spot:
+        if spot.get("landWithin"):
+            result["landWithin"] = s.land_within(spot["teleport"], spot["landWithin"])
+            if result["landWithin"]["result"] != "LANDED":   # no stills from a landing the pairing would refuse
+                raise RuntimeError(f"NOT MEASURED: no landing within {result['landWithin']['max']} units of every "
+                                   f"Remix landing in {len(result['landWithin']['tries'])} tries")
+            result["teleport"] = result["landWithin"]["teleport"]
+        elif "teleport" in spot:
             result["teleport"] = s.first_teleport(spot["teleport"])
         hwnd = game_window(a.pid)
         if spot.get("quit"):   # one quit per launch: nothing else
@@ -2226,6 +2301,8 @@ def main() -> int:
             result["windows"] = s.windows
             result["relinks"] = s.relinks
             result["mouseCalibration"] = s.calibration
+            if getattr(s, "view_stuck", None):
+                result["viewDoesNotRespond"] = s.view_stuck
             result.update(s.finish())
         ctypes.windll.winmm.timeEndPeriod(1)
     gate.save_json(os.path.join(a.out, "spot.json"), result)

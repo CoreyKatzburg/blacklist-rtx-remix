@@ -11,6 +11,13 @@ sleep()        SC_MONITORPOWER 2 to every top-level window, then waits for state
 
 CLI (verify_runtime.ps1): display.py state | wake | sleep   prints one JSON line {display, idleSeconds, ...}
                           display.py watch --out <csv> [--interval 2]   appends time,display,idleSeconds until killed.
+
+Whose input (coordinator, Nov 16 21:3x: health run 210808's view stuck at 21:13 and display.csv could not say whether
+the gate or Corey had moved the mouse): every input the gate sends is noted with its tick in a gate_sends*.csv file in
+the launch folder (send_log, set by drive.py; verify_runtime.ps1 notes its own key taps the same way), and watch adds per
+sample the last-input tick, input = none (no input since the last sample), gate (the last input lies within SEND_MATCH_MS
+of a noted send) or outside (it does not), and the foreground window's process. An outside input followed within the
+same sample by a gate send reads as gate.
 """
 import ctypes
 import ctypes.wintypes as wt
@@ -75,6 +82,13 @@ user32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
 user32.DestroyWindow.argtypes = [wt.HWND]
 user32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
 user32.SendInput.argtypes = [wt.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+user32.GetForegroundWindow.restype = wt.HWND
+user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+kernel32.GetTickCount.restype = wt.DWORD   # unsigned: after 24.8 days of uptime a signed read goes negative
+kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+kernel32.OpenProcess.restype = wt.HANDLE
+kernel32.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
+kernel32.CloseHandle.argtypes = [wt.HANDLE]
 
 _seen: list = []
 
@@ -110,10 +124,69 @@ def state(timeout: float = 2.0) -> str | None:
     return STATES.get(_seen[-1], str(_seen[-1])) if _seen else None
 
 
-def idle_seconds() -> float:
+def last_input_tick() -> int:
     info = LASTINPUTINFO(cbSize=ctypes.sizeof(LASTINPUTINFO))
     user32.GetLastInputInfo(ctypes.byref(info))
-    return round(((kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000.0, 1)
+    return int(info.dwTime)
+
+
+def idle_seconds() -> float:
+    return round(((kernel32.GetTickCount() - last_input_tick()) & 0xFFFFFFFF) / 1000.0, 1)
+
+
+SENDS_PREFIX = "gate_sends"
+SEND_MATCH_MS = 300   # a gate send explains the last input when the two ticks are this close (tick steps are ~16 ms)
+send_log: str | None = None   # drive.py: <launch folder>\gate_sends_drive.csv
+_last_noted = [0]
+
+
+def note_send() -> None:
+    """Notes that the gate just sent input, at most every 100 ms (drive.py steers the mouse up to 120 times a second)."""
+    if not send_log:
+        return
+    now = int(kernel32.GetTickCount())
+    if (now - _last_noted[0]) & 0xFFFFFFFF < 100:
+        return
+    _last_noted[0] = now
+    with open(send_log, "a", newline="") as f:
+        f.write(f"{now}\r\n")
+
+
+def read_sends(folder: str) -> list[int]:
+    import glob
+    import os
+    ticks: list[int] = []
+    for p in glob.glob(os.path.join(folder, SENDS_PREFIX + "*.csv")):
+        with open(p, encoding="ascii", errors="replace") as f:
+            ticks += [int(t) for t in f.read().split() if t.isdigit()]
+    return ticks
+
+
+def input_source(prev_tick: int | None, tick: int, sends: list[int]) -> str:
+    """none, gate or outside for the input between two samples (see the module notes)."""
+    if prev_tick is None or tick == prev_tick:
+        return "none"
+    near = lambda s: min((tick - s) & 0xFFFFFFFF, (s - tick) & 0xFFFFFFFF) <= SEND_MATCH_MS
+    return "gate" if any(near(s) for s in sends) else "outside"
+
+
+def foreground_process() -> str:
+    """The image name of the process that owns the foreground window, "" when there is none or it cannot be read."""
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return ""
+    pid = wt.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    h = kernel32.OpenProcess(0x1000, False, pid.value)   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return f"pid {pid.value}"
+    try:
+        buf, n = ctypes.create_unicode_buffer(1024), wt.DWORD(1024)
+        if not kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+            return f"pid {pid.value}"
+        return buf.value.rsplit("\\", 1)[-1]
+    finally:
+        kernel32.CloseHandle(h)
 
 
 def _wait_for(want: str, seconds: float) -> tuple[str | None, float]:
@@ -134,6 +207,7 @@ def wake(seconds: float = 10.0) -> dict:
         i = INPUT(type=0, mi=MOUSEINPUT(dx, 0, 0, 0x0001, 0, 0))
         if user32.SendInput(1, ctypes.byref(i), ctypes.sizeof(INPUT)) != 1:
             raise OSError(ctypes.get_last_error(), "SendInput failed")
+    note_send()
     got, took = _wait_for("on", seconds)
     return {"asked": "awake", "before": before, "display": got, "seconds": took, "idleSeconds": idle_seconds()}
 
@@ -170,10 +244,15 @@ def main(argv: list[str]) -> int:
         import os
         if not os.path.exists(out):
             with open(out, "w", newline="") as f:
-                f.write("time,display,idleSeconds,displayRequired\r\n")
+                f.write("time,display,idleSeconds,displayRequired,lastInputTick,input,foreground\r\n")
+        folder, prev = os.path.dirname(os.path.abspath(out)), None
         while True:
+            tick = last_input_tick()
+            src = input_source(prev, tick, read_sends(folder))
+            prev = tick
             with open(out, "a", newline="") as f:
-                f.write(f"{time.strftime('%H:%M:%S')},{state()},{idle_seconds()},{int(display_required())}\r\n")
+                f.write(f"{time.strftime('%H:%M:%S')},{state()},{idle_seconds()},{int(display_required())},"
+                        f"{tick},{src},{foreground_process()}\r\n")
             time.sleep(interval)
     rec = wake() if cmd == "wake" else sleep() if cmd == "sleep" else {"display": state(), "idleSeconds": idle_seconds()}
     print(json.dumps(rec), flush=True)

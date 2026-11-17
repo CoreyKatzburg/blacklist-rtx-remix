@@ -58,6 +58,9 @@ $SaveDir = 'D:\Ubisoft\Ubisoft Game Launcher\savegames\d36412d1-6246-4703-adbf-8
 $InputIni = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Ubisoft\Blacklist\inputTranslations.ini'
 $GameLock = Join-Path (Split-Path $Tests) 'play-setup\AGENT_GAME_LOCK.txt'
 $ResultsRoot = 'D:\BlacklistOverhaul\experiments\remix-gate'
+# run_all_offline.ps1 writes its last run and last pass here; the manifest compares them with this launch's tree.
+$SuiteRecord = Join-Path $ResultsRoot 'offline_suite_last.json'
+$RemixSrc = Join-Path (Split-Path $Tests) 'src\dxvk-remix'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
 # gate.py compares a run with the previous run (FPS) and with the no-Remix reference (lag, brightness). Unless given,
@@ -201,9 +204,13 @@ public static class GateInput {
     uint a = GetWindowThreadProcessId(fg, IntPtr.Zero), me = GetCurrentThreadId();
     AttachThreadInput(me, a, true); ShowWindow(h, 9); SetForegroundWindow(h); AttachThreadInput(me, a, false);
     Thread.Sleep(200); return GetForegroundWindow() == h; }
+  // runtime\display.py watch reads the ticks noted here to tell these taps from outside input (display.csv input).
+  public static string SendLog;
   public static void Tap(ushort scan) {
     foreach (uint up in new uint[] { 0, 2 }) { var i = new INPUT(); i.type = 1; i.ki.scan = scan; i.ki.flags = 0x8u | up;
-      SendInput(1, new[] { i }, Marshal.SizeOf(typeof(INPUT))); Thread.Sleep(100); } }
+      SendInput(1, new[] { i }, Marshal.SizeOf(typeof(INPUT)));
+      if (SendLog != null) System.IO.File.AppendAllText(SendLog, ((uint)Environment.TickCount).ToString() + "\r\n");
+      Thread.Sleep(100); } }
 }
 "@
 
@@ -327,7 +334,9 @@ function Get-DisplayDuring([string]$csv) {
                 # hold, yet 158 of 183 samples had it set while the game ran, so this cannot prove whose hold it is.
                 displayRequiredSamples = @($rows | Where-Object displayRequired -eq '1').Count
                 firstNotAwake = $(if ($off) { "$($off[0].time) $($off[0].display)" } else { $null })
-                maxIdleSeconds = $(if ($rows) { ($rows | ForEach-Object { [double]$_.idleSeconds } | Measure-Object -Maximum).Maximum } else { $null }) }
+                maxIdleSeconds = $(if ($rows) { ($rows | ForEach-Object { [double]$_.idleSeconds } | Measure-Object -Maximum).Maximum } else { $null })
+                # display.py's input column: samples whose new input no gate send explains (null for an older csv)
+                outsideInput = $(if ($rows -and $rows[0].PSObject.Properties['input']) { @($rows | Where-Object input -eq 'outside' | ForEach-Object { "$($_.time) $($_.foreground)" }) } else { $null }) }
 }
 # True for a launch whose bench live steps put the displays to sleep on purpose (the awake / asleep proof): it must
 # not hold them awake.
@@ -573,13 +582,40 @@ $remixCommit = if (-not $stagedRec) { 'unknown: no play-setup\STAGED_REMIX.json'
                else { $stagedRec.commit }
 $build = [ordered]@{ remixCommit = $remixCommit; remixRuntimeSha256 = $runtimeHash; remixClientSha256 = $RemixClientHash
                      proxySha256 = Get-Hash (Join-Path $Setup 'd3d9.dll') }
-# offlineSuite (coordinator, Nov 16): which offline suite this launch relies on (-SuiteNote, for example "full suite last passed on
-# 08b9298, only the touched tests ran on <commit>"), and the tests commit with any modified tracked files.
-$suite = [ordered]@{ note = $SuiteNote; testsCommit = (git -C (Split-Path $Tests) rev-parse --short HEAD 2>$null)
-                     testsModified = @(git -C (Split-Path $Tests) status --porcelain --untracked-files=no 2>$null) }
+# The last full offline suite (run_all_offline.ps1 writes $SuiteRecord when it ends) against the tree this launch uses.
+# sameTree only when that run passed, the tools commit, dxvk-remix commit, proxy and staged runtime all match, and no
+# tracked file was modified then or now (coordinator, Nov 16: any difference means the suite runs).
+function Get-SuiteRecord([string]$path, $now) {
+    $rec = if (Test-Path -LiteralPath $path) { Get-Content -LiteralPath $path -Raw | ConvertFrom-Json } else { $null }
+    $pass = if ($rec) { $rec.lastPass } else { $null }
+    $diff = @()
+    if (-not $pass) { $diff += 'no recorded full-suite pass' }
+    else {
+        if ($rec.lastRun -and -not $rec.lastRun.passed) { $diff += "the last run, at $($rec.lastRun.finished), failed" }
+        foreach ($k in 'toolsCommit', 'remixCommit', 'proxySha256', 'runtimeSha256') {
+            if ("$($pass.$k)" -ne "$($now.$k)") { $diff += "$k $($pass.$k) then, $($now.$k) now" }
+        }
+        if (@($pass.toolsModified).Count) { $diff += "modified when it passed: $(@($pass.toolsModified).Trim() -join ', ')" }
+        if (@($now.toolsModified).Count) { $diff += "modified now: $(@($now.toolsModified).Trim() -join ', ')" }
+    }
+    $same = -not $diff
+    $line = if (-not $pass) { 'full suite: no recorded pass' }
+            else { "full suite last passed at $($pass.finished) on $($pass.toolsCommit); same tree now: " +
+                   $(if ($same) { 'yes' } else { "no ($($diff -join '; '))" }) }
+    [ordered]@{ lastPass = $pass; lastRun = $(if ($rec) { $rec.lastRun }); sameTree = $same; differences = $diff; line = $line }
+}
+# offlineSuite (coordinator, Nov 16): which offline suite this launch relies on (-SuiteNote for anything more, such as
+# "only the touched tests ran on <commit>"), the last recorded full-suite run, and the tests commit with modified files.
+$testsModified = @(git -C (Split-Path $Tests) status --porcelain --untracked-files=no 2>$null)
+$suiteRec = Get-SuiteRecord $SuiteRecord ([ordered]@{ toolsCommit = (git -C (Split-Path $Tests) rev-parse --short HEAD 2>$null)
+    remixCommit = (git -C $RemixSrc rev-parse --short HEAD 2>$null); proxySha256 = $build.proxySha256
+    runtimeSha256 = $runtimeHash; toolsModified = $testsModified })
+$suite = [ordered]@{ note = $SuiteNote; record = $suiteRec; testsCommit = (git -C (Split-Path $Tests) rev-parse --short HEAD 2>$null)
+                     testsModified = $testsModified }
 @{ spots = @($selected | ForEach-Object name); started = $Stamp; noRemix = [bool]$NoRemix; build = $build; offlineSuite = $suite
-   variants = @(if ($sweep) { $runs | ForEach-Object dir }) } | ConvertTo-Json | Set-Content (Join-Path $runDir 'manifest.json')
+   variants = @(if ($sweep) { $runs | ForEach-Object dir }) } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $runDir 'manifest.json')
 Write-Step "Builds: dxvk-remix $remixCommit, proxy $($build.proxySha256.Substring(0, 12))"
+Write-Step $suiteRec.line
 
 # The pid line tells the Play script this run is alive (it refuses Corey's launch) and that the Play script this run
 # starts is its own (it goes through); a lock whose process is gone counts as left by a crash.
@@ -698,6 +734,7 @@ try {
             $keepAwake = -not (Test-SleepsDisplays $spot)
             $disp = Start-Process $Py -WindowStyle Hidden -PassThru -ArgumentList (@('-I', ('"' + (Join-Path $Runtime 'display.py') + '"'),
                 'watch', '--out', ('"' + (Join-Path $spotDir 'display.csv') + '"')) + @(if ($keepAwake) { '--keep-awake' }))
+            [GateInput]::SendLog = Join-Path $spotDir 'gate_sends_verify.csv'   # the checkpoint-load taps are the gate's
             $game = Start-GameAtCheckpoint
             # Other programs holding the GPU (Windows reports their names; per-process memory reads N/A).
             & nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv 2>&1 | Set-Content (Join-Path $spotDir 'gpu_apps.csv')
@@ -765,7 +802,7 @@ try {
                 if (-not $man.PSObject.Properties['displayDuring']) { $man | Add-Member displayDuring ([pscustomobject]@{}) }
                 $man.displayDuring | Add-Member $run.dir ([pscustomobject]$d) -Force
                 $man | ConvertTo-Json -Depth 6 | Set-Content $path
-                Write-Step "$($run.dir): displays awake throughout: $($d.awakeThroughout) ($($d.samples) samples, $($d.notAwake) not awake$(if ($d.firstNotAwake) { ', first ' + $d.firstNotAwake }), longest without input $($d.maxIdleSeconds) s, display-required flag set by some program in $($d.displayRequiredSamples) samples$(if (-not $keepAwake) { ', not asked: this launch sleeps them on purpose' }))"
+                Write-Step "$($run.dir): displays awake throughout: $($d.awakeThroughout) ($($d.samples) samples, $($d.notAwake) not awake$(if ($d.firstNotAwake) { ', first ' + $d.firstNotAwake }), longest without input $($d.maxIdleSeconds) s, display-required flag set by some program in $($d.displayRequiredSamples) samples$(if (-not $keepAwake) { ', not asked: this launch sleeps them on purpose' })); outside input: $(if ($null -eq $d.outsideInput) { 'not recorded' } elseif ($d.outsideInput.Count) { "$($d.outsideInput.Count) samples, first $($d.outsideInput[0])" } else { 'none' })"
             } catch { Write-Step "$($run.dir): display log not read: $($_.Exception.Message)" } }
             $smi = $null; $mem = $null; $disp = $null
             if ($run.variant) {   # back to the baseline before the next variant (the game is closed by now)

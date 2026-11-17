@@ -157,6 +157,7 @@ class Steering(unittest.TestCase):
             s._try_raster = lambda name, how: {}
             s.dump = lambda tag: None
             s.sam_moved = lambda name: 0.0
+            s.stop_position = lambda w: None
             s.stop("y90_p-30")
             self.assertEqual(saved, list(range(1, len(s.windows) + 1)))   # spot.json rewritten after every window
             return s, moves
@@ -218,6 +219,7 @@ class Steering(unittest.TestCase):
             s._try_raster = lambda name, how: {}
             s.dump = lambda tag: None
             s.sam_moved = lambda name: 0.0
+            s.stop_position = lambda w: None
             s.reference_stills()
             return s, moves, caps
         s, moves, caps = run(True)
@@ -878,7 +880,7 @@ class Reference(unittest.TestCase):
                 poseA.append(([0, 30], 60, ["lampsA_on", "lampsA_off", "lampsA_on_again"]))
             self.assertEqual(order, poseA + [
                 ("at", -90), ("lampsB_teleport", False), ([225, 0], 60, ["lampsB_on", "lampsB_off", "lampsB_on_again"]),
-                ("at", -90), (None, None, ["on", "off", "on_again"])], blocked)
+                ("at", -90), ("return_teleport", None), (None, None, ["on", "off", "on_again"])], blocked)
 
     def test_switch_steps_take_their_own_debug_views_and_capture(self):
         # Worker B's see-through probe: every step grabs its debug views after its still, the view is 0 again before
@@ -902,6 +904,7 @@ class Reference(unittest.TestCase):
                 s.light_dump = lambda dest, draws=False: None
                 s.rel_pose = lambda: [0.0, 0.0]
                 s.sam_moved = lambda tag: False
+                s.stop_position = lambda w: None
                 s._try_raster = lambda tag, label: {}
                 s.usd_capture = lambda c: order.append(("usd", c["name"])) or {"name": c["name"]}
 
@@ -952,6 +955,7 @@ class Reference(unittest.TestCase):
             s.raster_rt_off = lambda tag: order.append(("raster", tag))
             s.rel_pose = lambda: [0.0, 0.0]
             s.sam_moved = lambda tag: False
+            s.stop_position = lambda w: None
             s.window = lambda name, kind, body, **k: (body(), {})[1]
             with mock.patch.object(drive, "set_ini", lambda *a: None):
                 s.switch_test()
@@ -1603,6 +1607,135 @@ class Reference(unittest.TestCase):
                 on([False] * 40)
             with self.assertRaisesRegex(RuntimeError, "not ray tracing"):   # one raster frame at the end
                 on([True] * 12 + [False])
+
+
+class StopsAndLandings(unittest.TestCase):
+    # The six con_boiler Remix landings for the asked teleport -12165, -2524, -592 and the 18 landings of no-Remix fall
+    # test reference-20261116-204925 (worker G's landwithin_fixtures.json), with whether each lies within 2.0 units
+    # sideways of all six.
+    REMIX = {"085935": [-12164.4, -2519.8, -676.5], "101111_03": [-12164.9, -2519.5, -676.5],
+             "130630_01": [-12164.9, -2518.0, -676.5], "130630_02": [-12163.9, -2518.7, -676.5],
+             "130630_03": [-12164.9, -2518.2, -676.5], "194054_01": [-12165.0, -2518.4, -676.5]}
+    FALLS = {1: ([-12164.0, -2518.4], True), 2: ([-12164.1, -2526.9], False), 3: ([-12164.7, -2525.1], False),
+             4: ([-12164.8, -2519.2], True), 5: ([-12163.9, -2518.6], True), 6: ([-12165.4, -2521.4], False),
+             7: ([-12165.4, -2519.4], True), 8: ([-12165.6, -2521.0], False), 9: ([-12166.4, -2520.3], False),
+             10: ([-12166.5, -2519.6], False), 11: ([-12163.8, -2518.2], True), 12: ([-12164.7, -2516.8], False),
+             13: ([-12165.4, -2522.0], False), 14: ([-12165.2, -2525.9], False), 15: ([-12164.5, -2524.6], False),
+             16: ([-12164.4, -2518.8], True), 17: ([-12163.6, -2517.7], False), 18: ([-12166.5, -2525.4], False)}
+    TP = {"location": [-12165.0, -2524.0, -592.0], "yaw": -154.0}
+
+    def land(self, order: list[int], tries: int = 6):
+        s = drive.Spot.__new__(drive.Spot)
+        s.cp, s.spot, s.pawn = {"location": [-6285.7, -2420.7, 1188.0], "yaw": 80.0, "pitch": -5.0}, {}, 2
+        placed, holds = [], []
+        s.game = mock.Mock(set_location=lambda pawn, loc: placed.append(loc))
+        s.hold = lambda t, until=None: holds.append(t)
+        seq = iter(order)
+        s.first_teleport = lambda tp: {"asked": tp["location"], "landed": self.FALLS[next(seq)][0] + [-676.5]}
+        with mock.patch("builtins.print"):
+            rec = s.land_within(self.TP, {"max": 2.0, "tries": tries, "remixLandings": self.REMIX})
+        return rec, placed, holds
+
+    def test_land_within_needs_every_remix_landing_and_retries_from_the_spawn(self):
+        for i, (_, ok) in self.FALLS.items():   # the fixtures' sort, one landing at a time
+            rec, _, _ = self.land([i], tries=1)
+            self.assertEqual(rec["result"] == "LANDED", ok, f"fall {i}: {rec['tries'][0]['dist']}")
+        # worker G's old2 group in its fall-test order: 13, 14 and 15 miss, 16 is the first to pass
+        rec, placed, holds = self.land([13, 14, 15, 16, 17, 18])
+        self.assertEqual((rec["result"], rec["tryUsed"], rec["teleport"]["landed"][:2]),
+                         ("LANDED", 4, [-12164.4, -2518.8]))
+        self.assertEqual([t["pass"] for t in rec["tries"]], [False, False, False, True])
+        self.assertEqual(placed, [[-6285.7, -2420.7, 1188.0]] * 3)   # back on the spawn before each retry only
+        self.assertEqual(holds, [5.0] * 3)
+        self.assertEqual(rec["tries"][1]["dist"]["194054_01"], 7.5)   # 14 lies 1.9 from the asked point, 7.5 from here
+        # 17 lies within 2.0 of four Remix landings but 2.25 from 085935: retried, not kept
+        rec, _, _ = self.land([17, 1])
+        self.assertEqual((rec["tryUsed"], rec["tries"][0]["dist"]["085935"]), (2, 2.25))
+        self.assertEqual(sum(d <= 2.0 for d in rec["tries"][0]["dist"].values()), 4)
+        rec, _, _ = self.land([2, 3, 14, 15, 18, 2])   # six misses: no landing, nothing kept
+        self.assertEqual((rec["result"], rec["tryUsed"], len(rec["tries"])), ("NOT MEASURED", None, 6))
+        self.assertNotIn("teleport", rec)
+
+    def frozen_spot(self, per_stop):
+        """per_stop: per stop, per try, the one direction the game reads before, during and after the capture."""
+        s = drive.Spot.__new__(drive.Spot)
+        s.yaw, s.pitch, s.no_remix, s.windows, s.spot = 90.0, -30.0, True, [], {}
+        s.counters = lambda: {"telemetry": 0, "proxy": 0}
+        poses = iter([p for stop in per_stop for t in stop for p in (t, t)])
+        traces = iter([([t, t], 0) for stop in per_stop for t in stop])
+        s.rel_pose = lambda: next(poses)
+        s.pose_trace = lambda body: (body(), next(traces))[1]
+        for k in ("move", "hold", "capture", "dump"):
+            setattr(s, k, lambda *a, **kw: None)
+        s.snap_pose, s.steady, s._try_raster, s.sam_moved = (lambda: 0), (lambda: 0.0), (lambda n, h: {}), (lambda n: 0.0)
+        s.stop_position = lambda w: w.update(samLanded=[1.0, 2.0, 3.0])
+        return s
+
+    def test_two_frozen_stops_in_a_row_end_the_spot(self):
+        # Health run 210808: from y90_p-30 on every stop read yaw 45.1, pitch -29.91 through every try
+        stuck, on = [45.1, -29.91], [90.0, -30.0]
+        s = self.frozen_spot([[stuck] * 3, [stuck] * 3])
+        with mock.patch("builtins.print"):
+            s.stop("y90_p-30")
+            self.assertTrue(s.windows[-1]["viewFrozen"])
+            with self.assertRaisesRegex(RuntimeError, "view does not respond: stops y90_p-30, y135_p-30"):
+                s.stop("y135_p-30")
+        self.assertEqual(s.view_stuck, {"stops": ["y90_p-30", "y135_p-30"], "pose": stuck})
+        # a view that turns late (second try of the second stop) is not stuck, and a later frozen stop starts over
+        s = self.frozen_spot([[stuck] * 3, [stuck, on], [stuck] * 3])
+        with mock.patch("builtins.print"):
+            for name in ("a", "b", "c"):
+                s.stop(name)
+        self.assertEqual([w["viewFrozen"] for w in s.windows if w["kind"] == "still"], [True, False, True])
+        self.assertEqual(s.windows[-1]["samLanded"], [1.0, 2.0, 3.0])
+        # off the asked view but moving within the stop: off-pose, not frozen
+        s = self.frozen_spot([[[80.0, -30.0], [70.0, -30.0], [60.0, -30.0]]] * 2)
+        with mock.patch("builtins.print"):
+            s.stop("a"); s.stop("b")
+        self.assertEqual([w.get("offPose") for w in s.windows if w["kind"] == "still"], [True, True])
+        # a camera held perfectly still on the asked view is a good stop, however many in a row
+        s = self.frozen_spot([[on], [on], [on]])
+        with mock.patch("builtins.print"):
+            s.stop("a"); s.stop("b"); s.stop("c")
+        self.assertEqual([w["viewFrozen"] for w in s.windows if w["kind"] == "still"], [False] * 3)
+
+    def test_stop_position_is_sam_and_the_median_camera_of_the_window(self):
+        import math, os, tempfile
+        y = math.radians(-154.0)
+        rows = [f"{k},{1000 + 5 * k}.0,5.0,0.5,100,8,G:0:0:" + (f"-12040:-2510:-620:{math.cos(y):.6f}:{math.sin(y):.6f}:0"
+                if 10 <= k <= 20 else "0:0:0:0:1:0") + ":0|G:9:1:1:1:1:1:0:0:0" for k in range(40)]
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "f.csv")
+            with open(p, "w") as fh:
+                fh.write("\n".join(rows) + "\n")
+            s = drive.Spot.__new__(drive.Spot)
+            s.pawn, s.game, s.proxy = 2, mock.Mock(location=lambda pawn: (-12164.44, -2518.81, -676.5)), mock.Mock(path=p)
+            w = {"name": "y0_p0", "proxy": [10, 20]}
+            with mock.patch("builtins.print"):
+                s.stop_position(w)
+        self.assertEqual(w["samLanded"], [-12164.4, -2518.8, -676.5])
+        self.assertEqual(w["camera"], [-12040.0, -2510.0, -620.0, -154.0, 0.0])
+
+    def test_input_without_a_gate_send_reads_as_outside(self):
+        import os, tempfile
+        display = drive.display
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(display, "send_log", os.path.join(tmp, "gate_sends_drive.csv")), \
+                 mock.patch.object(display, "_last_noted", [0]), \
+                 mock.patch.object(display.kernel32, "GetTickCount", side_effect=[50_000, 50_040, 50_200]):
+                for _ in range(3):
+                    display.note_send()   # the second is 40 ms after the first: not written
+            with open(os.path.join(tmp, "gate_sends_verify.csv"), "w") as f:
+                f.write("90000\r\n")
+            sends = display.read_sends(tmp)
+        self.assertEqual(sorted(sends), [50_000, 50_200, 90_000])
+        self.assertEqual(display.input_source(None, 50_100, sends), "none")      # first sample: nothing to compare
+        self.assertEqual(display.input_source(50_100, 50_100, sends), "none")    # no new input
+        self.assertEqual(display.input_source(40_000, 50_250, sends), "gate")    # 50 ms after a drive.py send
+        self.assertEqual(display.input_source(80_000, 90_016, sends), "gate")    # verify_runtime's checkpoint tap
+        self.assertEqual(display.input_source(60_000, 70_000, sends), "outside") # nothing the gate sent near it
+        self.assertEqual(display.input_source(50_250, 50_600, sends), "outside") # 400 ms after the last send
+        self.assertEqual(display.input_source(0xFFFFFF00, 40, [0xFFFFFFF0]), "gate")   # across the tick wrap
 
 
 if __name__ == "__main__":

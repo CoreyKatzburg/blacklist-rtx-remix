@@ -6,7 +6,7 @@ param([string]$Gate = (Join-Path (Split-Path $PSScriptRoot) 'verify_runtime.ps1'
 $ErrorActionPreference = 'Stop'
 $ast = [Management.Automation.Language.Parser]::ParseFile($Gate, [ref]$null, [ref]$null)
 foreach ($n in 'Remove-OwnPlayLock', 'Wait-RestartedGame', 'Get-DisplayProblem', 'Test-LaunchDead', 'Get-CSpaceProblem', 'Get-MemoryProblem',
-           'Get-DisplayAwakeProblem', 'Get-DisplayDuring', 'Test-SleepsDisplays', 'Invoke-UbiLogin') {
+           'Get-DisplayAwakeProblem', 'Get-DisplayDuring', 'Test-SleepsDisplays', 'Invoke-UbiLogin', 'Get-SuiteRecord') {
     $f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true) | Select-Object -First 1
     if (-not $f) { throw "missing $n" }
     . ([scriptblock]::Create($f.Extent.Text))
@@ -206,6 +206,45 @@ Check 'display watcher starts after the pre-launch wake' (WatchAfterWake $gateTe
 $i = $gateText.IndexOf('Add-MachineState $runDir $run.dir $spotDir')
 Check 'rule broken (watcher moved before the wake): the order check fails' `
     (-not (WatchAfterWake ($gateText.Substring(0, $i) + "'watch', '--out' " + $gateText.Substring($i).Replace("'watch', '--out'", "'w'"))))
+# The manifest's suite record (coordinator, Nov 16 23:19: the note must come from the recorded pass, not fixed text).
+$suiteFile = Join-Path $env:TEMP "suiterecord-$PID.json"
+function Rec([hashtable]$change = @{}) {
+    $n = [ordered]@{ finished = '2026-11-16 22:57:00'; passed = $true; checks = 35; failed = @(); toolsCommit = '13ef9b5'
+                     toolsModified = @(); remixCommit = '1d1cb86'; proxySha256 = 'FC8E'; runtimeSha256 = 'B72B' }
+    foreach ($k in $change.Keys) { $n[$k] = $change[$k] }; $n
+}
+$passRec = Rec
+function Write-SuiteFile($lastRun, $lastPass) { [ordered]@{ lastRun = $lastRun; lastPass = $lastPass } | ConvertTo-Json -Depth 4 | Set-Content $suiteFile }
+function Now([hashtable]$change = @{}) {
+    $n = [ordered]@{ toolsCommit = '13ef9b5'; remixCommit = '1d1cb86'; proxySha256 = 'FC8E'; runtimeSha256 = 'B72B'; toolsModified = @() }
+    foreach ($k in $change.Keys) { $n[$k] = $change[$k] }; $n
+}
+Write-SuiteFile $passRec $passRec
+$r = Get-SuiteRecord $suiteFile (Now)
+Check 'suite record: same tree reads yes with the recorded time and commit' ($r.sameTree -and $r.line -eq 'full suite last passed at 2026-11-16 22:57:00 on 13ef9b5; same tree now: yes')
+foreach ($c in @(@{ toolsCommit = '0f76bd9' }, @{ remixCommit = 'ee695ff' }, @{ proxySha256 = 'AAAA' }, @{ runtimeSha256 = 'CCCC' },
+                 @{ toolsModified = @(' M tests/runtime/gate.py') })) {
+    $r = Get-SuiteRecord $suiteFile (Now $c)
+    $k = @($c.Keys)[0]
+    Check "suite record: $k differs, same tree no" ((-not $r.sameTree) -and $r.line -like '*same tree now: no (*' -and ($r.differences -join ' ') -match $(if ($k -eq 'toolsModified') { 'modified now: M tests/runtime/gate.py' } else { $k }))
+}
+$dirty = Rec @{ toolsModified = @(' M tests/runtime/gate.py') }
+Write-SuiteFile $dirty $dirty
+Check 'suite record: a pass on a tree with a modified file is not the same tree' (-not (Get-SuiteRecord $suiteFile (Now)).sameTree)
+$failRun = Rec @{ passed = $false; finished = '2026-11-16 23:30:00' }
+Write-SuiteFile $failRun $passRec
+$r = Get-SuiteRecord $suiteFile (Now)
+Check 'suite record: a failed run after the pass is not the same tree' ((-not $r.sameTree) -and $r.line -like '*the last run, at 2026-11-16 23:30:00, failed*')
+Write-SuiteFile $failRun $null
+$r = Get-SuiteRecord $suiteFile (Now)
+Check 'suite record: never passed reads no recorded pass' ((-not $r.sameTree) -and $r.line -eq 'full suite: no recorded pass')
+Remove-Item $suiteFile
+$r = Get-SuiteRecord $suiteFile (Now)
+Check 'suite record: no file reads no recorded pass' ((-not $r.sameTree) -and $r.line -eq 'full suite: no recorded pass')
+$suiteText = Get-Content -Raw (Join-Path (Split-Path $Gate) 'run_all_offline.ps1')
+Check 'the suite writes the record the gate reads' ($suiteText.Contains("'experiments\remix-gate\offline_suite_last.json'") -and
+    $gateText.Contains("`$ResultsRoot = 'D:\BlacklistOverhaul\experiments\remix-gate'") -and $gateText.Contains("Join-Path `$ResultsRoot 'offline_suite_last.json'"))
+
 "failures $fail"
 exit [int]($fail -gt 0)
 
