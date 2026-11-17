@@ -26,7 +26,10 @@ median lies outside the plug-on range. Fake case (--fake-on-vs-on, also run by d
 reference against those of run 225845 with floor = the reference's own spread; no stage may CARRY. Second fake: the
 same with 2 ms added to every 225845 frame gap; gap must CARRY.
 
-Run: python -I monitor_stage_split.py [--json out.json]   |   python -I monitor_stage_split.py --self-test
+Run: python -I monitor_stage_split.py [--json out.json] [--on <spot folder>]... [--off <spot folder>]...
+     |   python -I monitor_stage_split.py --self-test
+--on adds a plug-on run (its both_on and both_on_again windows) to the two above, --off a plug-off run (its both_off
+windows) to the one above; every window of every run counts. The on-vs-on fakes stay 222500 against 225845.
 Exit 0 = report written and the on-vs-on fake shows no stage outside its floor; 1 = the fake failed; 2 = bad input.
 """
 import json
@@ -229,20 +232,47 @@ def recorded_config(folder):
     return {"presentMode": last_line(os.path.join(folder, "remix-dxvk.log"), "Present mode"), "refreshHz": hz}
 
 
-def main_report(json_out=None):
-    on_runs = [[window_medians(f, w) for w in windows(f, ON_STEPS)] for f in ON]
-    off = [window_medians(OFF, w) for w in windows(OFF, OFF_STEPS)]
+def run_args(args):
+    """(plug-on folders, plug-off folders, json path) from the command line: ON and OFF above, then each extra
+    --on <spot folder> (both_on, both_on_again windows) and --off <spot folder> (both_off windows), in order."""
+    on, off, json_out = list(ON), [OFF], None
+    it = iter(args)
+    for a in it:
+        value = next(it, None)
+        if a not in ("--on", "--off", "--json") or value is None:
+            raise ValueError(f"unknown or incomplete argument {a!r}")
+        if a == "--json":
+            json_out = value
+        else:
+            (on if a == "--on" else off).append(value)
+    return on, off, json_out
+
+
+def run_windows(folders, steps):
+    """Window medians per run folder: [[medians of each window of steps] per folder]."""
+    return [[window_medians(f, w) for w in windows(f, steps)] for f in folders]
+
+
+def pool(runs):
+    """Every window of every run, as {stage: median}; extra runs count like the fixed ones."""
+    return [{k: v[0] for k, v in w.items()} for ws in runs for w in ws]
+
+
+def main_report(json_out=None, on_folders=ON, off_folders=(OFF,)):
+    on_runs = run_windows(on_folders, ON_STEPS)
+    off_runs = run_windows(off_folders, OFF_STEPS)
+    off = [w for ws in off_runs for w in ws]
     flat = lambda ws: [{k: v[0] for k, v in w.items()} for w in ws]  # noqa: E731
-    on_all = flat(on_runs[0]) + flat(on_runs[1])
-    real = judge(on_all, flat(off))
+    on_all = pool(on_runs)
+    real = judge(on_all, pool(off_runs))
     fake = judge(flat(on_runs[0]), flat(on_runs[1]))
     shifted = [dict(w, **{"proxy gap": w["proxy gap"] + 2.0}) for w in flat(on_runs[1])]
     fake2 = judge(flat(on_runs[0]), shifted)
     main_keys = [k for k in real if not k.startswith(("gpu ", "cpu "))] + \
         [k for k in real if k.startswith(("gpu ", "cpu ")) and k.count("/") <= 1]
-    print(table(real, main_keys, "PLUG ON (4 windows) vs PLUG OFF (2 windows); floor = spread of the 4 on windows; "
-                                 "on-on = 225845 minus 222500", fake))
-    for f in ON + [OFF]:
+    print(table(real, main_keys, f"PLUG ON ({len(on_all)} windows) vs PLUG OFF ({len(off)} windows); floor = spread "
+                                 f"of the {len(on_all)} on windows; on-on = 225845 minus 222500", fake))
+    for f in list(on_folders) + list(off_folders):
         print(f"recorded config {os.path.basename(os.path.dirname(f))}: {recorded_config(f)}")
     carried = [k for k, r in real.items() if r["carries"]]
     print(f"\nstages that CARRY ({len(carried)} of {len(real)}):")
@@ -313,6 +343,19 @@ def self_test():
         case("hitches counted inside the window's QPC range only (1 per 86 ms)",
              round(m["proxy hitches per min"], 1), round(60000 / 86, 1))
         case("dwm GPU use inside the window's clock range (median of 10, 0, 10)", m["program gpu% dwm 3d"], 10)
+        # Extra run folders (--on, --off): an extra plug-on folder is counted in the plug-on windows.
+        on_f, off_f, js = run_args(["--on", d, "--json", "x.json", "--off", "o1", "--on", "e2"])
+        case("--on folders follow the fixed plug-on runs", on_f, ON + [d, "e2"])
+        case("--off folders follow the fixed plug-off run, --json still read", (off_f, js), ([OFF, "o1"], "x.json"))
+        case("no arguments: the fixed runs only", run_args([]), (ON, [OFF], None))
+        case("three plug-on runs give three plug-on windows", len(pool(run_windows([d, d, d], ON_STEPS))), 3)
+        case("an extra run's window is in the pool (proxy gap 42)",
+             [w["proxy gap"] for w in pool(run_windows([d], ON_STEPS))], [42])
+        try:
+            run_args(["--on"])
+            case("--on without a folder is refused", False, True)
+        except ValueError:
+            case("--on without a folder is refused", True, True)
         os.remove(os.path.join(d, "gpu_engines.csv"))
         case("no gpu_engines.csv: no program stage, not 0",
              any(k.startswith("program gpu%") for k in window_medians(d, w)), False)
@@ -325,7 +368,8 @@ if __name__ == "__main__":
     if args[:1] == ["--self-test"]:
         sys.exit(self_test())
     try:
-        sys.exit(main_report(args[1] if args[:1] == ["--json"] and len(args) > 1 else None))
+        on_folders, off_folders, json_path = run_args(args)
+        sys.exit(main_report(json_path, on_folders, off_folders))
     except (OSError, ValueError, KeyError) as e:
         print("bad input:", e)
         sys.exit(2)
