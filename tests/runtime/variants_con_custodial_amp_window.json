@@ -1,0 +1,15 @@
+{
+ "about": "Amp-window test (coordinator, Nov 17 after launch (i)): does the Amp app's window drawing cost the game frame time? Same spot, gate settings, bench and held y0_p0 as the plug-on confirm launch 20261117-105336 (same build: Remix ee695ff, proxy FC8ECC61641E). Five plug-on windows of 45 s in the order as is, minimized, as is, minimized, as is; the only change is ShowWindow minimize / restore of the Amp.exe main window (drive.py live step ampWindow), with a detached watchdog that restores it at a fixed deadline. Each window records and reads back the Amp window's state, rectangle and monitor. Score: python -I tests\\analysis\\amp_window_score.py <spot folder> (rules fixed in it before the launch: floor 0.626 ms; EFFECT, NO EFFECT, NOT SETTLED, VOID). Exit 0 a verdict, 3 VOID, 1 NOT MEASURED.",
+ "spot": "con_custodial",
+ "bench": {"settle": 5, "frames": 150},
+ "variants": [
+  {"name": "01_amp_window",
+   "bench": {"liveSteps": [{"monitorStep": "both_on", "ampWindow": "as_is"},
+                           {"monitorStep": "both_on", "ampWindow": "minimized"},
+                           {"monitorStep": "both_on", "ampWindow": "as_is"},
+                           {"monitorStep": "both_on", "ampWindow": "minimized"},
+                           {"monitorStep": "both_on", "ampWindow": "as_is"}],
+             "liveStepSeconds": 45, "secondMonitor": "ACI27A8", "monitors": ["HKC2731", "ACI27A8"],
+             "monitorWaitSeconds": 600, "monitorPollSeconds": 1.0}}
+ ]
+}
