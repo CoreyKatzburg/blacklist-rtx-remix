@@ -19,22 +19,37 @@ $py = 'D:\BlacklistOverhaul\tools\upscalers\py314\Scripts\python.exe'
 $vcvars = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat'
 $results = [System.Collections.Generic.List[object]]::new()
 $sw = [Diagnostics.Stopwatch]::StartNew()
+# Each step's console output (stdout and stderr) also goes to a file; a failed step keeps it there, a passing one deletes
+# it. Out-Host alone left nothing behind when test_installer.ps1 failed once and passed on the rerun (Nov 17 10:37).
+$logDir = Join-Path (Split-Path (Split-Path $remixDir)) ('experiments\remix-gate\offline_suite_logs\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 
 function Step($name, [scriptblock]$body) {
     Write-Host "== $name" -ForegroundColor Cyan
     $t = [Diagnostics.Stopwatch]::StartNew()
     $ok = $false; $note = ''
+    [void](New-Item -ItemType Directory -Force $logDir)
+    $script:stepLog = Join-Path $logDir (($name -replace '[^\w.-]+', '_') + '.log')
+    Set-Content -LiteralPath $script:stepLog -Value "== $name $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     try { $ok = [bool](& $body) } catch { $note = $_.Exception.Message }
     if (-not $ok -and -not $note) { $note = "exit $LASTEXITCODE" }
+    if ($ok) { Remove-Item -LiteralPath $script:stepLog } else {
+        Add-Content -LiteralPath $script:stepLog -Value "== FAIL: $note"
+        $note = "$note (output in $script:stepLog)"
+    }
     $results.Add([pscustomobject]@{ Check = $name; Result = $(if ($ok) { 'PASS' } else { 'FAIL' }); Seconds = [math]::Round($t.Elapsed.TotalSeconds, 1); Note = $note })
     Write-Host ("   {0} ({1:N1} s) {2}" -f $(if ($ok) { 'PASS' } else { 'FAIL' }), $t.Elapsed.TotalSeconds, $note) -ForegroundColor $(if ($ok) { 'Green' } else { 'Red' })
 }
-function Native { param([string]$exe, [string[]]$arguments) & $exe @arguments | Out-Host; $LASTEXITCODE -eq 0 }
+function Native {
+    param([string]$exe, [string[]]$arguments)
+    $ErrorActionPreference = 'Continue'   # Windows PowerShell 5.1 would turn a stderr line into a stopping error
+    & $exe @arguments 2>&1 | ForEach-Object { "$_"; Add-Content -LiteralPath $script:stepLog -Value "$_" } | Out-Host
+    $LASTEXITCODE -eq 0
+}
 
 Step 'C++ replay suite (build + run)' {
     $exePath = Join-Path $testsDir 'verify_proxy_tests.exe'
     $cmd = "call `"$vcvars`" x64 >nul && cl.exe /nologo /std:c++17 /O2 /MT /W4 /WX /EHsc `"$testsDir\verify_proxy_tests.cpp`" `"$unifiedDir\shader_traits.cpp`" `"$unifiedDir\camera_solver.cpp`" `"$unifiedDir\pass_graph.cpp`" /Fe:`"$exePath`" /Fo:`"$testsDir\\`" /link /NOLOGO"
-    & $env:ComSpec /d /s /c $cmd | Out-Host
+    & $env:ComSpec /d /s /c "$cmd 2>&1" | ForEach-Object { "$_"; Add-Content -LiteralPath $script:stepLog -Value "$_" } | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "compile failed (exit $LASTEXITCODE)" }
     Native $exePath @()
 }
