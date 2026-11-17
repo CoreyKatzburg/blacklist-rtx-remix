@@ -7,9 +7,14 @@ incomplete never passes. Frame numbers restart at every game launch, so each spo
 
 Checks (thresholds in THRESHOLDS):
   nan_pixels               non-finite pixels in Remix's final image dumps (<tag>_final.pfm), all sweep stops
-  scene_brightness         two-sided original-game brightness + near-white check vs <tag>_raster.pfm (central 84%
-                           ROI, clipped to [0, 1], on-pose <= 1 deg): per-stop [0.50x, 1.85x], spot median
-                           [0.60x, 1.50x], near-white delta <= +0.10, floor >= 0.03; NOT MEASURED without raster
+  scene_brightness         two-sided original-game brightness + near-white check vs the --reference (no Remix) run's
+                           <tag>_raster.pfm, only at stops reference_position accepts (central 84% ROI, clipped to
+                           [0, 1], on-pose <= 1 deg): per-stop [0.50x, 1.85x], spot median [0.60x, 1.50x],
+                           near-white delta <= +0.10, floor >= 0.03; NOT MEASURED without an accepted reference
+                           stop. This run's own <tag>_raster.pfm (the in-launch picture, ray tracing off) is NOT the
+                           original game (1.41-1.69x brighter at accepted stops, Nov 16): it is printed report only,
+                           "against the in-launch picture, not the original game", and is fit only for change
+                           detection between steps of one launch, never for a verdict.
   neon_fraction            worst dump's share of clipped, strongly coloured pixels: max channel >= 1.0 and
                            (max - min) / max >= 0.5 (white highlights are allowed, neon colours are not)
   skinned_min              fewest active character meshes in any frame where proxy skinnedSceneDraws > 0
@@ -2226,7 +2231,7 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
     b_thresh = (f"luma >= {THRESHOLDS['min_scene_luma']:g}, stop [{THRESHOLDS['min_raster_luma_ratio']:.2f}x, "
                 f"{THRESHOLDS['max_raster_luma_ratio']:.2f}x], median [{THRESHOLDS['min_spot_median_ratio']:.2f}x, "
                 f"{THRESHOLDS['max_spot_median_ratio']:.2f}x], near-white <= +{THRESHOLDS['max_near_white_delta']:.2f}")
-    b_src = "Remix <tag>_final.pfm + reference <tag>_raster.pfm"
+    b_src = "Remix <tag>_final.pfm + --reference (no Remix) <tag>_raster.pfm at stops reference_position accepts"
     if missing_final or not_rt_stops or n_final == 0 or not good:
         if not_rt_stops:
             detail = f"{len(not_rt_stops)} stop(s) unverified for RT ({'; '.join(not_rt_stops[:4])})"
@@ -2259,12 +2264,16 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
             stop_ok=_reference_stop_ok(good, ref_spots)
         )
         b_spots = [b_sum["spots"][s["name"]] for s in good if s["name"] in b_sum.get("spots", {})]
+        inl = [f"{s['name']} {b_sum['spots'][s['name']]['inlaunch_gamma_ratio_median']:.2f}x" for s in good
+               if b_sum.get("spots", {}).get(s["name"], {}).get("inlaunch_gamma_ratio_median") is not None]
+        inl_note = (f"; report only, against the in-launch picture, not the original game: median {', '.join(inl)}"
+                    if inl else "")
         if len(b_spots) < len(good) or any(sp["status"] == pfm_brightness.NOT_MEASURED for sp in b_spots):
             reasons = [f"{s['name']}: {', '.join(b_sum['spots'][s['name']]['reasons'] or ['not measured'])}"
                        if s["name"] in b_sum.get("spots", {}) else f"{s['name']}: no brightness data"
                        for s in good if s["name"] not in b_sum.get("spots", {})
                        or b_sum["spots"][s["name"]]["status"] == pfm_brightness.NOT_MEASURED]
-            run.add("scene_brightness", NOT_MEASURED, None, b_thresh, "; ".join(reasons[:6]), b_src)
+            run.add("scene_brightness", NOT_MEASURED, None, b_thresh, "; ".join(reasons[:6]) + inl_note, b_src)
         else:
             meds = [sp["raster_gamma_ratio_median"] for sp in b_spots if sp["raster_gamma_ratio_median"] is not None]
             nw_max = max((sp["near_white_delta_max"] for sp in b_spots if sp["near_white_delta_max"] is not None),
@@ -2273,8 +2282,9 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
                          for s in good if b_sum["spots"][s["name"]]["status"] == pfm_brightness.FAIL]
             val = round(float(meds[0]) if len(meds) == 1 else max(meds), 3) if meds else None
             b_detail = ("; ".join(failed_sp[:4]) if failed_sp
-                        else f"median {min(meds):.2f}x..{max(meds):.2f}x raster, max near-white delta {nw_max:+.3f}")
-            run.add("scene_brightness", FAIL if failed_sp else PASS, val, b_thresh, b_detail, b_src)
+                        else f"median {min(meds):.2f}x..{max(meds):.2f}x the original game's raster, "
+                             f"max near-white delta {nw_max:+.3f}")
+            run.add("scene_brightness", FAIL if failed_sp else PASS, val, b_thresh, b_detail + inl_note, b_src)
 
         if n_angled == 0:
             run.add("angled_sharpness", NOT_MEASURED, None, f">= {THRESHOLDS['min_angled_sharpness']:g}",
