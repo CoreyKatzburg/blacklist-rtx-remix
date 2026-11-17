@@ -243,11 +243,10 @@ def _window_pose_error_deg(tag: str, win: dict | None, raster_json_path: str | N
 
 def _find_raster_for_stop(spot_dir: str, spot_name: str, tag: str,
                           reference_dirs: list[str]) -> tuple[str | None, str | None, str | None]:
-    """Returns (raster_pfm_path, raster_json_path, ref_spot_dir) from local spot_dir or first matching reference_dir."""
-    local_pfm = os.path.join(spot_dir, "gate", f"{tag}_raster.pfm")
-    if os.path.exists(local_pfm):
-        local_json = os.path.join(spot_dir, "gate", f"{tag}_raster.json")
-        return local_pfm, (local_json if os.path.exists(local_json) else None), spot_dir
+    """Returns (raster_pfm_path, raster_json_path, ref_spot_dir) from the first no-Remix reference run that has the
+    stop. Never the run's own raster: a Remix launch's <tag>_raster.pfm is the in-launch picture with ray tracing off,
+    which is not the original game (Nov 16 measurement: 1.41-1.69x brighter than the no-Remix reference at the same
+    accepted stop, 4-12 extra glows). It is scored only as the report-only "vs_inlaunch" number."""
     for ref_root in reference_dirs:
         cand_spot = os.path.join(ref_root, spot_name)
         cand_pfm = os.path.join(cand_spot, "gate", f"{tag}_raster.pfm")
@@ -413,20 +412,26 @@ def summarize_gate_run(run_dir: str, reference_dirs: list[str] | str | None = No
                 **st,
             }
             if not is_switch:
+                own_rp = os.path.join(spot_dir, "gate", f"{tag}_raster.pfm")
+                if os.path.exists(own_rp):
+                    # Report only: the in-launch picture (ray tracing off) is not the original game. It is fit for
+                    # change detection between steps of one launch, never for a verdict against the original.
+                    own = compare_final_to_raster(f_img, gate.read_pfm(own_rp), mask_hud=True)
+                    entry["vs_inlaunch_gamma_ratio"] = own["gamma_mean_ratio"]
                 rp, rjson, ref_spot_dir = _find_raster_for_stop(spot_dir, spot_name, tag, refs)
                 if rp is not None and ref_spot_dir is not None:
                     if ref_spot_dir not in ref_wins_cache:
-                        ref_wins_cache[ref_spot_dir] = (
-                            run_wins if os.path.abspath(ref_spot_dir) == os.path.abspath(spot_dir)
-                            else _load_spot_windows(ref_spot_dir)
-                        )
+                        ref_wins_cache[ref_spot_dir] = _load_spot_windows(ref_spot_dir)
                     ref_pose_err = _window_pose_error_deg(tag, ref_wins_cache[ref_spot_dir].get(tag), rjson)
                     pose_errs = [e for e in (run_pose_err, ref_pose_err) if e is not None]
                     worst_pose_err = max(pose_errs) if pose_errs else None
                     on_pose = (worst_pose_err is None) or (worst_pose_err <= max_pose_error_deg)
-                    if stop_ok is not None and os.path.abspath(ref_spot_dir) != os.path.abspath(spot_dir):
+                    if stop_ok is None:
+                        placed, entry["position"] = False, f"{tag}: reference position rule not applied (no stop_ok)"
+                    else:
                         placed, entry["position"] = stop_ok(spot_dir, ref_spot_dir, tag)
-                        on_pose = on_pose and placed
+                    entry["placed"] = bool(placed)
+                    on_pose = on_pose and placed
                     r_img = gate.read_pfm(rp)
                     cmp = compare_final_to_raster(f_img, r_img, mask_hud=True)
                     entry["raster_path"] = rp
@@ -473,7 +478,8 @@ def summarize_gate_run(run_dir: str, reference_dirs: list[str] | str | None = No
             reasons.append("missing_reference")
         elif not on_pose_entries:
             spot_status = NOT_MEASURED
-            reasons.append("no_on_pose_stops")
+            refused = [s["position"] for s in with_raster if s.get("placed") is False]
+            reasons.append("no_on_pose_stops" + (" (" + "; ".join(refused[:3]) + ")" if refused else ""))
         elif not valid_entries:
             spot_status = NOT_MEASURED
             reasons.append("black_raster")
@@ -545,6 +551,11 @@ def summarize_gate_run(run_dir: str, reference_dirs: list[str] | str | None = No
             "raster_gamma_ratio_max": max(ratios) if ratios else None,
             "raster_linear_ratio_median": float(np.median(lin_ratios)) if lin_ratios else None,
             "near_white_delta_max": max(nw_deltas) if nw_deltas else None,
+            # Report only, never a verdict: against the in-launch picture (ray tracing off), not the original game.
+            "inlaunch_gamma_ratio_median": (
+                float(np.median(il)) if (il := [float(s["vs_inlaunch_gamma_ratio"]) for s in sweep
+                                                if s.get("vs_inlaunch_gamma_ratio") is not None]) else None
+            ),
             "too_dark_stops": too_dark_stops,
             "too_bright_stops": too_bright_stops,
             "too_white_stops": too_white_stops,
@@ -624,6 +635,12 @@ def run_self_test() -> None:
     # 4. End-to-end fake run checks: missing_reference -> NOT_MEASURED, plus too_dark_vs_raster,
     #    too_bright_vs_raster, too_white_vs_raster, black_raster -> NOT_MEASURED, nonfinite -> FAIL,
     #    and off-pose reference stop exclusion.
+    def placed_ok(spot_dir, ref_spot_dir, tag):
+        return True, f"{tag}: placed (fake)"
+
+    def placed_refused(spot_dir, ref_spot_dir, tag):
+        return False, f"{tag}: Sam 7.9, camera 65.1 apart (fake)"
+
     with tempfile.TemporaryDirectory() as tmp:
         ref_dir = _make_fake_run(
             os.path.join(tmp, "ref"),
@@ -648,7 +665,7 @@ def run_self_test() -> None:
         assert "missing_reference" in no_ref_res["spots"]["spot_a"]["reasons"], no_ref_res
 
         # With --reference: y0_p0 (1.04x) passes and off-pose y45_p0 is excluded!
-        ok_res = summarize_gate_run(good_run, reference_dirs=[ref_dir])
+        ok_res = summarize_gate_run(good_run, reference_dirs=[ref_dir], stop_ok=placed_ok)
         sp_ok = ok_res["spots"]["spot_a"]
         assert sp_ok["status"] == PASS, sp_ok
         assert sp_ok["on_pose_stops"] == ["y0_p0"] and sp_ok["off_pose_stops"] == ["y45_p0"], sp_ok
@@ -659,7 +676,7 @@ def run_self_test() -> None:
             "spot_a",
             finals={"y0_p0": np.full((64, 96, 3), 0.08, np.float32)},
         )
-        dark_res = summarize_gate_run(dark_run, reference_dirs=[ref_dir])
+        dark_res = summarize_gate_run(dark_run, reference_dirs=[ref_dir], stop_ok=placed_ok)
         assert dark_res["spots"]["spot_a"]["status"] == FAIL, dark_res
         assert any("too_dark_vs_raster" in r for r in dark_res["spots"]["spot_a"]["reasons"]), dark_res
 
@@ -669,7 +686,7 @@ def run_self_test() -> None:
             "spot_a",
             finals={"y0_p0": np.full((64, 96, 3), 0.50, np.float32)},
         )
-        bright_res = summarize_gate_run(bright_run, reference_dirs=[ref_dir])
+        bright_res = summarize_gate_run(bright_run, reference_dirs=[ref_dir], stop_ok=placed_ok)
         assert bright_res["spots"]["spot_a"]["status"] == FAIL, bright_res
         assert any("too_bright_vs_raster" in r for r in bright_res["spots"]["spot_a"]["reasons"]), bright_res
 
@@ -681,7 +698,7 @@ def run_self_test() -> None:
             "spot_a",
             finals={"y0_p0": white_slab},
         )
-        white_res = summarize_gate_run(white_run, reference_dirs=[ref_dir])
+        white_res = summarize_gate_run(white_run, reference_dirs=[ref_dir], stop_ok=placed_ok)
         assert white_res["spots"]["spot_a"]["status"] == FAIL, white_res
         assert any("too_white_vs_raster" in r for r in white_res["spots"]["spot_a"]["reasons"]), white_res
 
@@ -692,7 +709,7 @@ def run_self_test() -> None:
             finals={},
             rasters={"y0_p0": (black_raster, (0.0, 0.0))},
         )
-        black_res = summarize_gate_run(good_run, reference_dirs=[black_ref])
+        black_res = summarize_gate_run(good_run, reference_dirs=[black_ref], stop_ok=placed_ok)
         assert black_res["spots"]["spot_a"]["status"] == NOT_MEASURED, black_res
         assert "black_raster" in black_res["spots"]["spot_a"]["reasons"], black_res
 
@@ -702,9 +719,45 @@ def run_self_test() -> None:
             "spot_a",
             finals={"y0_p0": nan_final},
         )
-        nan_res = summarize_gate_run(nan_run, reference_dirs=[ref_dir])
+        nan_res = summarize_gate_run(nan_run, reference_dirs=[ref_dir], stop_ok=placed_ok)
         assert nan_res["spots"]["spot_a"]["status"] == FAIL, nan_res
         assert nan_res["spots"]["spot_a"]["nonfinite_pixels"] == 1, nan_res
+
+        # Fake case: the run's own (in-launch, ray tracing off) raster is never the reference. The final matches it
+        # (1.00x), so a scorer that falls back to it would PASS; without a reference run it must read NOT_MEASURED,
+        # and with one the verdict follows the reference (0.26 vs 0.10 = 2.6x -> FAIL), the in-launch 1.00x report only.
+        own_run = _make_fake_run(
+            os.path.join(tmp, "own_raster"), "spot_a",
+            finals={"y0_p0": np.full((64, 96, 3), 0.26, np.float32)},
+            rasters={"y0_p0": (np.full((64, 96, 3), 0.26, np.float32), (0.0, 0.0))},
+        )
+        own_res = summarize_gate_run(own_run, stop_ok=placed_ok)["spots"]["spot_a"]
+        assert own_res["status"] == NOT_MEASURED and "missing_reference" in own_res["reasons"], own_res
+        assert abs(own_res["inlaunch_gamma_ratio_median"] - 1.0) < 1e-6, own_res
+        dim_ref = _make_fake_run(os.path.join(tmp, "dim_ref"), "spot_a", finals={},
+                                 rasters={"y0_p0": (np.full((64, 96, 3), 0.10, np.float32), (0.0, 0.0))})
+        own_ref_res = summarize_gate_run(own_run, reference_dirs=[dim_ref], stop_ok=placed_ok)["spots"]["spot_a"]
+        assert own_ref_res["status"] == FAIL and own_ref_res["raster_gamma_ratio_median"] > 2.5, own_ref_res
+        assert abs(own_ref_res["inlaunch_gamma_ratio_median"] - 1.0) < 1e-6, own_ref_res
+
+        # Fake case: the reference dimmed 10% changes the verdict. 0.37 vs 0.25 = 1.48x (spot median limit 1.50)
+        # passes; the same final vs the reference at 0.225 = 1.64x fails.
+        near_run = _make_fake_run(os.path.join(tmp, "near_limit"), "spot_a",
+                                  finals={"y0_p0": np.full((64, 96, 3), 0.37, np.float32)})
+        near_res = summarize_gate_run(near_run, reference_dirs=[ref_dir], stop_ok=placed_ok)["spots"]["spot_a"]
+        assert near_res["status"] == PASS, near_res
+        ref90 = _make_fake_run(os.path.join(tmp, "ref_dimmed_10pct"), "spot_a", finals={},
+                               rasters={"y0_p0": (np.full((64, 96, 3), 0.25 * 0.9, np.float32), (0.1, 0.0))})
+        near90 = summarize_gate_run(near_run, reference_dirs=[ref90], stop_ok=placed_ok)["spots"]["spot_a"]
+        assert near90["status"] == FAIL and any("too_bright_vs_raster" in r for r in near90["reasons"]), near90
+
+        # Fake case: a reference from a rejected position is refused (NOT_MEASURED with the rule's distances), even
+        # though the same pictures would FAIL when placed; so is a reference scored without the position rule.
+        ref_far = summarize_gate_run(own_run, reference_dirs=[dim_ref], stop_ok=placed_refused)["spots"]["spot_a"]
+        assert ref_far["status"] == NOT_MEASURED, ref_far
+        assert any("no_on_pose_stops" in r and "65.1 apart" in r for r in ref_far["reasons"]), ref_far
+        no_rule = summarize_gate_run(own_run, reference_dirs=[dim_ref])["spots"]["spot_a"]
+        assert no_rule["status"] == NOT_MEASURED and "rule not applied" in "; ".join(no_rule["reasons"]), no_rule
 
         # Fake case: cinematic whiteout vs normal cinematic (using real column names brightness/nearWhite/inCutscene)
         cin_ref_dir = os.path.join(tmp, "cin_ref", "ben_interrogation", "cinematic")
@@ -748,8 +801,11 @@ def main() -> int:
         run_self_test()
         if not args.runs:
             return 0
+    ref_spots = {f"{i}:{k}": v for i, ref in enumerate(args.reference)
+                 for k, v in (gate.load_other_run(ref) or {}).items()}
     results = [
-        summarize_gate_run(r, reference_dirs=args.reference, max_pose_error_deg=args.max_pose_error_deg)
+        summarize_gate_run(r, reference_dirs=args.reference, max_pose_error_deg=args.max_pose_error_deg,
+                           stop_ok=gate._reference_stop_ok(gate.load_spots(gate.Run(r)), ref_spots))
         for r in args.runs
     ]
     for res in results:
@@ -761,7 +817,9 @@ def main() -> int:
                 f"nonfinite={info['nonfinite_pixels']} "
                 f"gamma_mean=[{info['sweep_gamma_mean_min']} .. {info['sweep_gamma_mean_median']} .. {info['sweep_gamma_mean_max']}] "
                 f"ratio=[{info['raster_gamma_ratio_min']} .. {info['raster_gamma_ratio_median']} .. {info['raster_gamma_ratio_max']}] "
-                f"max_nw_delta={info['near_white_delta_max']}"
+                f"max_nw_delta={info['near_white_delta_max']} "
+                f"(report only, against the in-launch picture, not the original game: "
+                f"median {info['inlaunch_gamma_ratio_median']})"
             )
             if info["off_pose_stops"]:
                 print(f"    excluded off-pose ({len(info['off_pose_stops'])}): {info['off_pose_stops']}")
