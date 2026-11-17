@@ -2,6 +2,7 @@
 
 #include "lightpub.h"
 #include "proxy_log.h"
+#include "stage_texture_dump.h"
 #include "texture_fill.h"
 
 #include <psapi.h>
@@ -153,6 +154,7 @@ bool g_captureDrawsPrevious = false;
 LONG g_captureDrawSequence = 0;
 std::vector<char> g_dumpBuffer;
 LONG g_dumpFrame = 0;
+std::vector<void*> g_stageDumpWritten;  // textures written by the stage texture dump this frame
 
 const char* CameraSourceName(const UploadInfo* upload) {
     if (upload && upload->pureCameraUpload) {
@@ -510,7 +512,8 @@ void CaptureDrawFull(IDirect3DDevice9* device,
         if (state.id == D3DRS_ALPHATESTENABLE) alphaTest = value;
         DumpAppend("\t%s=%lu", state.name, value);
     }
-    for (DWORD i = 0; i < 8; ++i) {
+    const bool stageDump = StageTextureDumpWants(psHash);
+    for (DWORD i = 0; i < DrawDumpStageCount(stageDump); ++i) {
         IDirect3DBaseTexture9* texture = nullptr;
         if (FAILED(device->GetTexture(i, &texture)) || !texture) continue;
         const D3DRESOURCETYPE type = texture->GetType();
@@ -523,6 +526,19 @@ void CaptureDrawFull(IDirect3DDevice9* device,
         proxy::FormatTextureFill(texture, fill, sizeof fill);
         DumpAppend("\tt%lu=%p,ty%u,%ux%u,f%u,u%lX,l%lu,srgb%lu%s", i, texture, static_cast<UINT>(type), d.Width, d.Height,
                    static_cast<UINT>(d.Format), d.Usage, texture->GetLevelCount(), srgb, fill);
+        if (stageDump && (g_stageDumpStages & (1u << i)) &&
+            std::find(g_stageDumpWritten.begin(), g_stageDumpWritten.end(), texture) == g_stageDumpWritten.end()) {
+            g_stageDumpWritten.push_back(texture);
+            wchar_t dir[MAX_PATH], file[MAX_PATH];
+            DumpFolder(L"framedump", dir, ARRAYSIZE(dir));
+            swprintf_s(file, L"%s\\f%ld_tex_%p.dds", dir, g_dumpFrame, static_cast<void*>(texture));
+            D3DSURFACE_DESC level = {};
+            const StageDumpResult result = WriteStageTexture(texture, file, &level);
+            WriteLog("StageTexDump: frame %ld seq %ld ps %08X stage %lu tex %p ty%u f%u %ux%u pool%u: %s -> f%ld_tex_%p.dds",
+                     g_dumpFrame, sequence, psHash, i, texture, static_cast<UINT>(type), static_cast<UINT>(level.Format),
+                     level.Width, level.Height, static_cast<UINT>(level.Pool), StageDumpResultName(result), g_dumpFrame,
+                     texture);
+        }
         texture->Release();
     }
     {
@@ -1142,6 +1158,7 @@ void BeginFrameDump(LONG presentCount) {
     g_dumpBuffer.clear();
     g_captureDrawSequence = 0;
     g_dumpFrame = presentCount;
+    g_stageDumpWritten.clear();
     SYSTEMTIME now;
     GetLocalTime(&now);
     DumpAppend("frame\tpresent=%ld\ttime=%02u:%02u:%02u.%03u\trton=%d\n", g_dumpFrame, now.wHour, now.wMinute,

@@ -24,6 +24,7 @@
 #include "proxy_diagnostics.h"
 #include "proxy_log.h"
 #include "proxy_types.h"
+#include "stage_texture_dump.h"
 #include "texture_fill.h"
 
 #pragma intrinsic(_ReturnAddress)
@@ -285,6 +286,20 @@ T Resolve(const char* name) {
     return reinterpret_cast<T>(ResolveName(name));
 }
 
+// [Proxy] DumpStageTexturesPs / DumpStageTexturesStages (stage_texture_dump.h). Off unless both are set.
+void ReadStageTextureDumpKeys(const wchar_t* iniPath, bool log) {
+    wchar_t psList[256] = {}, stageList[64] = {};
+    GetPrivateProfileStringW(L"Proxy", L"DumpStageTexturesPs", L"", psList, ARRAYSIZE(psList), iniPath);
+    GetPrivateProfileStringW(L"Proxy", L"DumpStageTexturesStages", L"", stageList, ARRAYSIZE(stageList), iniPath);
+    const uint32_t before = proxy::g_stageDumpStages;
+    const size_t psBefore = proxy::g_stageDumpPs.size();
+    proxy::SetStageTextureDump(psList, stageList);
+    if (log || before != proxy::g_stageDumpStages || psBefore != proxy::g_stageDumpPs.size()) {
+        WriteLog("Proxy keys: DumpStageTexturesPs %u ids, DumpStageTexturesStages mask %04X",
+                 static_cast<unsigned>(proxy::g_stageDumpPs.size()), proxy::g_stageDumpStages);
+    }
+}
+
 bool LoadRealD3D9(HINSTANCE proxyInstance) {
     const DWORD proxyLength = GetModuleFileNameW(proxyInstance, g_proxyPath, ARRAYSIZE(g_proxyPath));
     if (proxyLength == 0 || proxyLength >= ARRAYSIZE(g_proxyPath) || !proxy::GetExecutableDirectory()) {
@@ -344,6 +359,7 @@ bool LoadRealD3D9(HINSTANCE proxyInstance) {
     proxy::SetCaptureDrawsConfig(
         GetPrivateProfileIntW(L"Proxy", L"CaptureDraws", 0, iniPath) != 0,
         static_cast<int>(GetPrivateProfileIntW(L"Proxy", L"CaptureBurst", 0, iniPath)));
+    ReadStageTextureDumpKeys(iniPath, true);
 
     g_filterCfg.passFilter = GetPrivateProfileIntW(L"Proxy", L"PassFilter", 1, iniPath) != 0;
     g_filterCfg.forwardScene = GetPrivateProfileIntW(L"Proxy", L"ForwardScene", 1, iniPath) != 0;
@@ -582,6 +598,7 @@ void ReloadLiveIniSwitches() {
     proxy::SetCaptureDrawsConfig(
         GetPrivateProfileIntW(L"Proxy", L"CaptureDraws", 0, iniPath) != 0,
         static_cast<int>(GetPrivateProfileIntW(L"Proxy", L"CaptureBurst", 0, iniPath)));
+    ReadStageTextureDumpKeys(iniPath, false);
 
     const bool handoffBeforeEffects = GetPrivateProfileIntW(L"Proxy", L"HandoffBeforeEffects", 1, iniPath) != 0;
     if (handoffBeforeEffects != g_filterCfg.handoffBeforeEffects)
