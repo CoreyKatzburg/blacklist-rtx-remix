@@ -1,0 +1,12 @@
+{
+ "about": "Monitors-off launch (coordinator, Nov 16 23:50, Corey's rule 2a): the con_custodial monitor launch with both monitors already switched off at the plug, on the build of 20261116-222500 and 20261116-225845 (Remix ee695ff, proxy FC8ECC61641E, both monitors on). Same spot, gate settings, bench and held y0_p0; the live steps are two both_off windows of 45 s (monitorWaitSeconds 45: the state is already reached, so each holds 45 s unless a monitor comes back). bench monitorsOff makes verify_runtime refuse the launch if any monitor is present, instead of requiring the displays awake. Score: python -I tests\\\\analysis\\\\monitors_off_score.py <spot folder> (limits fixed in it before the launch). Exit 0 MATCH, 3 DIFFER, 1 NOT MEASURED.",
+ "spot": "con_custodial",
+ "bench": {"settle": 5, "frames": 150},
+ "variants": [
+  {"name": "01_monitors_off",
+   "bench": {"monitorsOff": true,
+             "liveSteps": [{"monitorStep": "both_off"}, {"monitorStep": "both_off"}],
+             "liveStepSeconds": 45, "secondMonitor": "ACI27A8", "monitors": ["HKC2731", "ACI27A8"],
+             "monitorWaitSeconds": 45, "monitorPollSeconds": 1.0}}
+ ]
+}

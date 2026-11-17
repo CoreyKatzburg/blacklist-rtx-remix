@@ -296,29 +296,43 @@ function Get-MachineState {
     $wake = try { & $Py -I (Join-Path $Runtime 'display.py') wake 2>$null | Select-Object -Last 1 | ConvertFrom-Json } catch { $null }
     Start-Sleep -Seconds 3   # the idle power below is read with the displays settled awake
     $on = @(Get-PnpDevice -Class Monitor -ErrorAction SilentlyContinue | Where-Object Present | ForEach-Object InstanceId)
+    # Nov 17 00:01: with both monitors off at the plug, Windows still drives a display named "ASUS MG278" as primary at
+    # 60 Hz while no monitor is Present, so the active layout (name, primary, size, refresh) is recorded too.
+    $displays = try { @(& $Py -I (Join-Path $Runtime 'monitors.py') layout 2>$null | Select-Object -Last 1 | ConvertFrom-Json) } catch { @() }
     $rows = @(foreach ($i in 1..5) {
         & nvidia-smi --query-gpu=power.draw,clocks.gr,clocks.mem,pstate,utilization.gpu,temperature.gpu,memory.used --format=csv,noheader,nounits 2>$null | Select-Object -First 1
         Start-Sleep -Milliseconds 400 })
     $w = @($rows | ForEach-Object { $v = 0.0; if ([double]::TryParse(($_ -split ',')[0].Trim(), [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$v)) { $v } } | Sort-Object)
     [ordered]@{ time = (Get-Date -Format 'HH:mm:ss'); display = $wake.display; displayWake = $wake
-                monitorsOn = $on.Count; monitors = $on
+                monitorsOn = $on.Count; monitors = $on; displays = $displays
                 idleGpuPowerW = $(if ($w.Count) { $w[[int][math]::Floor($w.Count / 2)] } else { $null })
                 gpuSamples = 'power.draw W, clocks.gr MHz, clocks.mem MHz, pstate, utilization.gpu %, temperature.gpu C, memory.used MiB'
                 gpu = $rows }
 }
 # Records Get-MachineState in <launch>\machine_before.json and under machineBefore.<launch> in the run's manifest.json.
-function Add-MachineState([string]$runDir, [string]$launch, [string]$spotDir) {
+function Add-MachineState([string]$runDir, [string]$launch, [string]$spotDir, [bool]$monitorsOff = $false) {
     $m = Get-MachineState
+    $m.monitorsOffAsked = $monitorsOff
     $m | ConvertTo-Json | Set-Content (Join-Path $spotDir 'machine_before.json')
     $path = Join-Path $runDir 'manifest.json'
     $man = Get-Content $path -Raw | ConvertFrom-Json
     if (-not $man.PSObject.Properties['machineBefore']) { $man | Add-Member machineBefore ([pscustomobject]@{}) }
     $man.machineBefore | Add-Member $launch ([pscustomobject]$m) -Force
     $man | ConvertTo-Json -Depth 6 | Set-Content $path
-    Write-Step "$launch`: displays $($m.display), $($m.monitorsOn) monitor(s) present, idle GPU power $($m.idleGpuPowerW) W"
-    $why = Get-DisplayAwakeProblem $m.displayWake
+    Write-Step "$launch`: displays $($m.display) ($(@($m.displays | ForEach-Object { "$($_.name) $($_.refreshHz) Hz$(if ($_.primary) { ' primary' })" }) -join ', ')), $($m.monitorsOn) monitor(s) present, idle GPU power $($m.idleGpuPowerW) W$(if ($monitorsOff) { ', monitors off asked' })"
+    $why = Get-MonitorStateProblem $m $monitorsOff
     if ($why) { throw $why }
 }
+# Before a launch: the displays awake (Get-DisplayAwakeProblem), or, for a launch with bench "monitorsOff": true
+# (coordinator, Nov 16 23:50: Corey's monitors are switched off at the plug overnight), every monitor switched off,
+# that is none listed Present, whatever the display state reads. One monitor on is neither state, so it refuses both.
+function Get-MonitorStateProblem($m, [bool]$monitorsOff) {
+    if (-not $monitorsOff) { return Get-DisplayAwakeProblem $m.displayWake }
+    if ($m.monitorsOn -eq 0) { return $null }
+    "This launch is asked with the monitors off (bench monitorsOff), but $($m.monitorsOn) monitor(s) are present ($($m.monitors -join ', ')). Switch them off at the plug, then run again."
+}
+# True for a launch asked with every monitor switched off (bench "monitorsOff": true).
+function Test-MonitorsOff($spot) { [bool]($spot.bench -and $spot.bench.PSObject.Properties['monitorsOff'] -and $spot.bench.monitorsOff) }
 # $wake: display.py wake's record, $null when it did not run.
 function Get-DisplayAwakeProblem($wake) {
     if ($wake -and $wake.display -eq 'on') { return $null }
@@ -725,7 +739,7 @@ try {
             if (Test-Path -LiteralPath $hitchList) { Move-Item -LiteralPath $hitchList (Join-Path $spotDir 'proxy_hitches_before_launch.txt') -Force }
             $cSpace = Get-LaunchProblem (Add-CDriveSample $runDir $run.dir 'before')
             if ($cSpace) { throw $cSpace }
-            Add-MachineState $runDir $run.dir $spotDir
+            Add-MachineState $runDir $run.dir $spotDir (Test-MonitorsOff $spot)
             # Display state and time since the last input every 2 s (coordinator, Nov 16: a launch whose displays fall
             # asleep halfway must be marked; manifest displayDuring.<launch>). The same process keeps the displays awake
             # for the launch (ES_DISPLAY_REQUIRED, dropped by Windows when it is killed below), except in a launch whose

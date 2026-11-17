@@ -6,7 +6,7 @@ param([string]$Gate = (Join-Path (Split-Path $PSScriptRoot) 'verify_runtime.ps1'
 $ErrorActionPreference = 'Stop'
 $ast = [Management.Automation.Language.Parser]::ParseFile($Gate, [ref]$null, [ref]$null)
 foreach ($n in 'Remove-OwnPlayLock', 'Wait-RestartedGame', 'Get-DisplayProblem', 'Test-LaunchDead', 'Get-CSpaceProblem', 'Get-MemoryProblem',
-           'Get-DisplayAwakeProblem', 'Get-DisplayDuring', 'Test-SleepsDisplays', 'Invoke-UbiLogin', 'Get-SuiteRecord') {
+           'Get-DisplayAwakeProblem', 'Get-DisplayDuring', 'Test-SleepsDisplays', 'Invoke-UbiLogin', 'Get-SuiteRecord', 'Get-MonitorStateProblem', 'Test-MonitorsOff') {
     $f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true) | Select-Object -First 1
     if (-not $f) { throw "missing $n" }
     . ([scriptblock]::Create($f.Extent.Text))
@@ -244,6 +244,22 @@ Check 'suite record: no file reads no recorded pass' ((-not $r.sameTree) -and $r
 $suiteText = Get-Content -Raw (Join-Path (Split-Path $Gate) 'run_all_offline.ps1')
 Check 'the suite writes the record the gate reads' ($suiteText.Contains("'experiments\remix-gate\offline_suite_last.json'") -and
     $gateText.Contains("`$ResultsRoot = 'D:\BlacklistOverhaul\experiments\remix-gate'") -and $gateText.Contains("Join-Path `$ResultsRoot 'offline_suite_last.json'"))
+
+# Monitors-off launches (coordinator, Nov 16 23:50): bench monitorsOff accepts any display state with no monitor
+# present and refuses one present; without it the displays must read on, as before.
+$offWake = [pscustomobject]@{ display = 'off' }; $onWake = [pscustomobject]@{ display = 'on' }
+$none = @{ monitorsOn = 0; monitors = @(); displayWake = $offWake }
+$one = @{ monitorsOn = 1; monitors = @('DISPLAY\HKC2731\x'); displayWake = $onWake }
+$both = @{ monitorsOn = 2; monitors = @('DISPLAY\HKC2731\x', 'DISPLAY\ACI27A8\y'); displayWake = $onWake }
+Check 'monitors off asked, none present, display off: launches' ($null -eq (Get-MonitorStateProblem $none $true))
+Check 'monitors off asked, one present: refused' ((Get-MonitorStateProblem $one $true) -like '*1 monitor(s) are present*')
+Check 'monitors off asked, both present and awake: refused' ((Get-MonitorStateProblem $both $true) -like '*2 monitor(s) are present*')
+Check 'normal launch, none present, display off: refused as before' ((Get-MonitorStateProblem $none $false) -like '*did not wake*')
+Check 'normal launch, both present and awake: launches' ($null -eq (Get-MonitorStateProblem $both $false))
+Check 'bench monitorsOff true reads as asked' (Test-MonitorsOff ([pscustomobject]@{ bench = [pscustomobject]@{ monitorsOff = $true } }))
+Check 'no monitorsOff key reads as not asked' (-not (Test-MonitorsOff ([pscustomobject]@{ bench = [pscustomobject]@{ liveSteps = @() } })))
+Check 'monitorsOff false reads as not asked' (-not (Test-MonitorsOff ([pscustomobject]@{ bench = [pscustomobject]@{ monitorsOff = $false } })))
+Check 'Add-MachineState passes the spot''s monitorsOff on' ($gateText.Contains('Add-MachineState $runDir $run.dir $spotDir (Test-MonitorsOff $spot)'))
 
 "failures $fail"
 exit [int]($fail -gt 0)
