@@ -15,6 +15,8 @@ Bytes "$pkg\.trex\nvngx_dlss.dll" 'dlss old'
 Bytes "$pkg\.trex\usd\plugInfo.json" '{}'
 # the game folder before: a stale runtime file, a deliberate DLSS upgrade (the old one kept as .original), a log
 Bytes "$game\src\SYSTEM\.trex\d3d9.dll" 'runtime v0'
+# same size and same write time as pkg's: the installed copy then has the old file's hash-cache key (path, size, time)
+(Get-Item "$game\src\SYSTEM\.trex\d3d9.dll").LastWriteTimeUtc = (Get-Item "$pkg\.trex\d3d9.dll").LastWriteTimeUtc
 Bytes "$game\src\SYSTEM\.trex\nvngx_dlss.dll" 'dlss NEW'
 Bytes "$game\src\SYSTEM\.trex\nvngx_dlss.dll.original" 'dlss old'
 Bytes "$game\src\SYSTEM\.trex\keep.dmp" 'crash dump'

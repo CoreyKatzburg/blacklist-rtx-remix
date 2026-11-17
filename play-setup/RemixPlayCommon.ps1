@@ -257,6 +257,7 @@ function Install-PlaySetup {
     Install-Runtime
     Install-ModLinks
     Write-Step "Backed up the replaced files to $backup"
+    $HashCache.Clear()   # Copy-Item keeps the source's time, so a same-size copy can carry the replaced file's cache key
     @(Get-PlayMismatches)
 }
 
@@ -277,6 +278,7 @@ function Uninstall-PlaySetup {
     }
     foreach ($path in $Configs.Keys) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path } }
     Remove-ModLinks
+    $HashCache.Clear()   # same reason as in Install-PlaySetup: the .off copies may reuse a replaced file's cache key
     $backup
 }
 
