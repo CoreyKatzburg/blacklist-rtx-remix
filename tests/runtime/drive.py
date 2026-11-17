@@ -556,6 +556,55 @@ class Spot:
         self.home = got
         return info
 
+    def first_teleport(self, tp: dict, watch: float = 15.0, tries: int = 3) -> dict:
+        """The spot's own teleport right after the checkpoint load. No-Remix reference, Nov 16 17:57: at con_green_hall,
+        con_mall and con_bright_hall the game put Sam back exactly on the checkpoint position, or replaced the player
+        objects, within seconds of the teleport, so each spot failed before its first stop. After teleport()'s own
+        8 s check Sam is watched `watch` s more; a reset (player objects gone or replaced, or Sam back within 150 units
+        of the checkpoint position) waits for the level again and teleports again, up to `tries` teleports. The resets
+        are returned in info["resets"]."""
+        resets: list = []
+        for attempt in range(1, tries + 1):
+            try:
+                info, why = self.teleport(tp), None
+            except (RuntimeError, blmem.MemoryError_) as e:
+                if not self._back_at_checkpoint():
+                    raise
+                info, why = None, f"{type(e).__name__}: {e}"
+            why = why or self._watch_spot(tp, watch)
+            if why is None:
+                info["resets"] = resets
+                return info
+            resets.append({"attempt": attempt, "at": time.strftime("%H:%M:%S"), "why": why})
+            print("CHECKPOINT RESET", json.dumps(resets[-1]), flush=True)
+            self.controller, self.pawn = self.wait_player(self.cp)
+        raise RuntimeError(f"the game put Sam back on the checkpoint after all {tries} teleports: {resets}")
+
+    def _back_at_checkpoint(self) -> bool:
+        """True when the player objects cannot be read (a reload) or Sam stands within 150 units of the checkpoint."""
+        try:
+            loc = self.game.location(self.game.player()[1])
+        except blmem.MemoryError_:
+            return True
+        return float(np.hypot(loc[0] - self.cp["location"][0], loc[1] - self.cp["location"][1])) <= 150
+
+    def _watch_spot(self, tp: dict, seconds: float) -> str | None:
+        """None when the same player objects keep Sam within 150 units of tp for `seconds`, else what happened."""
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            try:
+                pair = tuple(self.game.player())
+                loc = self.game.location(pair[1])
+            except blmem.MemoryError_ as e:
+                return f"player objects unreadable (reload?): {e}"
+            if pair != (self.controller, self.pawn):
+                return f"player objects replaced: {[hex(v) for v in pair]}"
+            d = float(np.hypot(loc[0] - tp["location"][0], loc[1] - tp["location"][1]))
+            if d > 150:
+                return f"Sam at {[round(v, 1) for v in loc]}, {d:.0f} units from the teleport"
+            time.sleep(0.5)
+        return None
+
     def wait_player(self, cp: dict, timeout: float = 90.0, steady: int = 3) -> tuple[int, int]:
         """(controller, pawn) once `steady` reads one second apart find the same pair, in the checkpoint's map,
         with Sam within 150 units of the checkpoint position. Without Remix the gate starts drive.py as soon as a
@@ -1767,7 +1816,7 @@ def main() -> int:
             raise RuntimeError(f"Sam spawned {gap:.0f} units from the recorded checkpoint position")
         s.home = list(loc)
         if "teleport" in spot:
-            result["teleport"] = s.teleport(spot["teleport"])
+            result["teleport"] = s.first_teleport(spot["teleport"])
         hwnd = game_window(a.pid)
         if spot.get("quit"):   # one quit per launch: nothing else
             if not a.no_remix:

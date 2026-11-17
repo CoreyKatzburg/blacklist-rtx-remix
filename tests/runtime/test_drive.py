@@ -295,6 +295,54 @@ class Steering(unittest.TestCase):
         self.assertEqual((s.controller, s.pawn), (3, 4))
         self.assertEqual([(r["afterWindow"], r["old"], r["new"]) for r in s.relinks], [(1, ["0x1", "0x2"], ["0x3", "0x4"])])
 
+    def test_first_teleport_teleports_again_after_a_checkpoint_reset(self):
+        # No-Remix reference, Nov 16 17:57: con_bright_hall's teleport "landed" exactly on the checkpoint position, and
+        # at con_green_hall and con_mall the player objects vanished a few seconds after the teleport.
+        cp, want = {"map": "m", "location": [0.0, 0.0, 0.0]}, [5000.0, 0.0, 0.0]
+
+        def spot(script):
+            """script: per set_location call, 'hold' (Sam stays), 'land_reset' (the game puts him back on the
+            checkpoint with new objects before the 8 s check) or 'watch_reset' (lands, then reset on the first watch
+            read), 'elsewhere' (lands 3000 units off, no reset)."""
+            st = {"loc": (0.0, 0.0, 0.0), "pair": (1, 2), "calls": 0, "pending": None}
+            s = drive.Spot.__new__(drive.Spot)
+            s.cp, s.controller, s.pawn, s.hold = cp, 1, 2, lambda t: None
+
+            def set_location(pawn, loc):
+                kind = script[st["calls"]]
+                st["calls"] += 1
+                if kind == "land_reset":
+                    st["pair"] = (st["pair"][0] + 2, st["pair"][1] + 2)
+                elif kind == "elsewhere":
+                    st["loc"] = (loc[0] - 3000.0, loc[1], loc[2])
+                else:
+                    st["loc"] = tuple(loc)
+                    st["pending"] = "reset" if kind == "watch_reset" else None
+
+            def player():
+                if st["pending"] == "reset":
+                    st["pending"], st["loc"] = None, (0.0, 0.0, 0.0)
+                    st["pair"] = (st["pair"][0] + 2, st["pair"][1] + 2)
+                return st["pair"]
+            s.game = mock.Mock(set_location=set_location, location=lambda p: st["loc"], player=player)
+            s.wait_player = lambda c: st["pair"]
+            return s, st
+
+        with mock.patch.object(drive.time, "sleep"):
+            for script, resets in ((["land_reset", "hold"], 1), (["watch_reset", "hold"], 1),
+                                   (["land_reset", "watch_reset", "hold"], 2), (["hold"], 0)):
+                s, st = spot(script)
+                info = s.first_teleport({"location": want, "yaw": 90}, watch=0.05)
+                self.assertEqual((len(info["resets"]), st["calls"], info["landed"]), (resets, len(script), want), script)
+                self.assertEqual((s.controller, s.pawn), st["pair"], script)
+                self.assertEqual(s.home, want)
+            s, _ = spot(["land_reset"] * 3)
+            with self.assertRaisesRegex(RuntimeError, "after all 3 teleports"):
+                s.first_teleport({"location": want, "yaw": 90}, watch=0.05)
+            s, _ = spot(["elsewhere"])   # a landing that is not a reset still fails as before
+            with self.assertRaisesRegex(RuntimeError, "teleport did not hold"):
+                s.first_teleport({"location": want, "yaw": 90}, watch=0.05)
+
     def test_move_lands_on_the_stop_without_swinging_past_it(self):
         s = self.run_with(22, 7.0, -9.0, 7.0, -9.0)
         start = len(self.game.history)
