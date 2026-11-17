@@ -290,6 +290,55 @@ def main_report(json_out=None, on_folders=ON, off_folders=(OFF,)):
     return 0 if ok else 1
 
 
+def repeat_compare(ref_runs, test_runs, plug_off=None):
+    """Same display state, two launches: ref_runs (last night's plug-on runs) against test_runs (a repeat). Floor =
+    spread of the ref windows, same rule as judge(). Stages the test run has but the ref runs lack (program gpu%) are
+    returned separately as test-only medians. plug_off: the plug-on vs plug-off judge() result, to mark the stages
+    that carried that difference too."""
+    ref, test = pool(ref_runs), pool(test_runs)
+    res = judge(ref, test)
+    only = sorted(set.intersection(*(set(k for k, v in w.items() if v is not None) for w in test)) - set(res))
+    for k, r in res.items():
+        r["carriedPlugOff"] = bool(plug_off and plug_off.get(k, {}).get("carries"))
+    return res, {k: [w[k] for w in test] for k in only}
+
+
+def repeat_report(folder, json_out=None):
+    ref_runs = run_windows(ON, ON_STEPS)
+    plug_off = judge(pool(ref_runs), pool(run_windows([OFF], OFF_STEPS)))
+    res, only = repeat_compare(ref_runs, run_windows([folder], ON_STEPS), plug_off)
+    keys = [k for k in res if not k.startswith(("gpu ", "cpu "))] + \
+        [k for k in res if k.startswith(("gpu ", "cpu ")) and k.count("/") <= 1]
+    print(f"{'stage':58} {'night':>9} {'repeat':>9} {'diff':>8} {'floor':>7}  verdict          plug-off")
+    for k in keys:
+        r = res[k]
+        print(f"{k[:58]:58} {r['on']:9.3f} {r['off']:9.3f} {r['diff']:8.3f} {r['floor']:7.3f}  "
+              f"{'CARRIES     ' if r['carries'] else 'inside floor'}     {'carried' if r['carriedPlugOff'] else '-'}")
+    carried = [k for k, r in res.items() if r["carries"]]
+    print(f"\nstages that CARRY the repeat difference ({len(carried)} of {len(res)}):")
+    for k in carried:
+        r = res[k]
+        print(f"  {k}: night {r['on']} repeat {r['off']} diff {r['diff']} floor {r['floor']} windows {r['offWindows']}"
+              f"{' (carried plug-off too)' if r['carriedPlugOff'] else ''}")
+    po = [k for k, r in plug_off.items() if r["carries"]]
+    print(f"\nplug-off carriers that do NOT carry the repeat: {[k for k in po if k in res and not res[k]['carries']]}")
+    print(f"\nrepeat-only stages (not recorded last night), repeat window medians:")
+    for k, v in only.items():
+        print(f"  {k}: {v}")
+    for f in ON + [folder]:
+        print(f"recorded config {os.path.basename(os.path.dirname(f))}: {recorded_config(f)}")
+    # Fake: 225845's own windows with 1.1 ms added to the gap must CARRY; unshifted they must not.
+    base = pool(run_windows([ON[1]], ON_STEPS))
+    fake_hit = judge(pool(ref_runs), [dict(w, **{"proxy gap": w["proxy gap"] + 1.1}) for w in base])["proxy gap"]
+    fake_none = judge(pool(ref_runs), base)["proxy gap"]
+    ok = fake_hit["carries"] and not fake_none["carries"]
+    print(f"\nFAKE 225845 +1.1 ms gap vs night: {'CARRIES (ok)' if fake_hit['carries'] else 'MISSED'}; "
+          f"unshifted: {'inside floor (ok)' if not fake_none['carries'] else 'CARRIES (wrong)'}")
+    if json_out:
+        json.dump({"repeat": res, "repeatOnly": only}, open(json_out, "w"), indent=1)
+    return 0 if ok else 1
+
+
 def self_test():
     cases = []
 
@@ -359,6 +408,18 @@ def self_test():
         os.remove(os.path.join(d, "gpu_engines.csv"))
         case("no gpu_engines.csv: no program stage, not 0",
              any(k.startswith("program gpu%") for k in window_medians(d, w)), False)
+    # --repeat: ref windows 37.2..37.8, repeat windows 38.55 / 38.56 carry; a stage only the repeat has is listed apart.
+    W = lambda g, rr, **kw: {"proxy gap": (g, 1), "gpu InjectRTX/RR": (rr, 1), **{k: (v, 1) for k, v in kw.items()}}  # noqa: E731
+    ref_runs = [[W(37.7, 13.3), W(37.2, 13.4)], [W(37.8, 13.4), W(37.25, 13.5)]]
+    rep, only = repeat_compare(ref_runs, [[W(38.55, 13.4, **{"program gpu% dwm all": 3.0}),
+                                           W(38.56, 13.45, **{"program gpu% dwm all": 5.0})]],
+                               {"proxy gap": {"carries": False}, "gpu InjectRTX/RR": {"carries": True}})
+    case("--repeat: gap 1.1 ms above last night carries", rep["proxy gap"]["carries"], True)
+    case("--repeat: a stage inside last night's range does not carry", rep["gpu InjectRTX/RR"]["carries"], False)
+    case("--repeat: plug-off carriers are marked", (rep["proxy gap"]["carriedPlugOff"],
+                                                     rep["gpu InjectRTX/RR"]["carriedPlugOff"]), (False, True))
+    case("--repeat: a stage last night lacks is listed as repeat-only, not compared",
+         (only, "program gpu% dwm all" in rep), ({"program gpu% dwm all": [3.0, 5.0]}, False))
     print("monitor_stage_split self-test:", "PASS" if all(cases) else "FAIL")
     return 0 if all(cases) else 1
 
@@ -368,6 +429,8 @@ if __name__ == "__main__":
     if args[:1] == ["--self-test"]:
         sys.exit(self_test())
     try:
+        if args[:1] == ["--repeat"] and len(args) in (2, 4):
+            sys.exit(repeat_report(args[1], args[3] if len(args) == 4 and args[2] == "--json" else None))
         on_folders, off_folders, json_path = run_args(args)
         sys.exit(main_report(json_path, on_folders, off_folders))
     except (OSError, ValueError, KeyError) as e:
