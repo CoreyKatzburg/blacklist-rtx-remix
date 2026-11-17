@@ -12,9 +12,10 @@ reads 0.9877):
   - fewer than MIN_STOPS (10) scored stops: NOT MEASURED;
   - INSIDE needs both the spot median inside MEDIAN_BAND (0.996 to 1.012) and every scored stop inside STOP_BAND (0.987
     to 1.030); anything else with enough stops is OUTSIDE and names the stops.
-The bands are the measured range of the original against itself, not a chosen tolerance: --bands recomputes them from
-the three lit original-against-original pairs in PAIRS (55 same-view stops). If a retake lands outside them, that is a
-finding, not a reason to widen them.
+STOP_BAND is the measured range of the original against itself: --bands recomputes it from the three lit
+original-against-original pairs in PAIRS (55 same-view stops). MEDIAN_BAND is chosen by the coordinator, not measured:
+the three measured spot medians are 1.0008 to 1.0031, too few values to set a band from; --bands only checks they lie
+inside it. If a retake lands outside either band, that is a finding, not a reason to widen them.
 
   orig_floor.py <new no-Remix spot folder> <reference spot folder>
   orig_floor.py --bands      recompute the ranges from PAIRS, check the bands hold them, score each pair as a spot
@@ -39,7 +40,7 @@ import pfm_brightness  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "runtime"))
 import gate  # noqa: E402
 
-MEDIAN_BAND = (0.996, 1.012)   # worker A's original-against-original floor; the three measured medians lie inside
+MEDIAN_BAND = (0.996, 1.012)   # chosen by the coordinator (not measured); the three measured medians lie inside
 STOP_BAND = (0.987, 1.030)     # min and max over the 55 same-view stops of PAIRS, rounded outward to 0.001
 MIN_STOPS = 10
 MAX_LOCATION = 8.0             # units (cm), worker B's same-camera limit
@@ -134,9 +135,11 @@ def bands() -> int:
     stop_band = (math.floor(lo * 1000) / 1000, math.ceil(hi * 1000) / 1000)
     print(f"all scored stops: {len(every)}, range {lo:.4f} to {hi:.4f} -> stop band {stop_band} "
           f"(in the code: {STOP_BAND})")
-    print(f"spot medians: {min(medians):.4f} to {max(medians):.4f} (median band in the code: {MEDIAN_BAND})")
+    print(f"median band {MEDIAN_BAND}: chosen by the coordinator; measured medians {min(medians):.4f} to "
+          f"{max(medians):.4f} from {len(medians)} pairs")
     ok &= stop_band == STOP_BAND and all(MEDIAN_BAND[0] <= m <= MEDIAN_BAND[1] for m in medians)
-    print("bands", "MATCH the measured ranges" if ok else "DO NOT MATCH")
+    print("bands OK: the stop band matches the measured range and the measured medians lie inside the chosen band"
+          if ok else "bands DO NOT MATCH")
     return 0 if ok else 3
 
 
