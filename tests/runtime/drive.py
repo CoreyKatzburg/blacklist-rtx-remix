@@ -101,8 +101,20 @@ class Tail:
 
 def set_ini(path: str, section: str, key: str, value: str) -> None:
     """Sets key=value in [section] of the game folder's d3d9_proxy.ini (the proxy re-reads it about once a second)."""
+    set_inis(path, [(section, key, value)])
+
+
+def set_inis(path: str, items: list) -> None:
+    """Sets several [section] key=value in one write, so the proxy's next re-read sees them together (worker C's draw
+    log, Nov 16: CaptureDraws and rtx.drawLog.tag must reach the same frame)."""
     with open(path, encoding="latin-1", newline="") as f:
         text = f.read()
+    for section, key, value in items:
+        text = ini_with(text, section, key, value)
+    write_ini(path, text)
+
+
+def ini_with(text: str, section: str, key: str, value: str) -> str:
     line = f"{key} = {value}" if section == "RemixConfig" else f"{key}={value}"
     # Only a real header line opens the section: a comment such as "; [Lights] with ..." does not, and the key is
     # looked up inside its own section only (the proxy reads it there, not from whatever section holds it first).
@@ -116,7 +128,7 @@ def set_ini(path: str, section: str, key: str, value: str) -> None:
         pattern = re.compile(r"(?m)^" + re.escape(key) + r"[ \t]*=[^\r\n]*")   # keeps the file's CRLF line ends
         body = pattern.sub(line, body, count=1) if pattern.search(body) else f"\r\n{line}" + body
         text = text[:header.end()] + body + text[end:]
-    write_ini(path, text)
+    return text
 
 
 def remove_ini_key(path: str, key: str) -> None:
@@ -1704,6 +1716,39 @@ class Spot:
         n = raw.size // (CAP_W * CAP_H)
         return raw[: n * CAP_W * CAP_H].reshape(n, CAP_H, CAP_W).astype(np.float32).mean(axis=0)
 
+    def draw_log(self, tag: str, dest: str) -> dict:
+        """Worker C's Remix draw log (dxvk-remix ee695ff, Nov 16): one ini write sets [Proxy] CaptureDraws=1 and
+        rtx.drawLog.tag=<tag>, so the proxy's draw dump and Remix's gate\\\\<tag>_remix_draws.tsv come from the same
+        moment; then both are cleared in one write (the tag is sent empty, since Remix keeps the last value it got).
+        Both files are copied to `dest`. capRows counts the draws Remix logged while a USD capture was running."""
+        dumps, want = os.path.join(self.a.system, "framedump"), os.path.join(self.a.system, "gate", f"{tag}_remix_draws.tsv")
+        old_dumps = files_under(dumps)
+        before = os.path.getmtime(want) if os.path.exists(want) else None   # an earlier launch may have used the tag
+        fresh = lambda: os.path.exists(want) and os.path.getmtime(want) != before
+        new_draws = lambda: [n for n in written_since(dumps, old_dumps) if n.endswith("_draws.tsv")]
+        rec: dict = {"tag": tag, "askedFrame": self.proxy.last_frame(), "askedAt": time.strftime("%H:%M:%S")}
+        set_inis(self.ini, [("Proxy", "CaptureDraws", "1"), ("RemixConfig", "rtx.drawLog.tag", tag)])
+        try:
+            self.hold(3.0)
+            self.hold(10.0, until=lambda: fresh() and bool(new_draws()))
+        finally:
+            set_inis(self.ini, [("Proxy", "CaptureDraws", "0"), ("RemixConfig", "rtx.drawLog.tag", "")])
+        # The proxy's draw dump grows over several seconds; copy it once its size has held for 1 s (as light_dump).
+        sizes: list[int] = []
+        self.hold(15.0, until=lambda: not new_draws() or
+                  (sizes.append(sum(os.path.getsize(os.path.join(dumps, n)) for n in new_draws())) or
+                   len(sizes) > 20 and sizes[-1] == sizes[-21] > 0))
+        rec["remixFile"] = os.path.basename(want) if fresh() else None
+        rec["capRows"] = 0
+        if rec["remixFile"]:
+            shutil.copy2(want, os.path.join(dest, rec["remixFile"]))
+            with open(want, encoding="latin-1") as f:
+                rec["capRows"] = sum("\tcap=1\t" in ln for ln in f)
+        for n in new_draws():
+            shutil.copy2(os.path.join(dumps, n), os.path.join(dest, os.path.basename(n)))
+        rec["drawDump"] = [os.path.basename(n) for n in new_draws()]
+        return rec
+
     def usd_capture(self, c: dict) -> dict:
         """Worker E (Nov 16): which texture each draw binds. Teleports to c["teleport"], takes the y0_p0 stop as
         <name>_y0_p0 (final.pfm and, when listed in rasterStops, the ray-tracing-off raster), then asks in the same
@@ -1725,14 +1770,19 @@ class Spot:
         rec["rayTracing"] = self.rt_is_on()
         dest = os.path.join(self.out, name, "capture")
         os.makedirs(dest, exist_ok=True)
+        # c["drawLog"] (worker C, Nov 16, white tanks): Remix's per-draw log for one frame with the proxy's draw dump
+        # of the same moment, first as the scene is (replacement assets on), then again while the USD capture runs.
+        draw_log = c.get("drawLog")
+        if draw_log:
+            rec["drawLog"] = [self.draw_log(draw_log, dest)]
         caps, dumps = os.path.join(self.a.system, "rtx-remix", "captures"), os.path.join(self.a.system, "framedump")
         rlog = os.path.join(self.a.system, "rtx-remix", "logs", "remix-dxvk.log")
         old_caps, old_dumps = files_under(caps), files_under(dumps)
-        mark = os.path.getsize(rlog)
+        start = mark = os.path.getsize(rlog)
 
-        def remix_text() -> str:
+        def remix_text(since: int | None = None) -> str:
             with open(rlog, "rb") as f:
-                f.seek(mark)
+                f.seek(mark if since is None else since)
                 return f.read().decode("latin-1")
         new_dumps = lambda: written_since(dumps, old_dumps)
         set_ini(self.ini, "RemixConfig", "rtx.captureShowMenuOnHotkey", "False")
@@ -1742,20 +1792,31 @@ class Spot:
             hwnd = game_window(self.a.pid)
             if not hwnd or not front(hwnd):
                 raise RuntimeError("no game window in front for the capture hotkey")
-            rec["askedFrame"], rec["askedAt"] = self.proxy.last_frame(), time.strftime("%H:%M:%S")
-            set_ini(self.ini, "Proxy", "CaptureDraws", "1")
-            tap("CTRL+SHIFT+Q")
-            self.hold(8.0, until=lambda: any(n.endswith("_draws.tsv") for n in new_dumps()))
-            set_ini(self.ini, "Proxy", "CaptureDraws", "0")
-            self.hold(float(c.get("exportSeconds", 300)),
-                      until=lambda: "End USD export" in remix_text() or "Cannot begin" in remix_text())
-            self.hold(3.0)   # texture files may still be closing
+            # A one-frame capture runs for about 0.6 s ("New capture" to "Begin USD export", 085935) and the proxy
+            # re-reads the ini about once a second, so the logged frame can miss it: then the capture is taken again
+            # under a new tag (Remix logs only when the tag changes), up to c["capTries"] times.
+            for i in range(int(c.get("capTries", 3)) if draw_log else 1):
+                mark = os.path.getsize(rlog)
+                rec["askedFrame"], rec["askedAt"] = self.proxy.last_frame(), time.strftime("%H:%M:%S")
+                if draw_log:
+                    tap("CTRL+SHIFT+Q")
+                    rec["drawLog"].append(self.draw_log(f"{draw_log}_cap{i + 1 if i else ''}", dest))
+                else:
+                    set_ini(self.ini, "Proxy", "CaptureDraws", "1")
+                    tap("CTRL+SHIFT+Q")
+                    self.hold(8.0, until=lambda: any(n.endswith("_draws.tsv") for n in new_dumps()))
+                    set_ini(self.ini, "Proxy", "CaptureDraws", "0")
+                self.hold(float(c.get("exportSeconds", 300)),
+                          until=lambda: "End USD export" in remix_text() or "Cannot begin" in remix_text())
+                self.hold(3.0)   # texture files may still be closing
+                if not draw_log or rec["drawLog"][-1]["capRows"] or "Cannot begin" in remix_text():
+                    break
         finally:
             set_ini(self.ini, "Proxy", "CaptureDraws", "0")
             set_ini(self.ini, "RemixConfig", "rtx.enableReplacementAssets", "True")   # removing the key would not undo it
             remove_ini_key(self.ini, "rtx.captureShowMenuOnHotkey")
             self.hold(3.0)
-        rec["remixLog"] = [l for l in remix_text().splitlines() if "GameCapturer" in l][:30]
+        rec["remixLog"] = [l for l in remix_text(start).splitlines() if "GameCapturer" in l or "[DrawLog]" in l][:30]
         for n in new_dumps():
             shutil.copy2(os.path.join(dumps, n), os.path.join(dest, os.path.basename(n)))
         rec["drawDump"] = [os.path.basename(n) for n in new_dumps()]

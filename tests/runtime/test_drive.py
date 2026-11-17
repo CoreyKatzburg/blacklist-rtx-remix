@@ -1020,6 +1020,92 @@ class Reference(unittest.TestCase):
         self.assertEqual(rec["error"], "no new USD capture file")
         self.assertIn("Cannot begin capture", rec["remixLog"][0])
 
+    def test_draw_log_asks_both_logs_in_one_write_and_retakes_a_capture_the_logged_frame_missed(self):
+        # Worker C's white-tank launch: Remix's draw log and the proxy's draw dump must reach the same frame, so the tag
+        # and CaptureDraws=1 arrive in one ini write; the tag is cleared by sending it empty. The capture's logged frame
+        # can fall outside the capture (about 0.6 s against a re-read about once a second): here the first try misses
+        # (cap=0 rows only), the second hits, and the third is not taken.
+        import os, re, shutil, tempfile, types
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        system, out = os.path.join(tmp, "SYSTEM"), os.path.join(tmp, "out")
+        caps, dumps = os.path.join(system, "rtx-remix", "captures"), os.path.join(system, "framedump")
+        logs, gate_dir = os.path.join(system, "rtx-remix", "logs"), os.path.join(system, "gate")
+        for d in (caps, dumps, logs, gate_dir, out):
+            os.makedirs(d)
+        rlog = os.path.join(logs, "remix-dxvk.log")
+        open(rlog, "w").close()
+        ini = os.path.join(system, "d3d9_proxy.ini")
+        with open(ini, "w", newline="") as f:
+            f.write("[Proxy]\r\nCaptureDraws=0\r\n[RemixConfig]\r\nrtx.x = 1\r\n")
+        state = {"frame": 0, "capturing": False, "captures": 0, "last_tag": "", "dumped": False}
+        writes: list[str] = []
+        real_write = drive.write_ini
+
+        def record(path, text):
+            writes.append(text)
+            real_write(path, text)
+
+        def frame(seconds=0, until=None):
+            # One proxy re-read and one Remix frame per hold.
+            state["frame"] += 1
+            with open(ini) as f:
+                text = f.read()
+            m = re.search(r"(?m)^rtx\.drawLog\.tag = (.*)$", text)
+            tag = m.group(1).strip() if m else ""
+            if tag and tag != state["last_tag"]:
+                with open(os.path.join(gate_dir, f"{tag}_remix_draws.tsv"), "w") as f:
+                    f.write(f"remixframe\tframe={state['frame']}\ttag={tag}\tdraws=1\n"
+                            f"geom=1\tcap={1 if state['capturing'] else 0}\tcapmat=-1\n")
+            state["last_tag"] = tag
+            if "CaptureDraws=1" in text and not state["dumped"]:
+                with open(os.path.join(dumps, f"f{state['frame']}_draws.tsv"), "w") as f:
+                    f.write("draws")
+            state["dumped"] = "CaptureDraws=1" in text
+            if state["capturing"]:   # the capture ends after this frame and its export is logged
+                state["capturing"] = False
+                with open(rlog, "a") as f:
+                    f.write(f"[GameCapturer][{state['captures']}] End USD export\n")
+            return until() if until else None
+
+        def press(key):
+            self.assertEqual(key, "CTRL+SHIFT+Q")
+            state["captures"] += 1
+            # The first capture ends before the proxy's next re-read: its logged frame misses it.
+            state["capturing"] = state["captures"] > 1
+            open(os.path.join(caps, f"capture_{state['captures']}.usda"), "w").close()
+            with open(rlog, "a") as f:
+                f.write(f"[GameCapturer][{state['captures']}] New capture\n")
+                if state["captures"] == 1:
+                    f.write("[GameCapturer][1] End USD export\n")
+
+        s = drive.Spot.__new__(drive.Spot)
+        s.a = types.SimpleNamespace(system=system, pid=1)
+        s.ini, s.out = ini, out
+        s.proxy = types.SimpleNamespace(last_frame=lambda: state["frame"])
+        s.teleport, s.move, s.stop = (lambda tp: {"sideways": 0}), (lambda *a: None), (lambda name: None)
+        s.rt_is_on, s.hold = (lambda: {"rayTracedLastFrames": [True]}), frame
+        with mock.patch.object(drive, "tap", press), mock.patch.object(drive, "game_window", lambda pid: 5), \
+                mock.patch.object(drive, "front", lambda h: True), mock.patch.object(drive, "write_ini", record):
+            rec = s.usd_capture({"name": "con_boiler", "teleport": {}, "drawLog": "con_boiler_y0_p0"})
+        self.assertNotIn("error", rec)
+        self.assertEqual([d["tag"] for d in rec["drawLog"]], ["con_boiler_y0_p0", "con_boiler_y0_p0_cap",
+                                                             "con_boiler_y0_p0_cap2"])
+        self.assertEqual([d["capRows"] for d in rec["drawLog"]], [0, 0, 1])
+        self.assertTrue(all(d["remixFile"] and d["drawDump"] for d in rec["drawLog"]))
+        self.assertEqual(state["captures"], 2)
+        dest = os.path.join(out, "con_boiler", "capture")
+        self.assertTrue(os.path.exists(os.path.join(dest, "con_boiler_y0_p0_cap2_remix_draws.tsv")))
+        # Every write that sets a tag also sets CaptureDraws=1, and the end state is both cleared.
+        for text in writes:
+            if re.search(r"(?m)^rtx\.drawLog\.tag = \S", text):
+                self.assertIn("CaptureDraws=1", text)
+        with open(ini) as f:
+            text = f.read()
+        self.assertIn("CaptureDraws=0", text)
+        self.assertRegex(text, r"(?m)^rtx\.drawLog\.tag = $")
+        self.assertIn("rtx.enableReplacementAssets = True", text)
+
     def test_light_dump_takes_a_rewritten_file_whose_name_an_earlier_launch_used(self):
         # 082350 con_bright_hall_samgear: the sam_gear step's f6059_lights.tsv was written, but a launch at 07:25 had
         # made a file with that name, and a check by name missed it (no light dump for the step).
