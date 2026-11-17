@@ -17,6 +17,8 @@ Stages, each as a per-window median over the window's own frames or samples:
   gpu_run.csv       graphics and memory clock, power, temperature (nvidia-smi samples inside the window's clock range)
   memory.csv        hardFaultsPerSec, freeRamMB (samples inside the window's clock range)
   proxy_hitches.txt hitches starting inside the window, per minute
+  gpu_engines.csv   GPU use per program group, 3d engine and all engines, % (runtime\\gpu_engines.py; launches from
+                    Nov 17 on; absent, so left out of the compare, when a run did not record it)
 
 Rule. floor = max - min of the 4 plug-on window medians (within- and between-run spread), at least MIN_FLOOR for ms
 stages. A stage CARRIES the difference when |off - on| > floor (off, on = mean of the window medians) and each off window
@@ -33,6 +35,9 @@ import re
 import statistics as st
 import sys
 from datetime import datetime
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "runtime"))
+import gpu_engines  # noqa: E402  program gpu% <game|bridge|dwm|nvidia overlay|other> <3d|all>, absent when not recorded
 
 GATE = r"D:\BlacklistOverhaul\experiments\remix-gate"
 ON = [os.path.join(GATE, "20261116-222500-settings", "01_monitors"),
@@ -167,6 +172,7 @@ def window_medians(folder, w):
     stages.update(telemetry_stages(folder, w))
     stages.update(clock_rows(folder, "gpu_run.csv", w, GPU_COLS))
     stages.update(clock_rows(folder, "memory.csv", w, MEM_COLS))
+    stages.update(gpu_engines.window_stages(os.path.join(folder, "gpu_engines.csv"), w.get("clock")))
     stages["proxy hitches per min"] = hitches_per_min(folder, qa, qb)
     return {k: (med(v), len(v)) for k, v in stages.items()}
 
@@ -281,7 +287,12 @@ def self_test():
     with tempfile.TemporaryDirectory() as d:
         def put(name, text):
             open(os.path.join(d, name), "w", encoding="utf-8").write(text)
-        put("spot.json", json.dumps({"windows": [{"monitorStep": "both_on", "proxy": [10, 13], "telemetry": [21, 22]}]}))
+        put("spot.json", json.dumps({"windows": [{"monitorStep": "both_on", "proxy": [10, 13], "telemetry": [21, 22],
+                                                  "clock": ["01:00:00.000", "01:00:02.500"]}]}))
+        # dwm 10 % in two samples and 0 % (no row) in one inside the clock range, 90 % in one sample after it
+        put("gpu_engines.csv", "time,pid,process,engtype,percent,instances\n" + "".join(
+            (f"{t},636,dwm,3d,{v},\n" if v else "") + f"{t},-1,_sample,all,0,500\n"
+            for t, v in (("01:00:00.000", 10), ("01:00:01.000", 0), ("01:00:02.000", 10), ("01:00:03.000", 90))))
         # frame, entry, gap, inPresent, draws, publishes; window frames are 11..13 (frame 10 only gives inPresent)
         put("proxy_frames.csv", "frame,qpc,gap,inPresent,draws,publishes\n9,970,30,20,100,16\n"
                                 "10,1000,30,25,100,16\n11,1040,40,35,100,16\n"
@@ -301,6 +312,10 @@ def self_test():
         case("GPU outside timed passes sums only top-level passes (10.5)", m["remix gpu outside timed passes"], 10.5)
         case("hitches counted inside the window's QPC range only (1 per 86 ms)",
              round(m["proxy hitches per min"], 1), round(60000 / 86, 1))
+        case("dwm GPU use inside the window's clock range (median of 10, 0, 10)", m["program gpu% dwm 3d"], 10)
+        os.remove(os.path.join(d, "gpu_engines.csv"))
+        case("no gpu_engines.csv: no program stage, not 0",
+             any(k.startswith("program gpu%") for k in window_medians(d, w)), False)
     print("monitor_stage_split self-test:", "PASS" if all(cases) else "FAIL")
     return 0 if all(cases) else 1
 

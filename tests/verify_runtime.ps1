@@ -722,7 +722,7 @@ try {
     foreach ($run in $runs) {
         $spot = $run.spot
         $spotDir = Join-Path $runDir $run.dir
-        $smi = $null; $mem = $null; $disp = $null; $hitchList = "$S\d3d9_proxy_hitches.txt"
+        $smi = $null; $mem = $null; $eng = $null; $disp = $null; $hitchList = "$S\d3d9_proxy_hitches.txt"
         $cp = Join-Path $Library $(if ($spot.checkpoint) { $spot.checkpoint } else { $spot.name })
         New-Item -ItemType Directory -Force $spotDir | Out-Null
         if (-not (Test-Path (Join-Path $cp 'checkpoint.json')) -or -not (Get-ChildItem $cp -Filter '*.save' -ErrorAction SilentlyContinue)) {
@@ -761,6 +761,11 @@ try {
             $smi = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
                 '-File', ('"' + (Join-Path $Runtime 'gpu_sampler.ps1') + '"'), '-Out', ('"' + (Join-Path $spotDir 'gpu_run.csv') + '"'),
                 '-Query', 'timestamp,clocks.gr,clocks.mem,clocks.sm,temperature.gpu,power.draw,power.limit,clocks_throttle_reasons.active,memory.used,memory.total,pstate')
+            # GPU use per program (pid and engine type) once a second for the whole launch (coordinator, Nov 17: GPU time
+            # other programs such as dwm.exe or the NVIDIA overlay use, against the plug-on vs plug-off frame time). Read by
+            # runtime\gpu_engines.py; about 1 % of one CPU core once running.
+            $eng = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
+                '-File', ('"' + (Join-Path $Runtime 'gpu_engines_sampler.ps1') + '"'), '-Out', ('"' + (Join-Path $spotDir 'gpu_engines.csv') + '"'))
             # Memory, page file and C: every 2 s for the whole launch (coordinator, Nov 16: lined up against freezes).
             $mem = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
                 '-File', ('"' + (Join-Path $Runtime 'mem_sampler.ps1') + '"'), '-Out', ('"' + (Join-Path $spotDir 'memory.csv') + '"'))
@@ -839,7 +844,7 @@ try {
                 @{ name = $spot.name; error = $_.Exception.Message; windows = @() } | ConvertTo-Json | Set-Content (Join-Path $spotDir 'spot.json')
             }
         } finally {
-            foreach ($p in $smi, $mem, $disp) { if ($p) { try { if (-not $p.HasExited) { $p.Kill() } } catch { } } }
+            foreach ($p in $smi, $mem, $eng, $disp) { if ($p) { try { if (-not $p.HasExited) { $p.Kill() } } catch { } } }
             if ($disp) { try {
                 $d = Get-DisplayDuring (Join-Path $spotDir 'display.csv'); $d.keepAwakeAsked = $keepAwake
                 $path = Join-Path $runDir 'manifest.json'; $man = Get-Content $path -Raw | ConvertFrom-Json
@@ -848,7 +853,7 @@ try {
                 $man | ConvertTo-Json -Depth 6 | Set-Content $path
                 Write-Step "$($run.dir): displays awake throughout: $($d.awakeThroughout) ($($d.samples) samples, $($d.notAwake) not awake$(if ($d.firstNotAwake) { ', first ' + $d.firstNotAwake }), longest without input $($d.maxIdleSeconds) s, display-required flag set by some program in $($d.displayRequiredSamples) samples$(if (-not $keepAwake) { ', not asked: this launch sleeps them on purpose' })); outside input: $(if ($null -eq $d.outsideInput) { 'not recorded' } elseif ($d.outsideInput.Count) { "$($d.outsideInput.Count) samples, first $($d.outsideInput[0])" } else { 'none' })"
             } catch { Write-Step "$($run.dir): display log not read: $($_.Exception.Message)" } }
-            $smi = $null; $mem = $null; $disp = $null
+            $smi = $null; $mem = $null; $eng = $null; $disp = $null
             if ($run.variant) {   # back to the baseline before the next variant (the game is closed by now)
                 Stop-Game
                 foreach ($p in $rtxPaths) { [IO.File]::WriteAllText($p, $rtxBackup) }
