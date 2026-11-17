@@ -1816,6 +1816,11 @@ class Reference(unittest.TestCase):
             calibrate(loose, False)
         with self.assertRaisesRegex(RuntimeError, "inconsistent"):
             calibrate([40.0, 100.0, 40.0, 100.0, 40.0, 100.0], True)
+        # No-Remix bright hall, Nov 17 14:11: one y move at half the rate, 1.93x from the median (inside 2.0) but 2.09x
+        # from the fastest, raised "inconsistent" and lost the spot. That move is dropped; x moves (7.0) are steady.
+        half = calibrate([7.0] * 6 + [29.0, 29.0, 14.94, 28.84, 27.48, 31.19], True)
+        self.assertEqual(half.calibration["droppedY"], [14.94])
+        self.assertAlmostEqual(half.counts_per_deg_y, 28.92, delta=0.01)
 
     def test_live_ini_step_needs_its_own_reload_line_then_stray_lines(self):
         import types

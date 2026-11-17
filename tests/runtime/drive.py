@@ -960,6 +960,11 @@ class Spot:
             vals = samples[axis]
             mid = float(np.median(vals)) if vals else 0.0
             kept = [v for v in vals if mid and v * mid > 0 and max(abs(v), abs(mid)) / min(abs(v), abs(mid)) <= spread]
+            # A half-eaten move can sit just inside the spread of the median yet outside it from the others (no-Remix
+            # bright hall, Nov 17 14:11: y 29.0, 14.9, 28.8, 27.5, 31.2). When nothing was dropped and the kept moves
+            # still disagree, drop the one farthest from the median.
+            if kept and len(kept) == len(vals) and max(map(abs, kept)) / min(map(abs, kept)) > spread:
+                kept.pop(max(range(len(kept)), key=lambda i: abs(np.log(abs(kept[i]) / abs(mid)))))
             if len(kept) < 3 or len(vals) - len(kept) > 1 or max(map(abs, kept)) / min(map(abs, kept)) > spread:
                 raise RuntimeError(f"mouse calibration on {axis} is inconsistent: counts per degree {vals}")
             self.calibration[f"dropped{axis.upper()}"] = [round(v, 3) for v in vals if v not in kept]
