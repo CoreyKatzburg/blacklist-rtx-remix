@@ -7,7 +7,7 @@ $ErrorActionPreference = 'Stop'
 $ast = [Management.Automation.Language.Parser]::ParseFile($Gate, [ref]$null, [ref]$null)
 foreach ($n in 'Remove-OwnPlayLock', 'Wait-RestartedGame', 'Get-DisplayProblem', 'Test-LaunchDead', 'Get-CSpaceProblem', 'Get-MemoryProblem',
            'Get-DisplayAwakeProblem', 'Get-DisplayDuring', 'Test-SleepsDisplays', 'Invoke-UbiLogin', 'Get-SuiteRecord', 'Get-MonitorStateProblem', 'Test-MonitorsOff',
-           'Get-RunSpots', 'Select-Previous', 'Get-InstalledRemixCommit') {
+           'Get-RunSpots', 'Get-RunIniKeys', 'Select-Previous', 'Get-InstalledRemixCommit') {
     $f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true) | Select-Object -First 1
     if (-not $f) { throw "missing $n" }
     . ([scriptblock]::Create($f.Extent.Text))
@@ -317,7 +317,45 @@ $p = Select-Previous $onNow $onOld
 Check 'plug-on run with -Previous a plug-on run: compared' ($p.prev -eq $onOld)
 $p = Select-Previous $oldRun ''
 Check 'run without a display record: no previous run, NOT COMPARABLE' (-not $p.prev -and $p.note -like '*NOT COMPARABLE: display state unknown*')
+# -IniKeys (coordinator, Nov 17: the FlareStandIns=0 run at four spots): a run made with launch-wide ini keys is the
+# previous run only of a run with the same keys, so a normal run never takes its FPS from it, nor it from a normal one.
+foreach ($n in 'ConvertFrom-IniKeyArg', 'Get-IniKey', 'Set-IniKey') {
+    $f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true) | Select-Object -First 1
+    if (-not $f) { throw "missing $n" }
+    . ([scriptblock]::Create($f.Extent.Text))
+}
+function IniRun($name, $keys) {
+    $d = FakeRun $name $monOn
+    @{ spots = @('con_custodial'); iniKeys = @($keys) } | ConvertTo-Json | Set-Content (Join-Path $d 'manifest.json')
+    $d
+}
+$flareOld = IniRun '20990101-000010' 'Lights.FlareStandIns=0'
+$plainNow = FakeRun '20990101-000011' $monOn
+$flareNow = IniRun '20990101-000012' 'Lights.FlareStandIns=0'
+$p = Select-Previous $plainNow ''
+Check 'ini keys: a normal run skips the newer FlareStandIns=0 run and takes the plug-on normal run' ($p.prev -eq $onNow)
+$p = Select-Previous $flareNow ''
+Check 'ini keys: a FlareStandIns=0 run takes only the earlier FlareStandIns=0 run' ($p.prev -eq $flareOld)
 $f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq 'Select-Previous' }, $true) | Select-Object -First 1
+. ([scriptblock]::Create($f.Extent.Text.Replace('(Get-RunIniKeys $_.FullName) -eq (Get-RunIniKeys $folder)', '$true')))
+$p = Select-Previous $plainNow ''
+Check 'ini keys: rule removed, case fails: the normal run takes the FlareStandIns=0 run' ($p.prev -eq $flareOld)
+. ([scriptblock]::Create($f.Extent.Text))
+$setup = "[Proxy]`r`nEnableDebuggingTelemetry=1`r`nFlareStandIns=1`r`n; [Lights] is set by drive.py`r`n"
+$t = Set-IniKey $setup 'Lights' 'FlareStandIns' '0'
+Check 'ini keys: FlareStandIns=0 lands in a new [Lights] section; [Proxy] keeps its own lines' (
+    (Get-IniKey $t 'Lights' 'FlareStandIns') -eq '0' -and (Get-IniKey $t 'Proxy' 'FlareStandIns') -eq '1' -and
+    (Get-IniKey $t 'Proxy' 'EnableDebuggingTelemetry') -eq '1' -and $t.StartsWith($setup.TrimEnd()))
+Check 'ini keys: a key under another section is not read as [Lights] (the read-back can fail)' ($null -eq (Get-IniKey $setup 'Lights' 'FlareStandIns'))
+$t2 = Set-IniKey "[Lights]`r`nEnable=1`r`nFlareStandIns=1`r`n[Proxy]`r`nFlareStandIns=1`r`n" 'Lights' 'FlareStandIns' '0'
+Check 'ini keys: an existing [Lights] key is replaced in place, the next section untouched' (
+    $t2 -eq "[Lights]`r`nEnable=1`r`nFlareStandIns=0`r`n[Proxy]`r`nFlareStandIns=1`r`n")
+$items = ConvertFrom-IniKeyArg @('Lights.FlareStandIns=0', 'RemixConfig.rtx.volumetrics.enable=False')
+Check 'ini keys: arguments split into section, key, value' ((($items | ForEach-Object { $_ -join '|' }) -join ';') -eq
+    'Lights|FlareStandIns|0;RemixConfig|rtx.volumetrics.enable|False')
+$badArg = $false
+try { $null = ConvertFrom-IniKeyArg @('FlareStandIns=0') } catch { $badArg = $_.Exception.Message -like "*is not Section.Key=Value" }
+Check 'ini keys: an argument without a section is refused' $badArg
 . ([scriptblock]::Create($f.Extent.Text.Replace('if ($LASTEXITCODE -eq 0)', 'if ($true)')))
 $p = Select-Previous $onNow $offNew
 Check 'rule removed (display state not checked), case fails: the plug-off run is compared' ($p.prev -eq $offNew)

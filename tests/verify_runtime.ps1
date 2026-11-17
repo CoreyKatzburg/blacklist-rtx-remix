@@ -48,7 +48,7 @@
 # keys need the game window in front, which this script does itself.
 param([string[]]$Spots = @(), [switch]$DryRun, [string]$CaptureCheckpoint = '', [switch]$Launch, [string]$Evaluate = '', [switch]$SkipInstall, [string]$SaveFrom = '',
       [string]$Previous = '', [string]$Reference = '', [switch]$NoRemix, [string]$Variants = '', [string]$RestoreFrom = '',
-      [string]$SuiteNote = '')
+      [string]$SuiteNote = '', [string[]]$IniKeys = @())
 $ErrorActionPreference = 'Stop'
 $Tests = $PSScriptRoot
 $Runtime = Join-Path $Tests 'runtime'
@@ -69,6 +69,11 @@ $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 function Get-RunSpots($folder) {
     $m = Join-Path $folder 'manifest.json'
     if (Test-Path $m) { @((Get-Content $m -Raw | ConvertFrom-Json).spots | Sort-Object) } else { @() }
+}
+# The launch-wide ini keys a run was made with (-IniKeys, manifest iniKeys), as one text; '' for a run without them.
+function Get-RunIniKeys($folder) {
+    $m = Join-Path $folder 'manifest.json'
+    if (Test-Path $m) { @((Get-Content $m -Raw | ConvertFrom-Json).iniKeys | Where-Object { $_ }) -join ';' } else { '' }
 }
 # The no-Remix reference, per spot: the newest earlier reference-* run that finished (has result.json) and holds that
 # spot without an error (coordinator review, Nov 16: a newer broken reference hid an older good one). When the spots
@@ -112,7 +117,9 @@ function Select-Previous($folder, [string]$given) {
     $kind = if ($name -like 'reference-*') { '^reference-\d{8}-\d{6}$' } else { '^\d{8}-\d{6}$' }
     $cands = if ($given) { @($given) } else {
         @(Get-ChildItem $ResultsRoot -Directory | Where-Object { $_.Name -match $kind -and ($_.Name -replace '^reference-', '') -lt $stamp -and
-            (Test-Path (Join-Path $_.FullName 'result.json')) -and ((Get-RunSpots $_.FullName) -join ',') -eq $spotsHere } |
+            (Test-Path (Join-Path $_.FullName 'result.json')) -and ((Get-RunSpots $_.FullName) -join ',') -eq $spotsHere -and
+            # a run made with launch-wide ini keys (-IniKeys) is only the previous run of one made with the same keys
+            (Get-RunIniKeys $_.FullName) -eq (Get-RunIniKeys $folder) } |
             Sort-Object Name -Descending | ForEach-Object FullName) }
     $first = $null
     foreach ($c in $cands) {
@@ -596,6 +603,41 @@ function Set-ProxyKeys($text, $keys) {
     }
     $text
 }
+# -IniKeys "Section.Key=Value" (coordinator, Nov 17: the FlareStandIns=0 Remix run at four spots): set in this run's
+# proxy ini for every spot of the launch and recorded in manifest iniKeys; both ini copies are written back from the
+# backups at the end like every run's ini. Section names hold letters only, so "RemixConfig.rtx.a.b=1" is key rtx.a.b.
+function ConvertFrom-IniKeyArg([string[]]$items) {
+    @(foreach ($s in $items) {
+        if ($s -notmatch '^([A-Za-z]+)\.([^=\s]+)=([^\r\n]*)$') { throw "-IniKeys '$s' is not Section.Key=Value" }
+        , @($Matches[1], $Matches[2], $Matches[3])
+    })
+}
+# The value of key in [section] of an ini text, $null when absent (the proxy reads a key only inside its own section).
+function Get-IniKey([string]$text, [string]$section, [string]$key) {
+    $h = [regex]::Match($text, "(?m)^[ \t]*\[$([regex]::Escape($section))\][ \t]*(?=\r?$)")
+    if (-not $h.Success) { return $null }
+    $nx = ([regex]'(?m)^[ \t]*\[').Match($text, $h.Index + $h.Length)
+    $body = $text.Substring($h.Index + $h.Length, $(if ($nx.Success) { $nx.Index } else { $text.Length }) - $h.Index - $h.Length)
+    $m = [regex]::Match($body, "(?m)^$([regex]::Escape($key))[ \t]*=[ \t]*([^\r\n]*)")
+    if ($m.Success) { $m.Groups[1].Value.TrimEnd() } else { $null }
+}
+# Sets key=value in [section] (drive.py ini_with's rule: the section is added at the end when absent), then reads it back.
+function Set-IniKey([string]$text, [string]$section, [string]$key, [string]$value) {
+    $line = if ($section -eq 'RemixConfig') { "$key = $value" } else { "$key=$value" }
+    $h = [regex]::Match($text, "(?m)^[ \t]*\[$([regex]::Escape($section))\][ \t]*(?=\r?$)")
+    if (-not $h.Success) { $text = $text.TrimEnd() + "`r`n[$section]`r`n$line`r`n" }
+    else {
+        $start = $h.Index + $h.Length
+        $nx = ([regex]'(?m)^[ \t]*\[').Match($text, $start)
+        $end = if ($nx.Success) { $nx.Index } else { $text.Length }
+        $body = $text.Substring($start, $end - $start)
+        $pat = [regex]"(?m)^$([regex]::Escape($key))[ \t]*=[^\r\n]*"
+        $body = if ($pat.IsMatch($body)) { $pat.Replace($body, $line, 1) } else { "`r`n$line" + $body }
+        $text = $text.Substring(0, $start) + $body + $text.Substring($end)
+    }
+    if ((Get-IniKey $text $section $key) -ne $value) { throw "Could not set [$section] $key=$value" }
+    $text
+}
 # -NoRemix: how Remix is turned off. Only this run's copy of the proxy ini changes (put back afterwards like every
 # run's ini); the installed files stay as they are. ChainDll makes the proxy hand every call to Windows' 32-bit d3d9,
 # so d3d9_remix.dll and the bridge never load; the rest switches off everything the proxy changes in the game's
@@ -689,8 +731,9 @@ $suiteRec = Get-SuiteRecord $SuiteRecord ([ordered]@{ toolsCommit = (git -C (Spl
     runtimeSha256 = $runtimeHash; toolsModified = $testsModified })
 $suite = [ordered]@{ note = $SuiteNote; record = $suiteRec; testsCommit = (git -C (Split-Path $Tests) rev-parse --short HEAD 2>$null)
                      testsModified = $testsModified }
+$iniItems = ConvertFrom-IniKeyArg $IniKeys
 @{ spots = @($selected | ForEach-Object name); started = $Stamp; noRemix = [bool]$NoRemix; build = $build; offlineSuite = $suite
-   variants = @(if ($sweep) { $runs | ForEach-Object dir }) } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $runDir 'manifest.json')
+   variants = @(if ($sweep) { $runs | ForEach-Object dir }); iniKeys = @($IniKeys) } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $runDir 'manifest.json')
 Write-Step "Builds: dxvk-remix installed $remixCommit (source checkout $remixSourceCommit), proxy $($build.proxySha256.Substring(0, 12))"
 Write-Step $suiteRec.line
 
@@ -725,6 +768,8 @@ try {
            restore = 'both ini copies are written back from the backups taken at the start; see restored below' } |
             ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDir 'reference.json')
     }
+    foreach ($i in $iniItems) { $gateIni = Set-IniKey $gateIni $i[0] $i[1] $i[2] }
+    if ($iniItems.Count) { Write-Step "ini keys for the whole launch: $($IniKeys -join ', ')" }
     $gateIni = Add-RunMarker $gateIni $runDir
     [IO.File]::WriteAllText($setupIniPath, $gateIni)
     if (-not $SkipInstall) {
