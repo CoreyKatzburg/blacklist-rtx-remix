@@ -69,6 +69,38 @@ count compares Remix with itself before and after the change, at the lamps the o
      inside the run's own on/on_again noise does not count. PASS when at most ALLOWED lamps are dimmed.
   Usage: --dimmed CHANGED --again ON_AGAIN with --remix-spot, --orig-spot and --still ON (window names).
 
+Fifth count, dimmed areas (coordinator, Nov 16). A CAUSE TEST, Remix against Remix, not a symptom check. At lampsA the
+original shows each lamp as a saturated area of 2200 to 3200 px, which rules 2 and 9 skip as too big:
+  10. The original's bright areas are 4-connected groups of pixels at luma >= SAT_LUMA covering more than BLOB_MAX_PX
+      pixels, outside the HUD (or the rule 11 skip mask). For each Remix still (on, changed, on_again) the area's ratio
+      is Remix's mean inside the area over Remix's mean in the rest of the frame, so an exposure change that dims the
+      whole frame equally leaves it unchanged. The area is DIMMED when on - changed > max(AREA_DROP_MIN x on,
+      3 x |on - on_again|). AREA_DROP_MIN (5%) is a chosen floor, not measured; the on / on_again spread of the ratio
+      on real Remix triplets was 2% to 3% (142638 switch_base) and up to 27% (102658, a window where the game stalled),
+      which the 3 x noise term covers. Printed with --dimmed as "dimmed areas N of M"; the exit code stays the lamp
+      count's.
+
+Alignment (rule 11; coordinator, Nov 16): a teleported stop can stand where the Remix stop stood but point a few
+degrees away.
+  11. A spot pair that the pose limits refuse is aligned when the two cameras (median render camera of each window in
+      proxy_frames.csv, the reader the gate's reference position rule copies) stand within POSE_CM and point within
+      ALIGN_YAW_DEG of yaw and ALIGN_PITCH_DEG of pitch, and both proxy.logs give one projection (the field of view;
+      spot_projection). The original is resampled into the Remix camera as a pure turn (nearest pixel, so glow peaks
+      keep their value). Pixels the turn exposes, which the original never saw, are skipped (grown by STRIP_GROW_PX),
+      as are the HUD and the original's HUD where the turn moves it. What is fixed to the screen, or close to Sam whom
+      the camera orbits, does not move with a turn, so each count also tries the unmoved original within PAIR_PX: a
+      blob is an orb only when neither the turned nor the unmoved original shows it, a glow is lost only when Remix
+      shows it at neither place, and the dimmed counts score each lamp where Remix's glow is brighter before the change.
+      Any other pair is NOT MEASURED (exit 2).
+  Measured (worker B, Nov 16) on every con_bright_hall pair standing within 8 cm and 1.5 to 4 degrees apart: pairs
+  2.88 to 3.19 degrees apart in yaw count 0 false lost glows and 0 false orbs (original against original, both ways),
+  and Remix 142638 y225_p0 against 191120 lampsB (2.88 degrees) counts the same 3 orbs and 0 lost as against y225_p0
+  (0.3 degrees, no alignment). At 3.63 degrees one glow reads lost and at 3.83 one orb that is not there (those pairs
+  also stand 7.3 to 7.8 cm apart), so ALIGN_YAW_DEG is 3.2. No usable real pair turns further in pitch than the pose
+  limit, so ALIGN_PITCH_DEG stays at POSE_PITCH_DEG. Cost: of 48 dots added to that Remix still, 23 are counted after
+  alignment, against 25 at 0.3 degrees without it. An alignment 3 degrees wrong in pitch counts 7 lost glows (+3) or
+  4 orbs (-3).
+
 HUD: with --orig-spot, pixels that stand out (contrast >= ORIG_STEPS) at the same screen place in at least half of
 the original spot's stills, although the camera turned between them, are the HUD; the mask is that set grown by 2 px
 with enclosed holes (the radar disc) filled. Blobs, puffs and glows whose peak lies on the HUD are skipped in all
@@ -95,6 +127,8 @@ WIN = 25
 BLOB_STEPS, ORIG_STEPS, BLOB_MAX_PX, MATCH_PX, BORDER_PX, ALLOWED = 24.0, 12.0, 200, 6, 3, 0
 GAIN_MAX, RING_BRIGHT_MAX = 6.0, 0.2
 POSE_CM, POSE_DEG, POSE_PITCH_DEG = 8.0, 1.5, 1.0
+ALIGN_YAW_DEG, ALIGN_PITCH_DEG, STRIP_GROW_PX, PROJ_SPREAD, PAIR_PX = 3.2, 1.0, 2, 0.005, 2
+SAT_LUMA, AREA_DROP_MIN = 250.0, 0.05
 CELL, CELL_WIN, PUFF_STEPS = 4, 15, 24.0
 KEEP_FRAC, STRONG_STEPS, DROP_MIN = 0.75, 100.0, 12.0
 HUD_MIN_STILLS = 8
@@ -117,9 +151,8 @@ def contrast(img: np.ndarray):
     return img - bg, bg
 
 
-def blobs(c: np.ndarray):
-    """4-connected groups of pixels with contrast >= BLOB_STEPS: list of (pixel count, peak (y, x), peak value)."""
-    mask = c >= BLOB_STEPS
+def regions(mask: np.ndarray):
+    """4-connected groups of True pixels: list of (ys, xs) index arrays."""
     seen = np.zeros_like(mask)
     out = []
     for y0, x0 in zip(*np.nonzero(mask)):
@@ -134,9 +167,16 @@ def blobs(c: np.ndarray):
                 if 0 <= yy < H and 0 <= xx < W and mask[yy, xx] and not seen[yy, xx]:
                     seen[yy, xx] = True
                     stack.append((yy, xx))
-        ys, xs = np.array(px).T
+        out.append(tuple(np.array(px).T))
+    return out
+
+
+def blobs(c: np.ndarray):
+    """4-connected groups of pixels with contrast >= BLOB_STEPS: list of (pixel count, peak (y, x), peak value)."""
+    out = []
+    for ys, xs in regions(c >= BLOB_STEPS):
         k = int(np.argmax(c[ys, xs]))
-        out.append((len(px), (int(ys[k]), int(xs[k])), float(c[ys[k], xs[k]])))
+        out.append((len(ys), (int(ys[k]), int(xs[k])), float(c[ys[k], xs[k]])))
     return out
 
 
@@ -163,13 +203,13 @@ def small_blobs(img, c, bg, hud, skipped):
         yield area, y, x, peak, d
 
 
-def judge(remix: np.ndarray, orig: np.ndarray, hud=None):
+def judge(remix: np.ndarray, orig: np.ndarray, hud=None, match_px=MATCH_PX):
     """Rows for every candidate blob, and counts of the blobs skipped by each rule."""
     cr, br = contrast(remix)
     co, bo = contrast(orig)
     rows, skipped = [], {"big": 0, "border": 0, "hud": 0, "area edge": 0}
     for area, y, x, peak, d in small_blobs(remix, cr, br, hud, skipped):
-        orig_bump = float(co[d <= MATCH_PX].max())
+        orig_bump = float(co[d <= match_px].max())
         gain = float(np.clip((br[y, x] + 1.0) / (bo[y, x] + 1.0), 1.0, GAIN_MAX))
         excess = peak - gain * max(orig_bump, 0.0)
         rows.append({"x": x, "y": y, "area": area, "peak": peak, "orig": orig_bump, "gain": gain,
@@ -177,13 +217,13 @@ def judge(remix: np.ndarray, orig: np.ndarray, hud=None):
     return rows, skipped
 
 
-def lost_glows(remix: np.ndarray, orig: np.ndarray, hud=None):
+def lost_glows(remix: np.ndarray, orig: np.ndarray, hud=None, match_px=MATCH_PX):
     """Rules 7 and 8: rows for every original glow, with "lost" set when Remix does not show it."""
     cr, br = contrast(remix)
     co, bo = contrast(orig)
     rows, skipped = [], {"big": 0, "border": 0, "hud": 0, "area edge": 0}
     for area, y, x, peak, d in small_blobs(orig, co, bo, hud, skipped):
-        near = d <= MATCH_PX
+        near = d <= match_px
         bump, top = float(cr[near].max()), float(remix[near].max())
         gain = float(np.clip((br[y, x] + 1.0) / (bo[y, x] + 1.0), 1.0, GAIN_MAX)) if peak >= STRONG_STEPS else 1.0
         need = KEEP_FRAC * min(255.0, gain * float(orig[y, x]))
@@ -296,6 +336,106 @@ def pose_ok(spec):
     return dist <= POSE_CM and dyaw <= POSE_DEG and dpitch <= POSE_PITCH_DEG, dist, dyaw, dpitch
 
 
+def align_ok(spec):
+    """Rule 11: a pair pose_ok refuses may be aligned when the cameras stand within POSE_CM (a turn cannot correct
+    where a camera stands) and point within ALIGN_YAW_DEG and ALIGN_PITCH_DEG of each other."""
+    _, dist, dyaw, dpitch = pose_ok(spec)
+    return dist <= POSE_CM and dyaw <= ALIGN_YAW_DEG and dpitch <= ALIGN_PITCH_DEG, dist, dyaw, dpitch
+
+
+def spot_projection(spot: pathlib.Path):
+    """(P00, P11) of the game's projection from the spot's proxy.log ("camera decomposition accepted ... projection
+    P00 P11 ..."), or None when the log has none or its lines disagree by more than PROJ_SPREAD (the field of view
+    changed during the run, so no single value belongs to a still; the log has no frame numbers to pick one)."""
+    vals = []
+    with (spot / "proxy.log").open(errors="replace") as f:
+        for line in f:
+            if "camera decomposition accepted" in line and (m := re.search(r"projection ([-0-9.]+) ([-0-9.]+)", line)):
+                vals.append((float(m[1]), float(m[2])))
+    if not vals:
+        return None
+    v = np.array(vals)
+    return None if np.any(v.max(0) - v.min(0) > PROJ_SPREAD * np.abs(v).max(0)) else tuple(np.median(v, axis=0))
+
+
+def basis(yaw, pitch):
+    """Camera forward, right and up in the game's world (left handed: facing +x, screen right is +y)."""
+    y, p = math.radians(yaw), math.radians(pitch)
+    fwd = np.array([math.cos(p) * math.cos(y), math.cos(p) * math.sin(y), math.sin(p)])
+    right = np.cross([0.0, 0.0, 1.0], fwd)
+    right /= np.linalg.norm(right)
+    return fwd, right, np.cross(fwd, right)
+
+
+def warp(img, src, src_proj, dst, dst_proj):
+    """img seen by camera src (x, y, z, yaw, pitch) resampled into the view of camera dst, turn only (nearest pixel):
+    (picture, valid, (u, v) source pixel of each dst pixel). Pixels dst sees that src did not are filled from src's
+    nearest edge and are not valid."""
+    fs, rs, us = basis(src[3], src[4])
+    fd, rd, ud = basis(dst[3], dst[4])
+    xs = ((XX + 0.5) / (W / 2) - 1) / dst_proj[0]
+    ys = (1 - (YY + 0.5) / (H / 2)) / dst_proj[1]
+    d = fd + xs[..., None] * rd + ys[..., None] * ud
+    z = d @ fs
+    u = W / 2 * (1 + src_proj[0] * (d @ rs) / z) - 0.5
+    v = H / 2 * (1 - src_proj[1] * (d @ us) / z) - 0.5
+    valid = (z > 0) & (u >= -0.5) & (u < W - 0.5) & (v >= -0.5) & (v < H - 0.5)   # inside src's pixel area
+    # Nearest pixel, not bilinear: bilinear averages a one- or two-pixel glow with its neighbours and cut original
+    # peaks below STRONG_STEPS (a 0.3 degree pair lost 2 of 6 lamps). Nearest keeps peak values and moves a glow by at
+    # most half a pixel. The brightest of the 2 x 2 source pixels gave the same counts on all five real turned pairs
+    # and widens glows, so nearest it is.
+    u0 = np.clip(np.floor(u + 0.5), 0, W - 1).astype(int)
+    v0 = np.clip(np.floor(v + 0.5), 0, H - 1).astype(int)
+    return img[v0, u0].astype(np.float32), valid, (u, v)
+
+
+def grow(mask, n):
+    m = mask.copy()
+    for _ in range(n):
+        g = m.copy()
+        g[1:] |= m[:-1]; g[:-1] |= m[1:]; g[:, 1:] |= m[:, :-1]; g[:, :-1] |= m[:, 1:]
+        m = g
+    return m
+
+
+def align(orig, opose, oproj, rpose, rproj, hud=None):
+    """Rule 11: (the original resampled into the Remix camera, skip mask, exposed strip px). The skip mask replaces the
+    HUD mask: the HUD where Remix has it, the original's HUD where it lands after the turn, and the strip the turn
+    exposes (no original picture there) grown by STRIP_GROW_PX."""
+    o2, valid, uv = warp(orig, opose, oproj, rpose, rproj)
+    skip = grow(~valid, STRIP_GROW_PX)
+    if hud is not None:
+        skip |= hud | (warp(hud.astype(np.float32), opose, oproj, rpose, rproj)[0] > 0.5)
+    return o2, skip, int((~valid).sum()), uv
+
+
+def counterpart(q, rows, uv=None):
+    """Rule 11: the row among `rows` (scored against the unaligned original) within PAIR_PX of the place aligned row
+    q came from: uv maps each Remix pixel to its source in the original; None means the same screen place."""
+    u, v = (q["x"], q["y"]) if uv is None else (uv[0][q["y"], q["x"]], uv[1][q["y"], q["x"]])
+    return next((w for w in rows if abs(w["x"] - u) <= PAIR_PX and abs(w["y"] - v) <= PAIR_PX), None)
+
+
+def aligned_counts(remix, orig, hud, al):
+    """Rule 11 for the orb and lost counts: (orb rows, orb skips, lost rows, lost skips). A Remix blob is an orb
+    only when it is unmatched against both the aligned original and the unaligned one; an original glow is lost only
+    when Remix shows it neither at its aligned place nor where it was in the original's own frame."""
+    o2, skip, uv = al
+    rows, skipped = judge(remix, o2, skip)
+    ru = judge(remix, orig, skip, PAIR_PX)[0]
+    for q in rows:
+        c = None if q["matched"] else counterpart(q, ru)
+        if c is not None and c["matched"]:
+            q["matched"], q["model"] = True, "unmoved"
+    lrows, lskipped = lost_glows(remix, o2, skip)
+    lu = lost_glows(remix, orig, hud, PAIR_PX)[0]
+    for q in lrows:
+        c = counterpart(q, lu, uv) if q["lost"] else None
+        if c is not None and not c["lost"]:
+            q["lost"], q["model"] = False, "unmoved"
+    return rows, skipped, lrows, lskipped
+
+
 def report(rows, skipped, out=print) -> bool:
     bad = [r for r in rows if not r["matched"]]
     ok = len(bad) <= ALLOWED
@@ -347,6 +487,48 @@ def dimmed_lamps(orig, on, changed, on_again, hud=None):
     return rows, skipped
 
 
+def dimmed_lamps_aligned(orig, on, changed, on_again, hud, al):
+    """Rule 11 for the dimmed count: each lamp is scored where Remix shows it more brightly before the change, at its
+    aligned place or where it was in the original's own frame."""
+    o2, skip, uv = al
+    rows, skipped = dimmed_lamps(o2, on, changed, on_again, skip)
+    ru = dimmed_lamps(orig, on, changed, on_again, hud)[0]
+    for q in rows:
+        c = counterpart(q, ru, uv)
+        if c is not None and c["on"] > q["on"]:
+            q.update({k: c[k] for k in ("on", "changed", "on_again", "shown", "dimmed")}, model="unmoved")
+    return rows, skipped
+
+
+def dimmed_areas(orig, on, changed, on_again, skip=None):
+    """Rule 10: rows for every bright area of the original (luma >= SAT_LUMA, over BLOB_MAX_PX pixels outside the
+    skip mask), with "dimmed" set when the change lowers Remix's brightness there relative to the rest of the frame."""
+    keep = np.ones((H, W), bool) if skip is None else ~skip
+    areas = [a for a in regions((orig >= SAT_LUMA) & keep) if len(a[0]) > BLOB_MAX_PX]
+    rest = keep.copy()
+    for ys, xs in areas:
+        rest[ys, xs] = False
+    rows = []
+    for ys, xs in areas:
+        a, b, c = (float(img[ys, xs].mean()) / max(float(img[rest].mean()), 1.0) for img in (on, changed, on_again))
+        rows.append({"x": int(xs.mean()), "y": int(ys.mean()), "area": len(ys), "on": a, "changed": b, "on_again": c,
+                     "dimmed": a - b > max(AREA_DROP_MIN * a, 3 * abs(a - c))})
+    return rows
+
+
+def report_dimmed_areas(rows, out=print) -> bool:
+    bad = [r for r in rows if r["dimmed"]]
+    ok = len(bad) <= ALLOWED
+    out(f"glow_blobs: dimmed areas {len(bad)} of {len(rows)} bright areas the original shows (cause test, Remix "
+        f"against Remix, not a symptom check; Remix area mean / rest-of-frame mean drops by more than "
+        f"max({AREA_DROP_MIN:g} x on, 3 x |on - on_again|); the exit code is the lamp count's): "
+        f"{'PASS' if ok else 'FAIL'}")
+    for r in rows:
+        out(f"  area at x {r['x']} y {r['y']} ({r['area']} px): Remix area / rest on {r['on']:.2f}, changed "
+            f"{r['changed']:.2f}, on_again {r['on_again']:.2f}{'  DIMMED' if r['dimmed'] else ''}")
+    return ok
+
+
 def report_dimmed(rows, out=print) -> bool:
     bad = [r for r in rows if r["dimmed"]]
     ok = len(bad) <= ALLOWED
@@ -358,14 +540,19 @@ def report_dimmed(rows, out=print) -> bool:
     return ok
 
 
-def check_all(remix, orig, hud, out=print):
-    """All three counts; returns (verdict, (orbs unmatched, puffs, lost)). The verdict is orbs and lost glows only."""
+def check_all(remix, orig, hud, out=print, al=None):
+    """All three counts; returns (verdict, (orbs unmatched, puffs, lost)). The verdict is orbs and lost glows only.
+    al: (aligned original, skip mask, source map) from align() for a pair rule 11 aligns."""
     out(f"glow_blobs: hud mask {'none' if hud is None else f'{int(hud.sum())} px'}")
-    rows, skipped = judge(remix, orig, hud)
+    if al is None:
+        rows, skipped = judge(remix, orig, hud)
+        lrow, lskip = lost_glows(remix, orig, hud)
+        prow, pskip = puffs(remix, orig, hud)
+    else:
+        rows, skipped, lrow, lskip = aligned_counts(remix, orig, hud, al)
+        prow, pskip = puffs(remix, al[0], al[1])
     ok1 = report(rows, skipped, out)
-    prow, pskip = puffs(remix, orig, hud)
     report_puffs(prow, pskip, out)
-    lrow, lskip = lost_glows(remix, orig, hud)
     ok3 = report_lost(lrow, lskip, out)
     ok = ok1 and ok3
     n = (sum(not r["matched"] for r in rows), len(prow), sum(r["lost"] for r in lrow))
@@ -496,6 +683,49 @@ def self_test() -> int:
     dim_case("the drop is inside the run's own on / on_again difference: not dimmed", shown, base, base, 0)
     dim_case("Remix never showed the lamp (the lost count's job): not dimmed", base, base, base, 0)
 
+    # Dimmed areas (rule 10): a cause test, Remix against Remix.
+    sq = (abs(XX - 120) < 20) & (abs(YY - 80) < 20)           # 1521 px, over BLOB_MAX_PX
+    sat = np.where(sq, 255.0, orig)                            # the original shows it saturated
+    lit = np.where(sq, 220.0, base)                            # Remix shows it bright
+
+    def area_case(name, on, changed, on_again, want):
+        rows = dimmed_areas(sat.astype(np.float32), on.astype(np.float32), changed.astype(np.float32),
+                            on_again.astype(np.float32))
+        lines = []
+        report_dimmed_areas(rows, out=lines.append)
+        tally(name, len(rows) == 1 and sum(r["dimmed"] for r in rows) == want, lines[0])
+
+    dimmer = np.where(sq, 130.0, base)
+    area_case("dimmed areas: the bright area unchanged by the change reads not dimmed", lit, lit, lit, 0)
+    area_case("dimmed areas: the change takes the area from 220 to 130 luma: dimmed", lit, dimmer, lit, 1)
+    area_case("dimmed areas: the same drop also in on_again (inside the run's noise): not dimmed", lit, dimmer, dimmer, 0)
+    area_case("dimmed areas: the whole frame dims to 0.6x (an exposure change): not dimmed", lit, lit * 0.6, lit, 0)
+    a_on, a_ch = float(lit[sq].mean()), float((lit * 0.6)[sq].mean())
+    tally("dimmed areas: a broken version on the area's own mean (no rest-of-frame ratio) would call that exposure "
+          "change dimmed", a_on - a_ch > AREA_DROP_MIN * a_on, f"area mean {a_on:.0f} to {a_ch:.0f}")
+    tally("dimmed areas: an original with no area over BLOB_MAX_PX at luma >= SAT_LUMA gives no rows",
+          dimmed_areas(orig.astype(np.float32), lit, lit, lit) == [], "")
+
+    # Rule 11 limits and the field-of-view reader.
+    for spec, want, why in (("0,0,0,-90,0;0,0,0,-87,0", True, "3 deg of yaw, same place: aligned"),
+                            ("0,0,0,-90,0;0,0,0,-86,0", False, "4 deg of yaw (over ALIGN_YAW_DEG): refused"),
+                            ("0,0,0,-90,0;0,10,0,-87,0", False, "3 deg but 10 cm to the side: refused"),
+                            ("0,0,0,-90,0;0,0,0,-90,1.2", False, "1.2 deg of pitch: refused")):
+        got = align_ok(spec)[0]
+        tally(f"align_ok, {why}", got == want, f"align_ok says {got}")
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        log = pathlib.Path(td) / "proxy.log"
+        one = "[lightpub] camera decomposition accepted: view ok, projection 1.00003 1.77784 0.0 0.0\n"
+        for text, want, why in ((one * 3, (1.00003, 1.77784), "one value"),
+                                (one + one.replace("1.00003 1.77784", "1.20000 2.13341"), None,
+                                 "two fields of view in one log: None, no single value belongs to a still"),
+                                ("nothing here\n", None, "no projection line: None")):
+            log.write_text(text)
+            got = spot_projection(pathlib.Path(td))
+            good = got == want if want is None else got is not None and np.allclose(got, want)
+            tally(f"spot_projection, {why}", good, f"got {got}")
+
     # Real pictures (coordinator, Nov 16): run 20261115-142638 con_bright_hall against the original game's picture in
     # reference-20261116-000454 at the same pose. Missing data fails the self-test rather than skipping it.
     global STRONG_STEPS
@@ -550,7 +780,7 @@ def self_test() -> int:
         # Dimmed lamps on real pictures: the original's ceiling lamp at x 214 y 57 in y225_p0 sits on a wall Remix
         # lights above the lost count's need, so erasing Remix's glow there is missed by the lost count.
         og_225 = spot_still(og_spot, "y225_p0")
-        rx_225, _ = spot_still(rx_spot, "y225_p0")
+        rx_225, rx_225_pose = spot_still(rx_spot, "y225_p0")
         gone = erase(214, 57)(rx_225)
         n_lost = sum(r["lost"] for r in lost_glows(gone, og_225[0], og_hud)[0])
         tally("142638 y225_p0 with Remix's lamp glow at x 214 y 57 erased: the lost count misses it (lost 0)",
@@ -601,6 +831,101 @@ def self_test() -> int:
         tally("two original stills 3.2 deg apart (191120 lampsB against y225_p0): refused, and compared anyway they "
               "count glows and orbs that are not there", not pok and dyaw > 3 and false >= 1,
               f"yaw {dyaw:.2f} deg, false counts {false}")
+
+        # Rule 11 on real pictures: the same pair stands 5.0 cm apart and 3.19 deg apart, inside the align limits.
+        P3 = spot_projection(ref3)
+        tally("the field of view of 191120 is read from its proxy.log", P3 is not None and np.allclose(P3, (1.0, 1.7778),
+              atol=0.002), f"projection {P3}")
+
+        def aligned(remix, orig, rpose, opose, pitch_err=0.0, strip=True):
+            op = opose.copy()
+            op[4] += pitch_err
+            o2, sk, _, uv = align(orig, op, P3, rpose, P3, og_hud)
+            if not strip:
+                sk = og_hud | (warp(og_hud.astype(np.float32), op, P3, rpose, P3)[0] > 0.5)
+            rows, _, lrows, _ = aligned_counts(remix, orig, og_hud, (o2, sk, uv))
+            return rows, lrows, sk
+
+        aok = align_ok((b3_pose, o3_pose))[0]
+        rows, lrows, sk3 = aligned(b3, o3, b3_pose, o3_pose)
+        false = sum(r["lost"] for r in lrows) + sum(not r["matched"] for r in rows)
+        tally("the same two original stills aligned (y225_p0 turned into lampsB's camera): 0 false counts",
+              aok and false == 0, f"align_ok {aok}, false counts {false}")
+        rows, lrows, _ = aligned(o3, b3, o3_pose, b3_pose)
+        false = sum(r["lost"] for r in lrows) + sum(not r["matched"] for r in rows)
+        tally("and the other way (lampsB turned into y225_p0's camera): 0 false counts", false == 0, f"false {false}")
+        rows, lrows, _ = aligned(o3, b3, o3_pose, b3_pose, pitch_err=3.0)
+        false = sum(r["lost"] for r in lrows) + sum(not r["matched"] for r in rows)
+        tally("broken alignment, 3 deg wrong in pitch: false counts appear", false >= 1, f"false counts {false}")
+
+        # The exposed strip: lampsB's camera sees a strip at one side that y225_p0 never saw.
+        _, valid, _ = warp(o3, o3_pose, P3, b3_pose, P3)
+        cols = np.nonzero(~valid[90])[0]
+        left = cols.size > 0 and cols.min() == 0
+        keep = np.nonzero(~sk3[90])[0]
+        x_in = int(cols.mean()) if cols.size else 0
+        x_in = max(x_in, BORDER_PX + 1) if left else min(x_in, W - BORDER_PX - 2)
+        x_edge = int(keep.min() + 3) if left else int(keep.max() - 3)
+
+        def orb_at(img, x, y=90, strip=True):
+            rows, _, _ = aligned(img.astype(np.float32), o3, b3_pose, o3_pose, strip=strip)
+            return any(not r["matched"] and abs(r["x"] - x) <= 2 and abs(r["y"] - y) <= 2 for r in rows)
+        lamp_strip = _dot(b3, x_in, 90, amp=120)
+        a_skip, a_noskip = orb_at(lamp_strip, x_in), orb_at(lamp_strip, x_in, strip=False)
+        tally(f"a lamp inside the exposed strip (x {x_in} y 90; {cols.size} px wide), which the original never saw, is "
+              "not counted; without the strip skip it would be", cols.size > 0 and not a_skip and a_noskip,
+              f"counted with skip {a_skip}, without {a_noskip}")
+        # Cost of rule 11: at x_edge the unmoved original has a real bright feature at the same screen place (a vertical
+        # strip near x 20 runs the frame's height), so a glow there is excused by the unmoved comparison.
+        c3 = contrast(o3)[0]
+        got = orb_at(_dot(b3, x_edge, 40, amp=120), x_edge, 40)
+        tally(f"cost of rule 11: a glow at x {x_edge} y 40, where the unmoved original has its own bright feature "
+              f"(contrast {c3[38:43, x_edge - 2:x_edge + 3].max():.0f}), is excused", not got, f"counted {got}")
+        # A glow just inside the skip's edge is still counted: the other direction of the pair, whose strip is at the
+        # right side over a plain wall, on rows where the unmoved original (lampsB) has no bump within PAIR_PX.
+        _, sk4 = aligned(o3, b3, o3_pose, b3_pose)[1:]
+        x4 = int(np.nonzero(~sk4[90])[0].max() - 3)
+        cb = contrast(b3)[0]
+        free = [y for y in (40, 60, 90, 110, 140) if not sk4[y, x4]
+                and cb[y - PAIR_PX:y + PAIR_PX + 1, x4 - PAIR_PX:x4 + PAIR_PX + 1].max() < ORIG_STEPS]
+
+        def orb_at4(x, y):
+            rows, _, _ = aligned(_dot(o3, x, y, amp=120).astype(np.float32), b3, o3_pose, b3_pose)
+            return any(not r["matched"] and abs(r["x"] - x) <= 2 and abs(r["y"] - y) <= 2 for r in rows)
+        got = {y: orb_at4(x4, y) for y in free}
+        tally(f"a glow 3 px inside the strip skip's edge (x {x4}, lampsB turned into y225_p0) is counted on every "
+              f"free row", len(free) >= 2 and all(got.values()), f"counted {got}")
+
+        # Remix against the turned original gives the counts it gets against an original at its own pose.
+        rows, lrows, sk_r = aligned(rx_225, b3, rx_225_pose, b3_pose)
+        orbs = sorted((r["x"], r["y"]) for r in rows if not r["matched"])
+        base_orbs = sorted((r["x"], r["y"]) for r in judge(rx_225, o3, og_hud)[0] if not r["matched"])
+        n_lost = sum(r["lost"] for r in lrows)
+        tally("142638 y225_p0 against 191120 lampsB aligned (2.88 deg): the same orbs and lost glows as against "
+              "y225_p0 at 0.3 deg", align_ok((rx_225_pose, b3_pose))[0] and orbs == base_orbs and n_lost == 0,
+              f"aligned orbs {orbs}, lost {n_lost}; at 0.3 deg orbs {base_orbs}")
+        al_r = align(b3, b3_pose, P3, rx_225_pose, P3, og_hud)
+        al_r = (al_r[0], al_r[1], al_r[3])
+        lamps = [r for r in dimmed_lamps(o3, rx_225, rx_225, rx_225, og_hud)[0] if r["shown"] and not sk_r[r["y"], r["x"]]]
+        caught = sum(any(q["dimmed"] and abs(q["x"] - r["x"]) <= 4 and abs(q["y"] - r["y"]) <= 4 for q in
+                         dimmed_lamps_aligned(b3, rx_225, erase(r["x"], r["y"])(rx_225), rx_225, og_hud, al_r)[0])
+                     for r in lamps)
+        tally("142638 y225_p0 against lampsB aligned: every lamp Remix shows outside the skip is caught when erased",
+              caught == len(lamps) > 0, f"{caught} of {len(lamps)}")
+
+        # End to end through main(): an aligned pair is scored, a pair beyond the limits is refused.
+        import subprocess
+        me = [sys.executable, "-I", str(pathlib.Path(__file__).resolve()), "--remix-spot", str(rx_spot)]
+        p = subprocess.run(me + ["--orig-spot", str(ref3), "--still", "y225_p0", "--orig-still", "lampsB"],
+                           capture_output=True, text=True, timeout=180)
+        tally("main(): 142638 y225_p0 against 191120 lampsB is aligned and scored (exit 1, its 3 orbs)",
+              p.returncode == 1 and "glow_blobs: aligned" in p.stdout and "unmatched 3 of" in p.stdout,
+              f"exit {p.returncode}: {p.stdout.splitlines()[0] if p.stdout else p.stderr.strip()[-200:]}")
+        p = subprocess.run(me + ["--orig-spot", str(og_spot), "--still", "y270_p-30"], capture_output=True, text=True,
+                           timeout=180)
+        tally("main(): 142638 y270_p-30 against 000454 (7.8 cm, 3.83 deg) is refused, NOT MEASURED",
+              p.returncode == 2 and "beyond the align limits" in p.stdout,
+              f"exit {p.returncode}: {p.stdout.strip()[:200]}")
     except (OSError, SystemExit) as e:
         tally("real-picture cases", False, f"data missing ({e})")
     print("self-test:", "all passed" if not fails else f"FAILED {fails}")
@@ -622,7 +947,26 @@ def main():
     ap.add_argument("--dimmed", help="window name of the changed Remix step (fourth count only)")
     ap.add_argument("--again", help="window name of the Remix step with the change undone")
     a = ap.parse_args()
-    pose, hud = a.pose, None
+    pose, hud, al = a.pose, None, None
+
+    def place(orig, opose, rpose, hud):
+        """Rule 11 for a spot pair: None when pose_ok passes, the alignment when align_ok passes and both proxy logs
+        give the projection; otherwise NOT MEASURED, exit 2."""
+        ok, dist, dyaw, dpitch = pose_ok((rpose, opose))
+        if ok:
+            return None
+        projs = (spot_projection(a.orig_spot), spot_projection(a.remix_spot))
+        apart = f"{dist:.1f} cm, yaw {dyaw:.2f}, pitch {dpitch:.2f} deg"
+        if not align_ok((rpose, opose))[0] or None in projs:
+            why = "no single projection in a proxy.log" if align_ok((rpose, opose))[0] else (
+                f"beyond the align limits {POSE_CM:g} cm, yaw {ALIGN_YAW_DEG:g}, pitch {ALIGN_PITCH_DEG:g} deg")
+            print(f"glow_blobs: NOT MEASURED, the original's pose differs from Remix's by {apart} ({why})")
+            sys.exit(2)
+        o2, skip, strip, uv = align(orig, opose, projs[0], rpose, projs[1], hud)
+        print(f"glow_blobs: aligned the original into the Remix camera ({apart}; {strip} px the turn exposes are "
+              f"skipped; each count takes the better of the turned and the unmoved original)")
+        return o2, skip, uv
+
     if a.dimmed:
         if not (a.remix_spot and a.orig_spot and a.still and a.again):
             ap.error("--dimmed needs --remix-spot, --orig-spot, --still and --again")
@@ -630,30 +974,39 @@ def main():
         orig, opose = spot_still(a.orig_spot, a.orig_still or a.still)
         changed, cpose = spot_still(a.remix_spot, a.dimmed)
         again, apose = spot_still(a.remix_spot, a.again)
-        for name, p in (("original", opose), ("changed", cpose), ("on_again", apose)):
+        for name, p in (("changed", cpose), ("on_again", apose)):
             ok, dist, dyaw, dpitch = pose_ok((rpose, p))
             if not ok:
                 print(f"glow_blobs: NOT MEASURED, {name} pose differs from on by {dist:.0f} cm, yaw {dyaw:.2f}, "
                       f"pitch {dpitch:.2f} deg")
                 sys.exit(2)
-        rows, _ = dimmed_lamps(orig, on, changed, again, spot_hud(a.orig_spot))
-        sys.exit(0 if report_dimmed(rows) else 1)
+        hud = spot_hud(a.orig_spot)
+        al = place(orig, opose, rpose, hud)
+        rows, _ = (dimmed_lamps(orig, on, changed, again, hud) if al is None
+                   else dimmed_lamps_aligned(orig, on, changed, again, hud, al))
+        ok = report_dimmed(rows)
+        report_dimmed_areas(dimmed_areas(orig if al is None else al[0], on, changed, again,
+                                         hud if al is None else al[1]))
+        sys.exit(0 if ok else 1)
     if a.remix_spot and a.orig_spot and a.still:
         remix, rpose = spot_still(a.remix_spot, a.still)
         orig, opose = spot_still(a.orig_spot, a.orig_still or a.still)
-        pose, hud = (rpose, opose), spot_hud(a.orig_spot)
+        hud = spot_hud(a.orig_spot)
+        al = place(orig, opose, rpose, hud)
     elif a.remix and a.orig:
         remix, orig = still(a.remix), still(a.orig)
+        if pose is not None:
+            ok, dist, dyaw, dpitch = pose_ok(pose)
+            if not ok:
+                print(f"glow_blobs: NOT MEASURED, poses differ by {dist:.0f} cm, yaw {dyaw:.2f}, pitch {dpitch:.2f} deg"
+                      " (files carry no projection, so no alignment)")
+                sys.exit(2)
     else:
         ap.error("give --remix and --orig, or --remix-spot, --orig-spot and --still")
-    if pose is not None:
-        ok, dist, dyaw, dpitch = pose_ok(pose)
-        if not ok:
-            print(f"glow_blobs: NOT MEASURED, poses differ by {dist:.0f} cm, yaw {dyaw:.2f}, pitch {dpitch:.2f} deg")
-            sys.exit(2)
-    ok, _ = check_all(remix, orig, hud)
+    ok, _ = check_all(remix, orig, hud, al=al)
     if a.crops:
-        for p in crops(judge(remix, orig, hud)[0], remix, orig, a.crops):
+        o, h = (orig, hud) if al is None else al[:2]
+        for p in crops(judge(remix, o, h)[0], remix, o, a.crops):
             print(f"crop {p}")
     sys.exit(0 if ok else 1)
 
