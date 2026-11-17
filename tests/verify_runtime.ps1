@@ -606,11 +606,19 @@ function Set-ProxyKeys($text, $keys) {
 # -IniKeys "Section.Key=Value" (coordinator, Nov 17: the FlareStandIns=0 Remix run at four spots): set in this run's
 # proxy ini for every spot of the launch and recorded in manifest iniKeys; both ini copies are written back from the
 # backups at the end like every run's ini. Section names hold letters only, so "RemixConfig.rtx.a.b=1" is key rtx.a.b.
+# One object per argument: launch 20261117-183718 kept each as a 3-item array, PowerShell unrolled the only one into
+# its three strings, and each string was then split into letters, so the ini got "[L] i=g", "[F] l=a", "[0] =" and
+# no FlareStandIns=0 (proxy.log: "flare stand-ins 1"); the read-back passed on the letters.
 function ConvertFrom-IniKeyArg([string[]]$items) {
-    @(foreach ($s in $items) {
+    foreach ($s in $items) {
         if ($s -notmatch '^([A-Za-z]+)\.([^=\s]+)=([^\r\n]*)$') { throw "-IniKeys '$s' is not Section.Key=Value" }
-        , @($Matches[1], $Matches[2], $Matches[3])
-    })
+        [pscustomobject]@{ Section = $Matches[1]; Key = $Matches[2]; Value = $Matches[3] }
+    }
+}
+# The -IniKeys arguments set in an ini text, each read back by Set-IniKey.
+function Set-IniKeys([string]$text, [string[]]$args_) {
+    foreach ($i in @(ConvertFrom-IniKeyArg $args_)) { $text = Set-IniKey $text $i.Section $i.Key $i.Value }
+    $text
 }
 # The value of key in [section] of an ini text, $null when absent (the proxy reads a key only inside its own section).
 function Get-IniKey([string]$text, [string]$section, [string]$key) {
@@ -731,7 +739,7 @@ $suiteRec = Get-SuiteRecord $SuiteRecord ([ordered]@{ toolsCommit = (git -C (Spl
     runtimeSha256 = $runtimeHash; toolsModified = $testsModified })
 $suite = [ordered]@{ note = $SuiteNote; record = $suiteRec; testsCommit = (git -C (Split-Path $Tests) rev-parse --short HEAD 2>$null)
                      testsModified = $testsModified }
-$iniItems = ConvertFrom-IniKeyArg $IniKeys
+$iniItems = @(ConvertFrom-IniKeyArg $IniKeys)
 @{ spots = @($selected | ForEach-Object name); started = $Stamp; noRemix = [bool]$NoRemix; build = $build; offlineSuite = $suite
    variants = @(if ($sweep) { $runs | ForEach-Object dir }); iniKeys = @($IniKeys) } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $runDir 'manifest.json')
 Write-Step "Builds: dxvk-remix installed $remixCommit (source checkout $remixSourceCommit), proxy $($build.proxySha256.Substring(0, 12))"
@@ -768,8 +776,10 @@ try {
            restore = 'both ini copies are written back from the backups taken at the start; see restored below' } |
             ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDir 'reference.json')
     }
-    foreach ($i in $iniItems) { $gateIni = Set-IniKey $gateIni $i[0] $i[1] $i[2] }
-    if ($iniItems.Count) { Write-Step "ini keys for the whole launch: $($IniKeys -join ', ')" }
+    $gateIni = Set-IniKeys $gateIni $IniKeys
+    if ($iniItems.Count) {
+        Write-Step "ini keys for the whole launch, read back: $(($iniItems | ForEach-Object { "[$($_.Section)] $($_.Key)=$(Get-IniKey $gateIni $_.Section $_.Key)" }) -join ', ')"
+    }
     $gateIni = Add-RunMarker $gateIni $runDir
     [IO.File]::WriteAllText($setupIniPath, $gateIni)
     if (-not $SkipInstall) {

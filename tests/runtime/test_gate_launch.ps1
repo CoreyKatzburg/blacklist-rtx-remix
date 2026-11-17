@@ -319,7 +319,7 @@ $p = Select-Previous $oldRun ''
 Check 'run without a display record: no previous run, NOT COMPARABLE' (-not $p.prev -and $p.note -like '*NOT COMPARABLE: display state unknown*')
 # -IniKeys (coordinator, Nov 17: the FlareStandIns=0 run at four spots): a run made with launch-wide ini keys is the
 # previous run only of a run with the same keys, so a normal run never takes its FPS from it, nor it from a normal one.
-foreach ($n in 'ConvertFrom-IniKeyArg', 'Get-IniKey', 'Set-IniKey') {
+foreach ($n in 'ConvertFrom-IniKeyArg', 'Get-IniKey', 'Set-IniKey', 'Set-IniKeys') {
     $f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true) | Select-Object -First 1
     if (-not $f) { throw "missing $n" }
     . ([scriptblock]::Create($f.Extent.Text))
@@ -351,8 +351,23 @@ $t2 = Set-IniKey "[Lights]`r`nEnable=1`r`nFlareStandIns=1`r`n[Proxy]`r`nFlareSta
 Check 'ini keys: an existing [Lights] key is replaced in place, the next section untouched' (
     $t2 -eq "[Lights]`r`nEnable=1`r`nFlareStandIns=0`r`n[Proxy]`r`nFlareStandIns=1`r`n")
 $items = ConvertFrom-IniKeyArg @('Lights.FlareStandIns=0', 'RemixConfig.rtx.volumetrics.enable=False')
-Check 'ini keys: arguments split into section, key, value' ((($items | ForEach-Object { $_ -join '|' }) -join ';') -eq
+Check 'ini keys: arguments split into section, key, value' ((($items | ForEach-Object { "$($_.Section)|$($_.Key)|$($_.Value)" }) -join ';') -eq
     'Lights|FlareStandIns|0;RemixConfig|rtx.volumetrics.enable|False')
+# Launch 20261117-183718: one key alone (the launch's own case) was unrolled into its three strings and written as
+# "[L] i=g", "[F] l=a", "[0] =" with no FlareStandIns. Set-IniKeys is the launch's path; the old code must fail here.
+$one = Set-IniKeys $setup @('Lights.FlareStandIns=0')
+Check 'ini keys: one key alone sets [Lights] FlareStandIns=0 and adds no other section' (
+    (Get-IniKey $one 'Lights' 'FlareStandIns') -eq '0' -and
+    @([regex]::Matches($one, '(?m)^\[([^\]]*)\]') | ForEach-Object { $_.Groups[1].Value }) -join ',' -eq 'Proxy,Lights')
+function OldIniKeyArg([string[]]$items) {   # verify_runtime before this fix, word for word
+    @(foreach ($s in $items) {
+        if ($s -notmatch '^([A-Za-z]+)\.([^=\s]+)=([^\r\n]*)$') { throw "-IniKeys '$s' is not Section.Key=Value" }
+        , @($Matches[1], $Matches[2], $Matches[3])
+    })
+}
+$old = $setup; foreach ($i in (OldIniKeyArg @('Lights.FlareStandIns=0'))) { $old = Set-IniKey $old $i[0] $i[1] $i[2] }
+Check 'ini keys: old code, case fails: one key alone writes [L] i=g and no FlareStandIns' (
+    $null -eq (Get-IniKey $old 'Lights' 'FlareStandIns') -and (Get-IniKey $old 'L' 'i') -eq 'g')
 $badArg = $false
 try { $null = ConvertFrom-IniKeyArg @('FlareStandIns=0') } catch { $badArg = $_.Exception.Message -like "*is not Section.Key=Value" }
 Check 'ini keys: an argument without a section is refused' $badArg
