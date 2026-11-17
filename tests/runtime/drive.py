@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import blmem  # noqa: E402
 import gate  # noqa: E402  (file helpers)
 import display  # noqa: E402  (display power state)
+import monitors  # noqa: E402  (which monitors Windows sees; DDC/CI power for the monitor test)
 
 FFMPEG = r"d:\ffmpeg\bin\ffmpeg.exe"
 CAP_W, CAP_H = 320, 180
@@ -186,6 +187,19 @@ def front(hwnd: int) -> bool:
     user32.SetForegroundWindow(ctypes.c_void_p(hwnd)); user32.AttachThreadInput(me, a, False)
     time.sleep(0.3)
     return user32.GetForegroundWindow() == hwnd
+
+
+# Live-step "monitorStep" values (worker C's monitor test, Nov 16), scored by tests\analysis\monitor_steps.py.
+MONITOR_STEPS = ("both_on", "second_off", "both_off", "both_on_again")
+
+
+def monitor_named(mons: list[dict], name: str) -> dict:
+    return next((m for m in mons if m.get("name") == name), {})
+
+
+def monitor_is(m: dict, want: str) -> bool:
+    """'attached' = the card sees it and it has an active path; 'detached' = the card does not see it."""
+    return bool(m.get("available") and m.get("active")) if want == "attached" else not m.get("available")
 
 
 SCAN = {"F9": 0x43, "F10": 0x44, "F11": 0x57, "F12": 0x58, "F": 0x21, "G": 0x22, "N": 0x31, "X": 0x2D, "SPACE": 0x39,
@@ -1284,6 +1298,10 @@ class Spot:
             self.move("to_live", 0.0, 0.0, 1.0)
             seconds = float(cfg.get("liveStepSeconds", 60))
             slept = False
+            bad = [k["monitorStep"] for k in cfg["liveSteps"] if k.get("monitorStep", MONITOR_STEPS[0]) not in MONITOR_STEPS]
+            if bad:
+                raise ValueError(f"monitorStep {bad[0]!r} is not one of {MONITOR_STEPS}")
+            mon: dict = {}   # monitor test state: layout before, whether the second monitor is still off
             try:
                 for i, keys in enumerate(cfg["liveSteps"]):
                     # "display": "awake" / "asleep" (coordinator, Nov 16: idle GPU power follows the display state): the
@@ -1298,8 +1316,12 @@ class Spot:
                     if load not in (None, "none", "capture", "sampler"):
                         raise ValueError(f"live step {i + 1}: benchLoad {load!r} is not none, capture or sampler")
                     step_seconds = float(keys.pop("seconds", seconds))
+                    mstep = keys.pop("monitorStep", None)
                     for k, v in keys.items():
                         set_ini(self.ini, "RemixConfig", k, str(v))
+                    if mstep:
+                        self.monitor_step(f"live_step{i + 1}", mstep, step_seconds, cfg, mon, liveRtx=keys)
+                        continue
                     shown = display.wake() if want == "awake" else display.sleep() if want == "asleep" else None
                     slept = slept or want == "asleep"
                     tag = f"live_step{i + 1}"
@@ -1335,6 +1357,8 @@ class Spot:
             finally:
                 if slept:
                     display.wake()
+                if mon:
+                    self.monitors_back(cfg, mon)
         # cfg["lightSwitch"] (worker B, Nov 16, fog fade sweep at con_custodial): after the lit-room bench window, the
         # light switch with its light dumps, so each variant launch also measures the fade (frames/light_switch.gray).
         if cfg.get("lightSwitch"):
@@ -1366,6 +1390,136 @@ class Spot:
             self.spot = {**self.spot, "switches": cfg["switches"]}
             self.switch_test()
         return extra
+
+    def monitor_snapshot(self, pnp: bool = True) -> dict:
+        pid = getattr(getattr(self, "a", None), "pid", None)
+        return monitors.snapshot(pid, pnp=pnp)
+
+    def wait_monitors(self, names: list[str], want: str, seconds: float, poll: float, also=None) -> float | None:
+        """Polls until every named monitor reads `want` ('attached' / 'detached') and also() holds; seconds taken,
+        or None after `seconds`."""
+        t0 = time.monotonic()
+        while True:
+            mons = monitors.monitors(pnp=False)[0]
+            if all(monitor_is(monitor_named(mons, n), want) for n in names) and (also is None or also()):
+                return round(time.monotonic() - t0, 1)
+            if time.monotonic() - t0 >= seconds:
+                return None
+            self.hold(poll)
+
+    def second_back(self, name: str, poll: float, seconds: float = 90.0) -> dict:
+        """DDC/CI VCP 0xD6=1 on the second monitor through the handle kept from before it went off (as
+        monitor_proof.py), one more write if it is not attached within `seconds`."""
+        rec = {"onAck": monitors.ddc_power(name, monitors.DDC_ON)}
+        rec["onAfterS"] = self.wait_monitors([name], "attached", seconds, poll)
+        if rec["onAfterS"] is None:
+            rec["onAck2"] = monitors.ddc_power(name, monitors.DDC_ON)
+            rec["onAfterS2"] = self.wait_monitors([name], "attached", seconds, poll)
+        rec["back"] = rec["onAfterS"] is not None or rec.get("onAfterS2") is not None
+        return rec
+
+    def monitor_step(self, tag: str, step: str, seconds: float, cfg: dict, mon: dict, **extra) -> dict:
+        """One live step of the monitor test (worker C, Nov 16; scored by tests\\analysis\\monitor_steps.py), holding the
+        pose with no input. The window records w["monitors"], w["monitorsRaw"] and w["gameWindow"] at its start (after
+        the switch) and end, as monitors.py reads them, and the wall clock of both.
+          both_on        as found, displays woken; opens the DDC/CI handles while both monitors are attached
+          second_off     DDC/CI power off of the second monitor (monitor_proof.py's method); put back on after the hold
+          both_off       Corey switches both off together; the step runs from the first poll that reads both detached
+                         to the last one, and is recorded with "skipped" (no telemetry) when they do not both detach
+                         within monitorWaitSeconds
+          both_on_again  starts once both read attached and the display state is on (the gate's check)
+        The second monitor is put back by bench's finally (monitors_back) whatever fails."""
+        names = list(cfg.get("monitors", monitors.KNOWN))
+        second = cfg.get("secondMonitor", "ACI27A8")
+        wait = float(cfg.get("monitorWaitSeconds", 600))
+        poll = float(cfg.get("monitorPollSeconds", 1.0))
+        pid = getattr(getattr(self, "a", None), "pid", None)
+        if "layoutBefore" not in mon:
+            mon["layoutBefore"] = monitors.layout()
+        rec: dict = {"monitorStep": step, **extra}
+        if step == "both_on":
+            rec["monitorMethod"] = "none: both monitors as found, displays woken"
+            rec["wake"] = display.wake()
+            monitors.ddc_open()
+        elif step == "second_off":
+            rec["monitorMethod"] = f"DDC/CI VCP 0xD6=5 on {second} through a handle opened while attached"
+            mon["secondOff"] = second
+            rec["offAck"] = monitors.ddc_power(second, monitors.DDC_OFF)
+            rec["offAfterS"] = self.wait_monitors([second], "detached", 30.0, poll)
+        elif step == "both_off":
+            rec["monitorMethod"] = "Corey switches both monitors off together (remote power); the driver only waits"
+            print(f"{tag}: both_off waiting up to {wait:.0f} s for Corey to switch both monitors off", flush=True)
+            rec["detachedAfterS"] = self.wait_monitors(names, "detached", wait, poll)
+            if rec["detachedAfterS"] is None:
+                rec["skipped"] = f"monitors did not both read detached within {wait:.0f} s"
+                w = {"name": tag, "kind": "still", "yaw": self.yaw, "pitch": self.pitch, **rec}
+                self.windows.append(w)
+                if getattr(self, "save_partial", None):
+                    self.save_partial()
+                print(f"{tag}: both_off skipped: {rec['skipped']}", flush=True)
+                return w
+        else:
+            rec["monitorMethod"] = "Corey switches both monitors back on; the driver waits for both attached and display on"
+            rec["attachedAfterS"] = self.wait_monitors(names, "attached", wait, poll, also=lambda: display.state() == "on")
+        if step != "both_off":
+            hwnd = game_window(pid) if pid else 0
+            rec["front"] = front(hwnd) if hwnd else None
+        snaps, clocks = {"start": self.monitor_snapshot()}, [clock()]
+        if step == "both_off":
+            c0 = self.counters()
+            last = (c0, snaps["start"], clocks[0])
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < wait:
+                self.hold(poll)
+                s = self.monitor_snapshot(pnp=False)
+                if not all(monitor_is(monitor_named(s["monitors"], n), "detached") for n in names):
+                    rec["firstBack"] = {"time": s["time"], "monitors": s["monitors"]}
+                    break
+                last = (self.counters(), s, clock())
+            c1, snaps["end"], c1clock = last
+            clocks.append(c1clock)
+            w = {"name": tag, "kind": "still", "yaw": self.yaw, "pitch": self.pitch,
+                 "telemetry": [c0["telemetry"], c1["telemetry"]], "proxy": [c0["proxy"], c1["proxy"]], **rec}
+            self.windows.append(w)
+        else:
+            # Both snapshots sit outside the window's frame range: the Get-PnpDevice list starts a PowerShell process.
+            w = self.window(tag, "still", lambda: self.hold(seconds), **rec)
+            snaps["end"] = self.monitor_snapshot()
+            clocks.append(clock())
+        w["monitors"] = {k: v["monitors"] for k, v in snaps.items()}
+        w["monitorsRaw"] = {k: v["raw"] for k, v in snaps.items()}
+        w["gameWindow"] = {k: v["gameWindow"] for k, v in snaps.items()}
+        w["clock"] = clocks
+        if step == "second_off":
+            w["secondBack"] = self.second_back(second, poll, float(cfg.get("monitorBackSeconds", 90)))
+            if w["secondBack"]["back"]:
+                mon.pop("secondOff", None)
+        if getattr(self, "save_partial", None):
+            self.save_partial()
+        print(f"{tag}: {step} monitors at start {[(m['name'], m['available'], m['active']) for m in w['monitors']['start']]}, "
+              f"at end {[(m['name'], m['available'], m['active']) for m in w['monitors']['end']]}, game window "
+              f"{w['gameWindow']['start']} / {w['gameWindow']['end']}", flush=True)
+        return w
+
+    def monitors_back(self, cfg: dict, mon: dict) -> None:
+        """After the monitor steps, also when one failed: the second monitor back on if the driver switched it off
+        and it has not come back, the displays woken, and the layout before and after in monitor_layout.json."""
+        poll = float(cfg.get("monitorPollSeconds", 1.0))
+        rec: dict = {"layoutBefore": mon.get("layoutBefore")}
+        if mon.get("secondOff"):
+            try:
+                rec["secondBack"] = self.second_back(mon["secondOff"], poll, float(cfg.get("monitorBackSeconds", 90)))
+            except Exception as e:   # noqa: BLE001  (recorded; the layout is still written)
+                rec["secondBack"] = {"error": f"{type(e).__name__}: {e}", "back": False}
+            if rec["secondBack"].get("back"):
+                mon.pop("secondOff", None)
+        rec["wake"] = display.wake()
+        rec["layoutAfter"] = monitors.layout()
+        rec["sameLayout"] = rec["layoutAfter"] == rec["layoutBefore"]
+        if getattr(self, "out", None):
+            gate.save_json(os.path.join(self.out, "monitor_layout.json"), rec)
+        print(f"MONITORS after the monitor steps: second put back {rec.get('secondBack', 'not needed')}, "
+              f"same layout {rec['sameLayout']}", flush=True)
 
     def bench_window(self, name: str, want: int, tag: str, smi_file: str) -> dict:
         """One still window of at least `want` game frames with nvidia-smi sampling into `smi_file`."""

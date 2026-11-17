@@ -639,6 +639,182 @@ class Reference(unittest.TestCase):
             self.assertEqual([c for c in calls if c in ("wake", "sleep") or c == ("hold", 45.0)],
                              ["wake", ("hold", 45.0), "sleep", ("hold", 45.0)] * 2 + ["wake", ("hold", 45.0), "wake"])
 
+    def monitor_launch(self, tmp, corey=(3, 33), fail_in=None, minimized_without_monitor=False, second_ignores_on=0):
+        """Runs bench liveSteps both_on, second_off, both_off, both_on_again against fake monitors. Each hold advances
+        25 telemetry frames per second held (25 for a poll). corey = (polls after the second monitor is back at which
+        both detach, at which both come back); None = Corey never switches. Returns (spot, ddc writes, fake)."""
+        import os
+        s = drive.Spot.__new__(drive.Spot)
+        s.ini, s.out, s.windows = "x.ini", tmp, []
+        s.a = type("A", (), {"pid": 1234})()
+        s.move = lambda *a: None
+        s.bench_window = lambda *a: None
+        s.dump = lambda tag: None
+        s.yaw = s.pitch = 0.0
+        fake = {"frame": 1000, "state": {"HKC2731": "attached", "ACI27A8": "attached"}, "armed": None, "polls": 0,
+                "minimized": False, "ons": 0}
+        ddc = []
+        s.counters = lambda: {"telemetry": fake["frame"], "proxy": fake["frame"]}
+
+        def hold(seconds, until=None):
+            if fail_in and fake.get("step") == fail_in and not fake.get("failed"):
+                fake["failed"] = True
+                raise RuntimeError("game gone")
+            fake["frame"] += int(max(seconds, 1.0) * 25)
+        s.hold = hold
+
+        def tick():
+            fake["polls"] += 1
+            if fake["armed"] is not None and corey is not None:
+                n = fake["polls"] - fake["armed"]
+                if n == corey[0]:
+                    fake["state"] = {k: "detached" for k in fake["state"]}
+                    fake["minimized"] = minimized_without_monitor
+                elif n == corey[1]:   # back attached, but the display state reads off for 3 more reads
+                    fake["state"] = {k: "attached" for k in fake["state"]}
+                    fake["dark"] = 3
+
+        def mons():
+            tick()
+            return [{"name": n, "primary": n == "HKC2731" and st == "attached", "available": st == "attached",
+                     "active": st == "attached", "power": "off" if fake.get("dark") else "on"} for n, st in sorted(fake["state"].items())]
+
+        def power(name, value):
+            ddc.append((name, value))
+            if value == drive.monitors.DDC_OFF:
+                fake["state"][name] = "detached"
+            elif fake["ons"] < second_ignores_on:
+                fake["ons"] += 1
+            else:
+                fake["state"][name] = "attached"
+                fake["armed"] = fake["polls"]   # Corey's switch is counted from when both are back on
+            return True
+
+        def snapshot(pid=None, known=None, pnp=True):
+            m = mons()
+            return {"time": "t", "monitors": m, "raw": {"pnp": pnp, "frame": fake["frame"]}, "layout": [x["name"] for x in m if x["active"]],
+                    "gameWindow": {"minimized": fake["minimized"], "foreground": not fake["minimized"], "rect": [1, 1]}}
+
+        def front(hwnd):
+            fake["minimized"] = False
+            return True
+
+        def state():
+            if fake.get("dark"):
+                fake["dark"] -= 1
+                return "off"
+            return "on"
+        steps = [{"monitorStep": m} for m in drive.MONITOR_STEPS]
+        orig_step = drive.Spot.monitor_step
+
+        def step(self_, tag, name, *a, **k):
+            fake["step"] = name
+            return orig_step(self_, tag, name, *a, **k)
+        with mock.patch.object(drive.monitors, "monitors", lambda known=None, pnp=True: (mons(), {})), \
+                mock.patch.object(drive.monitors, "snapshot", snapshot), \
+                mock.patch.object(drive.monitors, "layout", lambda: [n for n, st in sorted(fake["state"].items())
+                                                                      if st == "attached"]), \
+                mock.patch.object(drive.monitors, "ddc_power", power), \
+                mock.patch.object(drive.monitors, "ddc_open", lambda: {}), \
+                mock.patch.object(drive.display, "wake", lambda: {"asked": "awake", "display": "on"}), \
+                mock.patch.object(drive.display, "state", state), \
+                mock.patch.object(drive, "game_window", lambda pid: 77), mock.patch.object(drive, "front", front), \
+                mock.patch.object(drive.Spot, "monitor_step", step), \
+                mock.patch.object(drive, "set_ini", lambda *a: self.fail("a monitor step wrote the ini")):
+            s.bench({"settle": 0, "frames": 1, "liveSteps": steps, "liveStepSeconds": 45, "monitorPollSeconds": 0, "monitorBackSeconds": 0.2,
+                     "monitorWaitSeconds": 5 if corey else 0.2})
+        self.assertTrue(os.path.exists(os.path.join(tmp, "monitor_layout.json")))
+        return s, ddc, fake
+
+    def score_monitor_launch(self, s, gpu):
+        """Writes the spot folder the launch would leave (spot.json from the driver's own windows, telemetry.jsonl
+        with gpu[step] ms on every frame of each step's range) and scores it with monitor_steps.py."""
+        import json, os, sys, tempfile
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "analysis"))
+        import monitor_steps
+        with tempfile.TemporaryDirectory() as spot:
+            with open(os.path.join(spot, "spot.json"), "w") as f:
+                json.dump({"windows": s.windows}, f)
+            with open(os.path.join(spot, "telemetry.jsonl"), "w") as f:
+                for w in s.windows:
+                    if w.get("monitorStep") and w.get("telemetry"):
+                        a, b = w["telemetry"]
+                        for fr in range(a + 1, b + 1):
+                            f.write(json.dumps({"frame": fr, "qpcMs": fr * 40.0, "gpuTimeMs": gpu[w["monitorStep"]],
+                                                "rayTraced": True}) + "\n")
+            code, lines, v = monitor_steps.score(monitor_steps.steps_from(*monitor_steps.load_spot(spot)))
+        return code, lines, v
+
+    def test_monitor_steps_record_what_monitor_steps_py_scores_and_put_the_second_monitor_back(self):
+        # Worker C's monitor test (Nov 16): both_on, second_off (DDC/CI off of ACI27A8, put back after its hold),
+        # both_off (Corey switches both off; the step runs while both read detached), both_on_again (once both are
+        # attached and the display reads on). The driver's own windows, written as a spot folder, must score.
+        import tempfile
+        gpu = {"both_on": 38.7, "second_off": 38.6, "both_off": 35.8, "both_on_again": 38.6}
+        with tempfile.TemporaryDirectory() as tmp:
+            s, ddc, _ = self.monitor_launch(tmp)
+        live = [w for w in s.windows if w.get("monitorStep")]
+        self.assertEqual([w["monitorStep"] for w in live], list(drive.MONITOR_STEPS))
+        self.assertEqual(ddc, [("ACI27A8", 5), ("ACI27A8", 1)])
+        self.assertTrue(live[1]["secondBack"]["back"])
+        for w in live:
+            self.assertEqual(set(w["monitors"]), {"start", "end"})
+            self.assertEqual(set(w["gameWindow"]), {"start", "end"})
+            self.assertEqual(len(w["clock"]), 2)
+            self.assertGreater(w["monitorsRaw"]["end"]["frame"], w["monitorsRaw"]["start"]["frame"])   # after the hold
+        off = live[2]
+        self.assertEqual([m["available"] for m in off["monitors"]["start"] + off["monitors"]["end"]], [False] * 4)
+        # Corey's polls 3 (both detach) to 33 (both back): the start snapshot is poll 4, the range ends at the last
+        # detached poll (32), so 28 polls of 25 frames; the poll that saw them back is kept but not in the range.
+        self.assertEqual(off["telemetry"][1] - off["telemetry"][0], 28 * 25)
+        self.assertTrue(all(m["available"] for m in off["firstBack"]["monitors"]))
+        code, lines, v = self.score_monitor_launch(s, gpu)
+        self.assertEqual(code, 0, lines)
+        self.assertEqual((v["q1"][0], v["q2"][0]), ("DETACHED SAME AS ASLEEP", "SECOND MONITOR FREE"), lines)
+
+    def test_monitor_both_off_skipped_or_minimized_is_recorded_not_voided(self):
+        import tempfile
+        gpu = {"both_on": 38.7, "second_off": 38.6, "both_off": 35.8, "both_on_again": 38.6}
+        with tempfile.TemporaryDirectory() as tmp:
+            s, _, _ = self.monitor_launch(tmp, corey=None)
+        off = [w for w in s.windows if w.get("monitorStep") == "both_off"][0]
+        self.assertIn("skipped", off)
+        self.assertNotIn("telemetry", off)
+        self.assertEqual([w["monitorStep"] for w in s.windows if w.get("monitorStep")], list(drive.MONITOR_STEPS))
+        code, lines, v = self.score_monitor_launch(s, gpu)
+        self.assertEqual(code, 0, lines)
+        self.assertTrue(v["q1"][0].startswith("NOT ANSWERED (skipped"), lines)
+        # The game minimized with no monitor: recorded, both_on_again brings it to the front, Q1 not answered.
+        with tempfile.TemporaryDirectory() as tmp:
+            s, _, _ = self.monitor_launch(tmp, minimized_without_monitor=True)
+        code, lines, v = self.score_monitor_launch(s, gpu)
+        self.assertEqual(code, 0, lines)
+        self.assertTrue(v["q1"][0].startswith("NOT ANSWERED (game minimized"), lines)
+        self.assertTrue(any(l.startswith("FINDING") and "minimized" in l for l in lines), lines)
+
+    def test_monitor_second_comes_back_when_the_launch_fails_or_the_first_write_is_ignored(self):
+        import json, os, tempfile
+        for fail_in in ("second_off", "both_off"):
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaisesRegex(RuntimeError, "game gone"):
+                    self.monitor_launch(tmp, fail_in=fail_in)
+                with open(os.path.join(tmp, "monitor_layout.json")) as f:
+                    rec = json.load(f)
+            self.assertTrue(rec["sameLayout"], (fail_in, rec))
+            self.assertEqual("secondBack" in rec, fail_in == "second_off", (fail_in, rec))
+        with tempfile.TemporaryDirectory() as tmp:
+            s, ddc, _ = self.monitor_launch(tmp, second_ignores_on=1)
+        self.assertEqual(ddc, [("ACI27A8", 5), ("ACI27A8", 1), ("ACI27A8", 1)])
+        self.assertTrue([w for w in s.windows if w.get("monitorStep") == "second_off"][0]["secondBack"]["back"])
+        bare = drive.Spot.__new__(drive.Spot)   # an unknown step stops the launch before any monitor is touched
+        bare.ini, bare.windows, bare.yaw, bare.pitch = "x.ini", [], 0.0, 0.0
+        bare.move = bare.bench_window = bare.hold = lambda *a, **k: None
+        bare.dump = lambda tag: None
+        bare.counters = lambda: {"telemetry": 0, "proxy": 0}
+        with mock.patch.object(drive.monitors, "ddc_power", lambda *a: self.fail("a monitor was switched")), \
+                self.assertRaisesRegex(ValueError, "monitorStep 'all_off'"):
+            bare.bench({"settle": 0, "frames": 1, "liveSteps": [{"monitorStep": "both_on"}, {"monitorStep": "all_off"}]})
+
     def test_switch_poses_run_before_the_spot_switches_and_return_sam(self):
         # Worker B's must-stay lamp poses: the same on / off / on_again steps at two more poses in the probe launch,
         # Sam still within each; pose A's wall may push Sam, so its fallback is tried; a pose whose teleports all
