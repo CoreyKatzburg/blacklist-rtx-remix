@@ -21,7 +21,10 @@ attached and the displays on), whose numbers and the pass limits are fixed below
 Exit 0 = MATCH (frame gap and brightness both pass), 3 = DIFFER (either fails), 1 = NOT MEASURED (a both_off window
 was skipped, too short, or did not read both monitors detached at its start and end; or a file is missing),
 2 = bad input (the monitors-on folders no longer give the numbers above).
-Run: python -I monitors_off_score.py <monitors-off spot folder>   |   python -I monitors_off_score.py --self-test
+--plug-on <spot folder> (morning confirm, Nov 17): the same launch with Corey's monitors on again, live steps both_on.
+Same limits; it must read plug on with both monitors attached at each window's start and end. Exit 0 = BACK (frame gap
+and brightness inside), 3 = NOT BACK, 1 = NOT MEASURED, 2 = bad input.
+Run: python -I monitors_off_score.py [--plug-on] <spot folder>   |   python -I monitors_off_score.py --self-test
 """
 import json
 import os
@@ -97,6 +100,17 @@ def detached(snap: list[dict] | None) -> bool:
     return len(mine) == len(MONITORS) and all(not m.get("available") and not m.get("active") for m in mine)
 
 
+def attached(snap: list[dict] | None) -> bool:
+    mine = [m for m in snap or [] if m.get("name") in MONITORS]
+    return len(mine) == len(MONITORS) and all(m.get("available") and m.get("active") for m in mine)
+
+
+# --plug-on (coordinator, Nov 17 morning order (i)): the same con_custodial launch with Corey's monitors on again must
+# read plug on and sit inside the same limits, confirming the plug-on state (and its frame time) is back.
+MODES = {display_state.PLUG_OFF: ("both_off", detached, "detached", "MONITORS OFF", "MATCH", "DIFFER"),
+         display_state.PLUG_ON: ("both_on", attached, "attached", "PLUG ON CONFIRM", "BACK", "NOT BACK")}
+
+
 def others(snap: list[dict] | None) -> list[str]:
     return [m["name"] for m in snap or [] if m.get("name") not in MONITORS and (m.get("available") or m.get("active"))]
 
@@ -119,7 +133,8 @@ def check_on_runs(on_runs: list[str]) -> list[str]:
     return bad
 
 
-def score(off: str, on_runs: list[str] = ON_RUNS) -> tuple[int, list[str]]:
+def score(off: str, on_runs: list[str] = ON_RUNS, want: str = display_state.PLUG_OFF) -> tuple[int, list[str]]:
+    step_want, state_ok, state_word, title, yes, no = MODES[want]
     bad = check_on_runs(on_runs)
     if bad:
         return 2, [f"BAD INPUT: {b}" for b in bad]
@@ -136,10 +151,10 @@ def score(off: str, on_runs: list[str] = ON_RUNS) -> tuple[int, list[str]]:
     problems = []
     ds = display_state.launch_state(off)
     lines.append(f"display state before the launch: {ds['class']} ({ds['why']})")
-    if ds["class"] != display_state.PLUG_OFF:
-        problems.append(f"display state {ds['class']} before the launch, want plug off")
-    if not wins or any(w["monitorStep"] != "both_off" for w in wins):
-        problems.append(f"steps {[w['monitorStep'] for w in wins]}, want only both_off")
+    if ds["class"] != want:
+        problems.append(f"display state {ds['class']} before the launch, want {want}")
+    if not wins or any(w["monitorStep"] != step_want for w in wins):
+        problems.append(f"steps {[w['monitorStep'] for w in wins]}, want only {step_want}")
     results = []
     for w in wins:
         if w.get("skipped"):
@@ -148,8 +163,8 @@ def score(off: str, on_runs: list[str] = ON_RUNS) -> tuple[int, list[str]]:
         if (w.get("heldS") or 0) < MIN_HELD_S:
             problems.append(f"{w['name']} held {w.get('heldS')} s, under {MIN_HELD_S}")
         mons = w.get("monitors", {})
-        if not (detached(mons.get("start")) and detached(mons.get("end"))):
-            problems.append(f"{w['name']} monitors not both detached at start and end")
+        if not (state_ok(mons.get("start")) and state_ok(mons.get("end"))):
+            problems.append(f"{w['name']} monitors not both {state_word} at start and end")
         g, n = window_gap(gaps, w)
         results.append((w["name"], g, n))
         extra = sorted(set(others(mons.get("start")) + others(mons.get("end"))))
@@ -174,7 +189,7 @@ def score(off: str, on_runs: list[str] = ON_RUNS) -> tuple[int, list[str]]:
         lines.append(f"capture: {'PASS' if BAND[0] <= cr <= BAND[1] else 'FAIL'} ({cap}, ratio {cr:.4f}; decides only "
                      f"whether gdigrab captures taken with the monitors off count)")
     verdict = gap_ok and bright_ok
-    lines.append(f"MONITORS OFF: {'MATCH' if verdict else 'DIFFER'}")
+    lines.append(f"{title}: {yes if verdict else no}")
     return (0 if verdict else 3), lines
 
 
@@ -246,6 +261,19 @@ def self_test() -> int:
             ok = code == want and any(line in ln for ln in lines)
             fails += not ok
             print(f"{'ok  ' if ok else 'FAIL'} {name}: exit {code}" + ("" if ok else f" (want {want}); " + " | ".join(lines)))
+        on_cases = [  # --plug-on: the morning confirm run (both_on windows, monitors attached, machine reads plug on)
+            ("plug on, same as the monitors-on runs", {}, 0, "PLUG ON CONFIRM: BACK"),
+            ("plug on, frame gap at the plug-off 33.6 ms", {"gap_scale": 0.892}, 3, "PLUG ON CONFIRM: NOT BACK"),
+            ("plug on asked, machine_before reads plug off", {"machine": display_state.OFF_002048}, 1, "want plug on"),
+            ("plug on asked, monitors read detached", {"mon_avail": False}, 1, "monitors not both attached"),
+            ("plug on asked, both_off steps", {"steps": ("both_off", "both_off")}, 1, "want only both_on"),
+            ]
+        for i, (name, kw, want, line) in enumerate(on_cases):
+            args = dict({"steps": ("both_on", "both_on"), "mon_avail": True, "machine": display_state.ON_212703}, **kw)
+            code, lines = score(_fake(os.path.join(base, f"on{i}"), src, **args), want=display_state.PLUG_ON)
+            ok = code == want and any(line in ln for ln in lines)
+            fails += not ok
+            print(f"{'ok  ' if ok else 'FAIL'} {name}: exit {code}" + ("" if ok else f" (want {want}); " + " | ".join(lines)))
         # The monitors-on folders are checked against the fixed numbers: a changed one is bad input, not a verdict.
         moved = os.path.join(base, "moved", "20261116-225845-settings", "01_monitors")
         _fake(moved, src, steps=("both_on", "both_on_again"), mon_avail=True, gap_scale=0.95)
@@ -262,9 +290,11 @@ def self_test() -> int:
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-test"]:
         sys.exit(self_test())
-    if len(sys.argv) != 2:
+    a = sys.argv[1:]
+    plug_on = a[:1] == ["--plug-on"]
+    if len(a) != 1 + plug_on:
         print(__doc__)
         sys.exit(2)
-    code, out = score(sys.argv[1])
+    code, out = score(a[-1], want=display_state.PLUG_ON if plug_on else display_state.PLUG_OFF)
     print("\n".join(out))
     sys.exit(code)
