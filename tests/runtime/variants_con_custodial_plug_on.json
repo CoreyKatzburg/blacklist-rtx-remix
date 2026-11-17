@@ -1,0 +1,11 @@
+{
+ "about": "Plug-on confirm launch (coordinator, Nov 17 morning order (i)): after the monitors-off launch 20261117-002048 read DIFFER, the same con_custodial launch with Corey's monitors switched back on must show the plug-on state (and its frame time) is back, before any frame-time comparison resumes. Same spot, gate settings, bench and held y0_p0 as 20261116-222500, 20261116-225845 and 20261117-002048; the live steps are two both_on windows of 45 s (monitors as found, displays woken). No bench monitorsOff, so verify_runtime requires the displays awake and refuses the launch otherwise. gpu_engines.csv (GPU use per program) is recorded beside gpu_run.csv. Score: python -I tests\\\\analysis\\\\monitors_off_score.py --plug-on <spot folder> (limits fixed in it before the launch: frame gap 36.763 to 38.189 ms, brightness 0.988 to 1.012 of the monitors-on mean). Exit 0 BACK, 3 NOT BACK, 1 NOT MEASURED. Per-program GPU medians: python -I tests\\\\analysis\\\\monitor_stage_split.py.",
+ "spot": "con_custodial",
+ "bench": {"settle": 5, "frames": 150},
+ "variants": [
+  {"name": "01_plug_on",
+   "bench": {"liveSteps": [{"monitorStep": "both_on"}, {"monitorStep": "both_on"}],
+             "liveStepSeconds": 45, "secondMonitor": "ACI27A8", "monitors": ["HKC2731", "ACI27A8"],
+             "monitorWaitSeconds": 600, "monitorPollSeconds": 1.0}}
+ ]
+}
