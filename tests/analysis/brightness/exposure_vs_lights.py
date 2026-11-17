@@ -6,6 +6,7 @@ Modes:
   python exposure_vs_lights.py --self-test
   python exposure_vs_lights.py --run <gate_run_dir> [--run <gate_run_dir2> ...] --reference <ref_dir> [--reference <ref_dir2> ...]
   python exposure_vs_lights.py --score-sweep <settings_run_dir> --reference <ref_dir> [--reference <ref_dir2> ...]
+  python exposure_vs_lights.py --score-live <spot_or_sweep_dir> --reference <ref_dir> [--reference <ref_dir2> ...]
 
 Key metrics:
   - Across-stop log-log elasticity (`log2_elasticity_slope`): OLS slope `b` in
@@ -254,20 +255,175 @@ def analyze_spot_switches(spot_dir: str) -> dict[str, Any] | None:
     return evaluate_drift_gated_effects(base_luma, base_end_luma, variants)
 
 
+def _make_gate_stop_ok(run_dir: str, reference_dirs: list[str]):
+    """Builds gate._reference_stop_ok across run_dir and one or more reference_dirs.
+
+    Supports both full gate runs (spot.json + proxy_frames.csv present, using gate.reference_position)
+    and lightweight synthetic fixtures where neither run has proxy_frames.csv (falling back to angular
+    pose checks inside pfm_brightness).
+    """
+    run_spots: dict[str, dict[str, Any]] = {}
+    if os.path.isdir(run_dir):
+        for s in gate.load_spots(run_dir):
+            run_spots[os.path.normcase(os.path.abspath(s["_dir"]))] = s
+
+    ref_spots: dict[str, dict[str, Any]] = {}
+    for rdir in reference_dirs:
+        if os.path.isdir(rdir):
+            for r in gate.load_spots(rdir):
+                ref_spots[os.path.normcase(os.path.abspath(r["_dir"]))] = r
+
+    def ok(spot_dir: str, ref_spot_dir: str, tag: str) -> tuple[bool, str]:
+        s = run_spots.get(os.path.normcase(os.path.abspath(spot_dir)))
+        r = ref_spots.get(os.path.normcase(os.path.abspath(ref_spot_dir)))
+        if s is None or r is None:
+            s_proxy = os.path.isfile(os.path.join(spot_dir, "proxy_frames.csv"))
+            r_proxy = os.path.isfile(os.path.join(ref_spot_dir, "proxy_frames.csv"))
+            if not s_proxy and not r_proxy:
+                return True, f"{tag}: synthetic fixture without proxy_frames.csv"
+            return False, f"{tag}: spot not loaded for the reference position rule"
+        placed, why = gate.reference_position(s, tag, r, tag)
+        return bool(placed), why
+
+    return ok
+
+
+def extract_stop_exposure_telemetry(spot_dir: str) -> dict[str, dict[str, Any]]:
+    """Extracts per-window autoExposure, effectiveExposure, and rayTraced share from telemetry.jsonl."""
+    tel_path = os.path.join(spot_dir, "telemetry.jsonl")
+    spot_path = os.path.join(spot_dir, "spot.json")
+    if not (os.path.isfile(tel_path) and os.path.isfile(spot_path)):
+        return {}
+    tel, _ = gate.read_telemetry(tel_path)
+    if not tel:
+        return {}
+    spot = gate.load_json(spot_path)
+    out: dict[str, dict[str, Any]] = {}
+    for w in spot.get("windows", []):
+        wname = w.get("name")
+        if not wname or not w.get("telemetry"):
+            continue
+        rows = [tel[f] for f in gate.frames_in(w, "telemetry") if f in tel]
+        if not rows:
+            continue
+        rt_vals = [bool(r.get("rayTraced")) for r in rows]
+        rt_share = float(sum(rt_vals)) / len(rt_vals)
+        # Settle over second half of window when >= 10 frames so live transitions have adapted.
+        settled = rows[len(rows) // 2 :] if len(rows) >= 10 else rows
+        ae_vals = [
+            float(r["autoExposure"])
+            for r in settled
+            if r.get("autoExposure") is not None and math.isfinite(float(r["autoExposure"]))
+        ]
+        eff_vals = [
+            float(r["effectiveExposure"])
+            for r in settled
+            if r.get("effectiveExposure") is not None and math.isfinite(float(r["effectiveExposure"]))
+        ]
+        entry: dict[str, Any] = {
+            "n_frames": len(rows),
+            "ray_traced_share": rt_share,
+            "auto_exposure_median": float(np.median(ae_vals)) if ae_vals else None,
+            "effective_exposure_median": float(np.median(eff_vals)) if eff_vals else None,
+            "ceiling_clamped_share": (
+                float(np.mean([v >= 7.020 for v in ae_vals])) if ae_vals else None
+            ),
+        }
+        out[wname] = entry
+    return out
+
+
+def summarize_spot_exposure_telemetry(
+    on_pose_stops: list[dict[str, Any]],
+    stop_tel: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Summarizes Stage-1 autoExposure / effectiveExposure behavior across valid stops."""
+    if not stop_tel:
+        return None
+    orig_g: list[float] = []
+    pre_tm_ratios: list[float] = []
+    ae_list: list[float] = []
+    eff_list: list[float] = []
+    clamp_shares: list[float] = []
+    for s in on_pose_stops:
+        tag = s.get("tag")
+        t = stop_tel.get(tag or "")
+        if not t or t.get("effective_exposure_median") is None:
+            continue
+        vr = s.get("vs_raster") or {}
+        rg = vr.get("raster_gamma_mean")
+        lin_ratio = vr.get("linear_mean_ratio")
+        eff = float(t["effective_exposure_median"])
+        ae = float(t["auto_exposure_median"]) if t.get("auto_exposure_median") is not None else eff
+        if rg is None or rg < PASS_THRESHOLDS["min_raster_luma_for_ratio"] or eff <= 1e-6:
+            continue
+        orig_g.append(float(rg))
+        if lin_ratio is not None and math.isfinite(float(lin_ratio)):
+            pre_tm_ratios.append(float(lin_ratio) / eff)
+        ae_list.append(ae)
+        eff_list.append(eff)
+        if t.get("ceiling_clamped_share") is not None:
+            clamp_shares.append(float(t["ceiling_clamped_share"]))
+
+    if not eff_list:
+        return None
+
+    ae_arr = np.asarray(ae_list, dtype=np.float64)
+    eff_arr = np.asarray(eff_list, dtype=np.float64)
+    og_arr = np.asarray(orig_g, dtype=np.float64)
+    slope: float | None = None
+    if eff_arr.size >= 3 and float(np.std(np.log2(og_arr))) >= 0.05:
+        if float(np.std(np.log2(eff_arr))) < 1e-5:
+            slope = 0.0
+        else:
+            slope = float(np.polyfit(np.log2(og_arr), np.log2(eff_arr), 1)[0])
+
+    clamp_mean = float(np.mean(clamp_shares)) if clamp_shares else 0.0
+    if clamp_mean >= 0.90 and (slope is None or abs(slope) < 0.05):
+        regime = "clamped_at_ceiling"
+    elif slope is not None and slope <= -0.25:
+        regime = "active_inverse_gain"
+    else:
+        regime = "partial_or_flat"
+
+    pre_tm_ratio: float | None = (
+        float(np.median(np.asarray(pre_tm_ratios, dtype=np.float64))) if pre_tm_ratios else None
+    )
+
+    return {
+        "n_stops_with_telemetry": int(eff_arr.size),
+        "exposure_telemetry_regime": regime,
+        "auto_exposure_min": float(ae_arr.min()),
+        "auto_exposure_median": float(np.median(ae_arr)),
+        "auto_exposure_max": float(ae_arr.max()),
+        "effective_exposure_min": float(eff_arr.min()),
+        "effective_exposure_median": float(np.median(eff_arr)),
+        "effective_exposure_max": float(eff_arr.max()),
+        "ceiling_clamped_stop_share": clamp_mean,
+        "log2_eff_exp_vs_orig_slope": slope,
+        "normalized_pre_tonemap_radiance_ratio_median": pre_tm_ratio,
+    }
+
+
 def analyze_gate_runs(
     run_dirs: list[str],
     reference_dirs: list[str],
     max_pose_error_deg: float = PASS_THRESHOLDS["max_pose_error_deg"],
+    stop_ok=None,
 ) -> dict[str, Any]:
-    """Runs across-stop elasticity + drift-gated switch analysis across saved Remix gate runs."""
+    """Runs across-stop elasticity + exposure telemetry + drift-gated switch analysis on saved Remix gate runs."""
     spots_out: dict[str, Any] = {}
     pooled_rx: list[float] = []
     pooled_fx: list[float] = []
 
     for run_dir in run_dirs:
         run_name = os.path.basename(os.path.normpath(run_dir))
+        run_stop_ok = stop_ok if stop_ok is not None else _make_gate_stop_ok(run_dir, reference_dirs)
         summary = pb.summarize_gate_run(
-            run_dir, reference_dirs=reference_dirs, max_pose_error_deg=max_pose_error_deg
+            run_dir,
+            reference_dirs=reference_dirs,
+            max_pose_error_deg=max_pose_error_deg,
+            stop_ok=run_stop_ok,
         )
         for spot_name, sp in summary.get("spots", {}).items():
             key = f"{run_name}/{spot_name}" if spot_name in spots_out else spot_name
@@ -283,6 +439,7 @@ def analyze_gate_runs(
                     "n_on_pose": 0,
                     "off_pose_stops": [],
                     "elasticity": {"n_stops": 0, "diagnosis": "NOT_MEASURED", "reason": "not_ray_traced"},
+                    "exposure_telemetry": None,
                     "y0_p0": None,
                     "switch_drift_analysis": None,
                 }
@@ -300,7 +457,10 @@ def analyze_gate_runs(
             pooled_rx.extend(rx)
             pooled_fx.extend(fx)
 
+            stop_tel = extract_stop_exposure_telemetry(spot_dir)
+            exp_tel_summary = summarize_spot_exposure_telemetry(on_pose_pairs, stop_tel)
             y0_entry = next((s for s in sp.get("stops", []) if s.get("tag") == "y0_p0"), None)
+            y0_tel = stop_tel.get("y0_p0") or {}
             spots_out[key] = {
                 "run": run_name,
                 "spot": spot_name,
@@ -310,8 +470,10 @@ def analyze_gate_runs(
                 "n_on_pose": sp.get("n_on_pose", 0),
                 "off_pose_stops": sp.get("off_pose_stops", []),
                 "elasticity": fit_across_stop_elasticity(rx, fx),
+                "exposure_telemetry": exp_tel_summary,
                 "y0_p0": {
                     "on_pose": y0_entry.get("on_pose") if y0_entry else None,
+                    "placed": y0_entry.get("placed") if y0_entry else None,
                     "pose_error_deg": y0_entry.get("pose_error_deg") if y0_entry else None,
                     "final_gamma_mean": y0_entry.get("gamma_mean") if y0_entry else None,
                     "raster_gamma_mean": (
@@ -324,6 +486,8 @@ def analyze_gate_runs(
                         if (y0_entry and "vs_raster" in y0_entry)
                         else None
                     ),
+                    "auto_exposure_median": y0_tel.get("auto_exposure_median"),
+                    "effective_exposure_median": y0_tel.get("effective_exposure_median"),
                 },
                 "switch_drift_analysis": analyze_spot_switches(spot_dir),
             }
@@ -453,6 +617,11 @@ def score_variants_sweep(
                     break
     if not spot_name:
         raise ValueError(f"Could not determine spot name in {sweep_run_dir}")
+
+    if len(variant_names) == 1:
+        only_vdir = os.path.join(sweep_run_dir, variant_names[0])
+        if os.path.isfile(os.path.join(only_vdir, "gate", "live_step1_final.pfm")):
+            return score_live_steps(sweep_run_dir, reference_dirs, spot_override=spot_name, ref_tag=tag)
 
     raster_pfm, ref_pose_err, ref_err_reason = _find_on_pose_reference_pfm(spot_name, tag, reference_dirs)
     raster_img = gate.read_pfm(raster_pfm) if raster_pfm else None
@@ -634,10 +803,397 @@ def score_variants_sweep(
     }
 
 
+POSE_DEPTH_MAX_PIXELS = 0.05  # matches picture_cost.py POSE_MAX_PIXELS
+
+DEFAULT_LIVE_RTX = {
+    "rtx.autoExposure.enabled": "True",
+    "rtx.autoExposure.evMinValue": "-2.0",
+    "rtx.localtonemap.exposure": "0.75",
+    "rtx.localtonemap.shadows": "2.0",
+    "rtx.tonemappingMode": "1",
+    "rtx.tonemap.finalizeWithACES": "False",
+    "rtx.tonemap.exposureBias": "0.0",
+}
+
+
+def _describe_live_rtx(rtx_keys: dict[str, Any], stag: str) -> str:
+    diffs = []
+    for k, v in rtx_keys.items():
+        dflt = DEFAULT_LIVE_RTX.get(k)
+        if dflt is None or str(v).strip().lower() != str(dflt).strip().lower():
+            short_k = k.replace("rtx.autoExposure.", "ae.").replace("rtx.localtonemap.", "ltm.").replace("rtx.tonemap.", "tm.").replace("rtx.", "")
+            diffs.append(f"{short_k}={v}")
+    return "base" if not diffs else ",".join(diffs)
+
+
+def _pose_depth_diff_share(depth_a: np.ndarray | None, depth_b: np.ndarray | None) -> float | None:
+    """Share of pixels whose game depth differs by > 0.01, or None when either depth dump is absent."""
+    if depth_a is None or depth_b is None or depth_a.shape != depth_b.shape:
+        return None
+    return float((np.abs(depth_a - depth_b) > 0.01).mean())
+
+
+def _read_depth_pfm(gate_dir: str, tag: str) -> np.ndarray | None:
+    p = os.path.join(gate_dir, f"{tag}_gamedepth.pfm")
+    if not os.path.isfile(p):
+        return None
+    img = gate.read_pfm(p)
+    return img[:, :, 0] if img.ndim == 3 else img
+
+
+def _proxy_window_camera(spot_dir: str, window_names: tuple[str, ...]) -> np.ndarray | None:
+    """Median render camera [x, y, z, yaw, pitch] from proxy_frames.csv over the first matching window."""
+    spot_path = os.path.join(spot_dir, "spot.json")
+    proxy_path = os.path.join(spot_dir, "proxy_frames.csv")
+    if not (os.path.isfile(spot_path) and os.path.isfile(proxy_path)):
+        return None
+    spot = gate.load_json(spot_path)
+    target_w = next(
+        (w for w in spot.get("windows", []) if w.get("name") in window_names and w.get("proxy")),
+        None,
+    )
+    if not target_w:
+        return None
+    lo, hi = int(target_w["proxy"][0]), int(target_w["proxy"][1])
+    rows: list[list[float]] = []
+    with open(proxy_path, errors="replace") as f:
+        for line in f:
+            c = line.rstrip("\n").split(",")
+            if len(c) < 7 or not c[0].isdigit() or not c[6]:
+                continue
+            fr = int(c[0])
+            if not (lo <= fr <= hi):
+                continue
+            for pub in c[6].split("|"):
+                p = pub.split(":")
+                if len(p) >= 9 and p[2] == "0":
+                    rows.append([float(v) for v in p[3:9]])
+                    break
+    if not rows:
+        return None
+    m = np.median(np.asarray(rows, dtype=np.float64), axis=0)
+    return np.array(
+        [
+            m[0],
+            m[1],
+            m[2],
+            math.degrees(math.atan2(m[4], m[3])),
+            math.degrees(math.asin(float(np.clip(m[5], -1.0, 1.0)))),
+        ],
+        dtype=np.float64,
+    )
+
+
+def _check_variant_vs_reference_camera(
+    variant_dir: str,
+    ref_spot_dir: str,
+    win_names: tuple[str, ...] = ("live_step1", "bench_y0_p0", "y0_p0"),
+    ref_tag: str = "y0_p0",
+) -> tuple[bool, str | None]:
+    """Checks camera placement against reference when both sides have proxy_frames.csv + spot.json."""
+    cam_v = _proxy_window_camera(variant_dir, win_names)
+    cam_r = _proxy_window_camera(ref_spot_dir, (ref_tag, "y0_p0_after"))
+    if cam_v is None or cam_r is None:
+        return True, None
+    dc = float(np.linalg.norm(cam_v[:3] - cam_r[:3]))
+    dyaw = abs(gate.wrap(float(cam_v[3] - cam_r[3])))
+    dpitch = abs(float(cam_v[4] - cam_r[4]))
+    if dc <= gate.REF_CAM_UNITS and dyaw <= 1.5 and dpitch <= 1.0:
+        return True, None
+    return (
+        False,
+        f"reference_pose_mismatch (camera {dc:.2f}u, yaw {dyaw:.2f} deg, pitch {dpitch:.2f} deg)",
+    )
+
+
+def _expected_effective_exposure_ceiling(rtx_keys: dict[str, Any]) -> float | None:
+    """Closed-form effectiveExposure ceiling implied by liveRtx / variant rtx keys.
+
+    From auto_exposure.comp.slang:123-130 and rtx_context.cpp:3436-3437:
+      autoExposure <= 0.18 / max(0.001, (0.125 * 2^evMinValue) * 0.82) when enabled else 1.0
+      effectiveExposure = autoExposure * localtonemap.exposure (mode 1) or autoExposure * 2^exposureBias (mode 0)
+    """
+    ae_en = str(rtx_keys.get("rtx.autoExposure.enabled", "True")).strip().lower() != "false"
+    ev_min = float(rtx_keys.get("rtx.autoExposure.evMinValue", -2.0))
+    tm_mode = int(rtx_keys.get("rtx.tonemappingMode", 1))
+    ltm_exp = float(rtx_keys.get("rtx.localtonemap.exposure", 0.75))
+    tm_bias = float(rtx_keys.get("rtx.tonemap.exposureBias", 0.0))
+    if not ae_en:
+        max_ae = 1.0
+    else:
+        min_lum = 0.125 * (2.0 ** ev_min)
+        max_ae = 0.18 / max(0.001, min_lum * 0.82)
+    mult = ltm_exp if tm_mode == 1 else (2.0 ** tm_bias)
+    return float(max_ae * mult)
+
+
+def score_live_steps(
+    live_dir: str,
+    reference_dirs: list[str],
+    spot_override: str | None = None,
+    ref_tag: str = "y0_p0",
+) -> dict[str, Any]:
+    """Scores a single-launch `liveSteps` + `liveStepDump: true` spot/variant folder against reference."""
+    # Accept either the sweep root (<stamp>-settings containing 1 variant folder) or the variant folder itself.
+    vdir = live_dir
+    spot_name = spot_override
+    manifest_path = os.path.join(live_dir, "manifest.json")
+    if os.path.isfile(manifest_path) and not os.path.isfile(os.path.join(live_dir, "spot.json")):
+        manifest = json.load(open(manifest_path, encoding="utf-8"))
+        if not spot_name and manifest.get("spots"):
+            spot_name = manifest["spots"][0]
+        vlist = list(manifest.get("variants") or [])
+        if len(vlist) == 1 and os.path.isdir(os.path.join(live_dir, vlist[0])):
+            vdir = os.path.join(live_dir, vlist[0])
+    if not spot_name:
+        for cand_json in ("spot.json", "spot_config.json"):
+            p = os.path.join(vdir, cand_json)
+            if os.path.isfile(p):
+                spot_name = json.load(open(p, encoding="utf-8")).get("name")
+                if spot_name:
+                    break
+    if not spot_name:
+        raise ValueError(f"Could not determine spot name in {live_dir}")
+
+    spot_path = os.path.join(vdir, "spot.json")
+    if not os.path.isfile(spot_path):
+        raise ValueError(f"Missing spot.json in {vdir}")
+    spot = gate.load_json(spot_path)
+    live_wins = [
+        w
+        for w in spot.get("windows", [])
+        if str(w.get("name", "")).startswith("live_step")
+        and not str(w.get("name", "")).endswith("_dump")
+    ]
+    if len(live_wins) < 3:
+        raise ValueError(f"Need at least 3 live_step windows (base, variant..., base_end) in {spot_path}")
+
+    raster_pfm, ref_pose_err, ref_err_reason = _find_on_pose_reference_pfm(spot_name, ref_tag, reference_dirs)
+    raster_img = gate.read_pfm(raster_pfm) if raster_pfm else None
+    ref_spot_dir = os.path.dirname(os.path.dirname(raster_pfm)) if raster_pfm else None
+    ref_placed, ref_place_reason = (
+        _check_variant_vs_reference_camera(vdir, ref_spot_dir, ref_tag=ref_tag)
+        if ref_spot_dir
+        else (False, ref_err_reason or "missing_reference")
+    )
+
+    stop_tel = extract_stop_exposure_telemetry(vdir)
+    gate_dir = os.path.join(vdir, "gate")
+    base_tag = str(live_wins[0]["name"])
+    end_tag = str(live_wins[-1]["name"])
+    base_depth = _read_depth_pfm(gate_dir, base_tag)
+
+    raw_steps: dict[str, dict[str, Any]] = {}
+    for idx, w in enumerate(live_wins):
+        stag = str(w["name"])
+        rtx_keys = dict(w.get("liveRtx") or {})
+        label = _describe_live_rtx(rtx_keys, stag)
+        is_base = idx in (0, len(live_wins) - 1)
+        f_pfm = os.path.join(gate_dir, f"{stag}_final.pfm")
+        if not os.path.isfile(f_pfm):
+            raw_steps[stag] = {"step": stag, "label": label, "is_base": is_base, "status": "MISSING_FINAL"}
+            continue
+        f_img = gate.read_pfm(f_pfm)
+        f_stats = pb.image_brightness_stats(f_img, mask_hud=True)
+        tel_info = stop_tel.get(stag) or {}
+        rt_share = tel_info.get("ray_traced_share")
+        rt_ok = None if rt_share is None else (rt_share >= 0.90)
+        eff_med = tel_info.get("effective_exposure_median")
+        ae_med = tel_info.get("auto_exposure_median")
+        depth_diff = _pose_depth_diff_share(base_depth, _read_depth_pfm(gate_dir, stag))
+        cmp_res = (
+            pb.compare_final_to_raster(f_img, raster_img, mask_hud=True)
+            if (raster_img is not None and ref_placed)
+            else None
+        )
+        raw_steps[stag] = {
+            "step": stag,
+            "label": label,
+            "is_base": is_base,
+            "rtx": rtx_keys,
+            "ray_traced": rt_ok,
+            "ray_traced_share": rt_share,
+            "auto_exposure_median": ae_med,
+            "effective_exposure_median": eff_med,
+            "depth_diff_vs_step1": depth_diff,
+            "gamma_mean": float(f_stats["gamma_mean"]),
+            "linear_mean": float(f_stats["linear_mean"]),
+            "near_white_share": float(f_stats["near_white_share"]),
+            "nonfinite_pixels": int(f_stats["nonfinite"]),
+            "vs_raster": cmp_res,
+        }
+
+    b1 = raw_steps.get(base_tag, {})
+    bN = raw_steps.get(end_tag, {})
+    base_luma = b1.get("gamma_mean") if b1.get("ray_traced") is not False else None
+    base_end_luma = bN.get("gamma_mean") if bN.get("ray_traced") is not False else None
+    base_eff_exp = b1.get("effective_exposure_median")
+
+    non_base_lumas = {
+        k: v["gamma_mean"]
+        for k, v in raw_steps.items()
+        if not v.get("is_base") and "gamma_mean" in v
+    }
+    drift_eval = evaluate_drift_gated_effects(base_luma, base_end_luma, non_base_lumas)
+
+    steps_scored: dict[str, Any] = {}
+    passing_steps: list[str] = []
+    for stag, entry in raw_steps.items():
+        if entry.get("status") == "MISSING_FINAL":
+            steps_scored[stag] = entry
+            continue
+        out = dict(entry)
+        if entry["is_base"]:
+            if entry["ray_traced"] is False:
+                out["measurement_status"] = "NOT_MEASURED"
+                out["reasons"] = ["not_ray_traced"]
+            elif entry["depth_diff_vs_step1"] is not None and entry["depth_diff_vs_step1"] > POSE_DEPTH_MAX_PIXELS:
+                out["measurement_status"] = "NOT_MEASURED"
+                out["reasons"] = ["intra_launch_pose_moved"]
+            else:
+                out["measurement_status"] = "BASE_ANCHOR"
+            steps_scored[stag] = out
+            continue
+
+        de = drift_eval["variants"][stag]
+        out["delta_vs_base"] = de.get("delta_vs_base")
+        out["effect_abs"] = de.get("effect_abs")
+        out["effect_rel"] = de.get("effect_rel")
+
+        # Verify SetConfigVariable took effect when the requested rtx ceiling is well below base effectiveExposure.
+        ceil_eff = _expected_effective_exposure_ceiling(entry["rtx"])
+        out["expected_effective_exposure_ceiling"] = ceil_eff
+        took_ok = True
+        if (
+            ceil_eff is not None
+            and base_eff_exp is not None
+            and entry["effective_exposure_median"] is not None
+            and ceil_eff < 0.85 * float(base_eff_exp)
+            and float(entry["effective_exposure_median"]) > ceil_eff * 1.08
+        ):
+            took_ok = False
+
+        if entry["ray_traced"] is False:
+            out["measurement_status"] = "NOT_MEASURED"
+            out["gate_pass"] = False
+            out["reasons"] = ["not_ray_traced"]
+        elif not took_ok:
+            out["measurement_status"] = "NOT_MEASURED"
+            out["gate_pass"] = False
+            out["reasons"] = ["live_rtx_did_not_take"]
+        elif entry["depth_diff_vs_step1"] is not None and entry["depth_diff_vs_step1"] > POSE_DEPTH_MAX_PIXELS:
+            out["measurement_status"] = "NOT_MEASURED"
+            out["gate_pass"] = False
+            out["reasons"] = ["intra_launch_pose_moved"]
+        elif de["status"] == "NOT_MEASURED":
+            out["measurement_status"] = "NOT_MEASURED"
+            out["gate_pass"] = None
+            out["reasons"] = [de["reason"]]
+        elif not ref_placed or raster_img is None or entry["vs_raster"] is None:
+            out["measurement_status"] = "NOT_MEASURED"
+            out["gate_pass"] = None
+            out["reasons"] = [ref_place_reason or ref_err_reason or "missing_reference"]
+        elif entry["vs_raster"].get("black_raster"):
+            out["measurement_status"] = "NOT_MEASURED"
+            out["gate_pass"] = None
+            out["reasons"] = ["black_raster"]
+        else:
+            out["measurement_status"] = "MEASURED"
+            vr = entry["vs_raster"]
+            ratio = vr["gamma_mean_ratio"]
+            nw_delta = vr["near_white_delta"]
+            reasons: list[str] = []
+            if entry["nonfinite_pixels"] > 0 or vr["nonfinite_pixels"] > 0:
+                reasons.append("nonfinite_pixels")
+            if entry["gamma_mean"] < PASS_THRESHOLDS["min_scene_luma"]:
+                reasons.append(f"below_luma_floor ({entry['gamma_mean']:.4f} < {PASS_THRESHOLDS['min_scene_luma']})")
+            if ratio is None or ratio < PASS_THRESHOLDS["min_stop_ratio"]:
+                reasons.append(f"too_dark_stop ({ratio:.3f}x < {PASS_THRESHOLDS['min_stop_ratio']}x)")
+            elif ratio > PASS_THRESHOLDS["max_stop_ratio"]:
+                reasons.append(f"too_bright_stop ({ratio:.3f}x > {PASS_THRESHOLDS['max_stop_ratio']}x)")
+            if ratio is not None and (
+                ratio < PASS_THRESHOLDS["min_spot_median_ratio"]
+                or ratio > PASS_THRESHOLDS["max_spot_median_ratio"]
+            ):
+                reasons.append(
+                    f"outside_spot_median_target ({ratio:.3f}x not in "
+                    f"[{PASS_THRESHOLDS['min_spot_median_ratio']}, {PASS_THRESHOLDS['max_spot_median_ratio']}])"
+                )
+            if nw_delta > PASS_THRESHOLDS["max_near_white_delta"]:
+                reasons.append(f"near_white_excess (+{nw_delta:.4f} > +{PASS_THRESHOLDS['max_near_white_delta']})")
+            out["gate_pass"] = len(reasons) == 0
+            out["reasons"] = reasons
+            if out["gate_pass"]:
+                passing_steps.append(stag)
+
+        steps_scored[stag] = out
+
+    measured_non_base = [
+        v for v in steps_scored.values() if not v.get("is_base") and v.get("measurement_status") == "MEASURED"
+    ]
+    ae_off_entry = next(
+        (
+            v
+            for v in steps_scored.values()
+            if not v.get("is_base")
+            and str(v.get("rtx", {}).get("rtx.autoExposure.enabled", "")).lower() == "false"
+        ),
+        None,
+    )
+    if not measured_non_base:
+        verdict = "NOT_MEASURED"
+    elif ae_off_entry and ae_off_entry.get("measurement_status") == "MEASURED" and ae_off_entry.get("vs_raster"):
+        ae_ratio = ae_off_entry["vs_raster"].get("gamma_mean_ratio")
+        all_ratios = [
+            v["vs_raster"]["gamma_mean_ratio"]
+            for v in measured_non_base
+            if v.get("vs_raster") and v["vs_raster"].get("gamma_mean_ratio") is not None
+        ]
+        if (
+            ae_ratio is not None
+            and ae_ratio > PASS_THRESHOLDS["max_stop_ratio"]
+            and min(all_ratios) > PASS_THRESHOLDS["max_stop_ratio"]
+        ):
+            verdict = "exposure_falsified_lights_too_strong"
+        elif passing_steps or (ae_ratio is not None and ae_ratio <= PASS_THRESHOLDS["max_stop_ratio"]):
+            verdict = "exposure_confirmed"
+        else:
+            verdict = "mixed_exposure_and_lights"
+    elif passing_steps:
+        verdict = "exposure_confirmed"
+    else:
+        verdict = "inconclusive"
+
+    return {
+        "mode": "live_steps",
+        "live_dir": os.path.abspath(vdir),
+        "spot": spot_name,
+        "reference_tag": ref_tag,
+        "reference_pfm": raster_pfm,
+        "reference_placed": ref_placed,
+        "reference_pose_error_deg": ref_pose_err,
+        "base_first": base_tag,
+        "base_end": end_tag,
+        "base_luma": base_luma,
+        "base_end_luma": base_end_luma,
+        "base_drift_abs": drift_eval["base_drift_abs"],
+        "base_drift_rel": drift_eval["base_drift_rel"],
+        "passing_variants": passing_steps,
+        "causal_verdict": verdict,
+        "variants": steps_scored,
+    }
+
+
 def _write_uniform_pfm(path: str, val: float, h: int = 32, w: int = 32) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     arr = np.full((h, w, 3), float(val), dtype=np.float32)
     gate.write_pfm(path, arr)
+
+
+def _write_depth_pfm(path: str, arr2d: np.ndarray) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    arr3 = np.repeat(arr2d[:, :, None].astype(np.float32), 3, axis=2)
+    gate.write_pfm(path, arr3)
 
 
 def run_self_test() -> None:
@@ -773,6 +1329,131 @@ def run_self_test() -> None:
         assert sc_cust["variants"]["02_untraced"]["reasons"] == ["not_ray_traced"]
         assert sc_cust["passing_variants"] == ["03_ok"], sc_cust
 
+        # 5. analyze_gate_runs stop_ok placement rejection + per-stop exposure telemetry regimes
+        gate_run = os.path.join(tmp, "gate_run")
+        gate_ref = os.path.join(tmp, "gate_ref")
+        tags4 = ["y0_p0", "y45_p0", "y90_p0", "y135_p0"]
+        orig4 = [0.06, 0.10, 0.16, 0.25]
+        tel_lines_active: list[str] = []
+        tel_lines_clamped: list[str] = []
+        win_defs: list[dict[str, Any]] = []
+        for i, (tname, ov) in enumerate(zip(tags4, orig4)):
+            f0 = 100 + i * 20
+            _write_uniform_pfm(os.path.join(gate_ref, "spot_act", "gate", f"{tname}_raster.pfm"), ov)
+            _write_uniform_pfm(os.path.join(gate_ref, "spot_clamp", "gate", f"{tname}_raster.pfm"), ov)
+            _write_uniform_pfm(os.path.join(gate_run, "spot_act", "gate", f"{tname}_final.pfm"), 0.48)
+            _write_uniform_pfm(os.path.join(gate_run, "spot_clamp", "gate", f"{tname}_final.pfm"), 0.24)
+            win_defs.append({"name": tname, "kind": "still", "telemetry": [f0, f0 + 9]})
+            ae_act = min(7.0244, 0.70 / ov)
+            for fr in range(f0, f0 + 10):
+                tel_lines_active.append(
+                    json.dumps(
+                        {
+                            "frame": fr,
+                            "rayTraced": True,
+                            "autoExposure": ae_act,
+                            "effectiveExposure": 0.75 * ae_act,
+                        }
+                    )
+                )
+                tel_lines_clamped.append(
+                    json.dumps(
+                        {
+                            "frame": fr,
+                            "rayTraced": True,
+                            "autoExposure": 7.0244,
+                            "effectiveExposure": 5.2683,
+                        }
+                    )
+                )
+        for sname, tlines in (("spot_act", tel_lines_active), ("spot_clamp", tel_lines_clamped)):
+            with open(os.path.join(gate_run, sname, "spot.json"), "w", encoding="utf-8") as f:
+                json.dump({"name": sname, "windows": win_defs}, f)
+            with open(os.path.join(gate_run, sname, "telemetry.jsonl"), "w", encoding="utf-8") as f:
+                f.write("\n".join(tlines) + "\n")
+
+        # Reject y135_p0 via stop_ok -> only 3 stops remain
+        ag = analyze_gate_runs(
+            [gate_run],
+            [gate_ref],
+            stop_ok=lambda _sd, _rd, tg: (tg != "y135_p0", "misplaced_test" if tg == "y135_p0" else "ok"),
+        )
+        assert ag["spots"]["spot_act"]["n_on_pose"] == 3, ag["spots"]["spot_act"]
+        assert (
+            ag["spots"]["spot_act"]["exposure_telemetry"]["exposure_telemetry_regime"] == "active_inverse_gain"
+        ), ag["spots"]["spot_act"]
+        assert (
+            ag["spots"]["spot_clamp"]["exposure_telemetry"]["exposure_telemetry_regime"] == "clamped_at_ceiling"
+        ), ag["spots"]["spot_clamp"]
+        assert (
+            ag["spots"]["spot_clamp"]["exposure_telemetry"]["normalized_pre_tonemap_radiance_ratio_median"] is not None
+        ), ag["spots"]["spot_clamp"]
+
+        # 6. score_live_steps: clean PASS + failing fake cases for live_rtx_did_not_take,
+        #    intra_launch_pose_moved, and reference_pose_mismatch
+        yy, xx = np.mgrid[0:32, 0:32]
+        depth_ok = (100.0 + 10.0 * ((xx // 4) % 2) + yy * 0.5).astype(np.float32)
+        depth_moved = np.roll(depth_ok, 1, axis=1)
+
+        live_ref = os.path.join(tmp, "live_ref")
+        _write_uniform_pfm(os.path.join(live_ref, "con_custodial", "gate", "y0_p0_raster.pfm"), 0.14)
+        with open(os.path.join(live_ref, "con_custodial", "spot.json"), "w", encoding="utf-8") as f:
+            json.dump({"name": "con_custodial", "windows": [{"name": "y0_p0", "kind": "still", "proxy": [10, 20]}]}, f)
+        with open(os.path.join(live_ref, "con_custodial", "proxy_frames.csv"), "w", encoding="utf-8") as f:
+            f.write("frame,dt,draws,prims,tex,lights,pub\n")
+            for fr in range(10, 21):
+                f.write(f"{fr},16.6,100,1000,10,5,c:0:0:10.0:20.0:30.0:1.0:0.0:0.0\n")
+
+        def _build_live_case(case_name: str, stuck_rtx: bool = False, move_depth: bool = False, far_cam: bool = False):
+            cdir = os.path.join(tmp, case_name, "01_live_exposure")
+            os.makedirs(cdir, exist_ok=True)
+            with open(os.path.join(tmp, case_name, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump({"spots": ["con_custodial"], "variants": ["01_live_exposure"]}, f)
+            steps_meta = [
+                ("live_step1", 0.48, 5.75, 4.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "-2.0", "rtx.localtonemap.exposure": "0.75"}),
+                ("live_step2", 0.17, (5.75 if stuck_rtx else 1.0), (4.31 if stuck_rtx else 0.75), {"rtx.autoExposure.enabled": "False", "rtx.localtonemap.exposure": "0.75"}),
+                ("live_step3", 0.16, 1.75, 1.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "0.0", "rtx.localtonemap.exposure": "0.75", "rtx.localtonemap.shadows": "0.0"}),
+                ("live_step4", 0.481, 5.75, 4.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "-2.0", "rtx.localtonemap.exposure": "0.75"}),
+            ]
+            wins = []
+            t_rows = []
+            for idx, (st, val, ae_v, eff_v, rtx_d) in enumerate(steps_meta):
+                f0 = 100 + idx * 30
+                wins.append({"name": st, "kind": "still", "telemetry": [f0, f0 + 19], "proxy": [f0, f0 + 19], "liveRtx": rtx_d})
+                _write_uniform_pfm(os.path.join(cdir, "gate", f"{st}_final.pfm"), val)
+                _write_depth_pfm(
+                    os.path.join(cdir, "gate", f"{st}_gamedepth.pfm"),
+                    depth_moved if (move_depth and st == "live_step3") else depth_ok,
+                )
+                for fr in range(f0, f0 + 20):
+                    t_rows.append(json.dumps({"frame": fr, "rayTraced": True, "autoExposure": ae_v, "effectiveExposure": eff_v}))
+            with open(os.path.join(cdir, "spot.json"), "w", encoding="utf-8") as f:
+                json.dump({"name": "con_custodial", "windows": wins}, f)
+            with open(os.path.join(cdir, "telemetry.jsonl"), "w", encoding="utf-8") as f:
+                f.write("\n".join(t_rows) + "\n")
+            cam_x = 25.0 if far_cam else 10.5
+            with open(os.path.join(cdir, "proxy_frames.csv"), "w", encoding="utf-8") as f:
+                f.write("frame,dt,draws,prims,tex,lights,pub\n")
+                for fr in range(100, 230):
+                    f.write(f"{fr},16.6,100,1000,10,5,c:0:0:{cam_x}:20.0:30.0:1.0:0.0:0.0\n")
+            return os.path.join(tmp, case_name)
+
+        live_ok = score_variants_sweep(_build_live_case("live_ok"), [live_ref])
+        assert live_ok["mode"] == "live_steps" and live_ok["causal_verdict"] == "exposure_confirmed", live_ok
+        assert live_ok["passing_variants"] == ["live_step2", "live_step3"], live_ok
+
+        live_stuck = score_live_steps(_build_live_case("live_stuck", stuck_rtx=True), [live_ref])
+        assert live_stuck["variants"]["live_step2"]["measurement_status"] == "NOT_MEASURED", live_stuck
+        assert live_stuck["variants"]["live_step2"]["reasons"] == ["live_rtx_did_not_take"], live_stuck
+
+        live_slip = score_live_steps(_build_live_case("live_slip", move_depth=True), [live_ref])
+        assert live_slip["variants"]["live_step3"]["measurement_status"] == "NOT_MEASURED", live_slip
+        assert live_slip["variants"]["live_step3"]["reasons"] == ["intra_launch_pose_moved"], live_slip
+
+        live_far = score_live_steps(_build_live_case("live_far", far_cam=True), [live_ref])
+        assert live_far["reference_placed"] is False and live_far["causal_verdict"] == "NOT_MEASURED", live_far
+        assert live_far["variants"]["live_step2"]["reasons"][0].startswith("reference_pose_mismatch"), live_far
+
     print("exposure_vs_lights.py: ALL SELF-TESTS PASSED")
 
 
@@ -781,8 +1462,9 @@ def main() -> int:
     ap.add_argument("--self-test", action="store_true", help="Run synthetic unit tests and exit.")
     ap.add_argument("--run", action="append", default=[], help="Saved Remix gate run folder(s) to analyze.")
     ap.add_argument("--score-sweep", default=None, help="Score a verify_runtime.ps1 -Variants output directory.")
+    ap.add_argument("--score-live", default=None, help="Score a single-launch liveSteps + liveStepDump folder.")
     ap.add_argument("--reference", action="append", default=[], help="No-Remix reference run folder(s).")
-    ap.add_argument("--spot", default=None, help="Optional spot name override for --score-sweep.")
+    ap.add_argument("--spot", default=None, help="Optional spot name override for --score-sweep / --score-live.")
     ap.add_argument("--out", default=None, help="Optional path to write JSON output.")
     args = ap.parse_args()
 
@@ -790,7 +1472,11 @@ def main() -> int:
         run_self_test()
         return 0
 
-    if args.score_sweep:
+    if args.score_live:
+        if not args.reference:
+            ap.error("--score-live requires at least one --reference <ref_dir>")
+        result = score_live_steps(args.score_live, args.reference, spot_override=args.spot)
+    elif args.score_sweep:
         if not args.reference:
             ap.error("--score-sweep requires at least one --reference <ref_dir>")
         result = score_variants_sweep(args.score_sweep, args.reference, spot_override=args.spot)
@@ -799,7 +1485,7 @@ def main() -> int:
             ap.error("--run requires at least one --reference <ref_dir>")
         result = analyze_gate_runs(args.run, args.reference)
     else:
-        ap.error("Specify --self-test, --run, or --score-sweep")
+        ap.error("Specify --self-test, --run, --score-sweep, or --score-live")
         return 2
 
     text = json.dumps(result, indent=2)

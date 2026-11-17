@@ -1,0 +1,80 @@
+{
+ "about": "Worker F2 single-launch exposure + local-tonemap shadow-fusion check at con_boiler (Nov 17): companion 1-launch check on the low-radiance room (con_boiler baseline median 1.46x with autoExposure pinned at 7.0244 on all 25/25 stops and normalized pre-tonemap radiance 0.326x vs con_custodial 1.888x), verifying that candidates passing con_custodial do not push con_boiler below 0.50x (too_dark_vs_raster) while taming its 1.93x-4.36x shadow-lifted views. Same 7 explicit liveSteps of 12 s each with liveStepDump=true. Score with: python -I tests\\analysis\\brightness\\exposure_vs_lights.py --score-live <run_dir> --reference experiments\\remix-gate\\reference-20261117-133918.",
+ "spot": "con_boiler",
+ "bench": {"settle": 5, "frames": 150},
+ "variants": [
+  {
+   "name": "01_live_exposure",
+   "about": "7 held-pose live steps (base -> 5 exposure/tonemap variants -> base_end), 12 s settle + GateDump per step",
+   "bench": {
+    "liveStepSeconds": 12,
+    "liveStepDump": true,
+    "liveSteps": [
+     {
+      "rtx.autoExposure.enabled": "True",
+      "rtx.autoExposure.evMinValue": "-2.0",
+      "rtx.localtonemap.exposure": "0.75",
+      "rtx.localtonemap.shadows": "2.0",
+      "rtx.tonemappingMode": "1",
+      "rtx.tonemap.finalizeWithACES": "False",
+      "rtx.tonemap.exposureBias": "0.0"
+     },
+     {
+      "rtx.autoExposure.enabled": "False",
+      "rtx.autoExposure.evMinValue": "-2.0",
+      "rtx.localtonemap.exposure": "0.75",
+      "rtx.localtonemap.shadows": "2.0",
+      "rtx.tonemappingMode": "1",
+      "rtx.tonemap.finalizeWithACES": "False",
+      "rtx.tonemap.exposureBias": "0.0"
+     },
+     {
+      "rtx.autoExposure.enabled": "True",
+      "rtx.autoExposure.evMinValue": "-2.0",
+      "rtx.localtonemap.exposure": "0.75",
+      "rtx.localtonemap.shadows": "0.0",
+      "rtx.tonemappingMode": "1",
+      "rtx.tonemap.finalizeWithACES": "False",
+      "rtx.tonemap.exposureBias": "0.0"
+     },
+     {
+      "rtx.autoExposure.enabled": "True",
+      "rtx.autoExposure.evMinValue": "0.0",
+      "rtx.localtonemap.exposure": "0.75",
+      "rtx.localtonemap.shadows": "0.0",
+      "rtx.tonemappingMode": "1",
+      "rtx.tonemap.finalizeWithACES": "False",
+      "rtx.tonemap.exposureBias": "0.0"
+     },
+     {
+      "rtx.autoExposure.enabled": "True",
+      "rtx.autoExposure.evMinValue": "-1.0",
+      "rtx.localtonemap.exposure": "0.35",
+      "rtx.localtonemap.shadows": "0.0",
+      "rtx.tonemappingMode": "1",
+      "rtx.tonemap.finalizeWithACES": "False",
+      "rtx.tonemap.exposureBias": "0.0"
+     },
+     {
+      "rtx.autoExposure.enabled": "True",
+      "rtx.autoExposure.evMinValue": "0.0",
+      "rtx.localtonemap.exposure": "0.75",
+      "rtx.localtonemap.shadows": "2.0",
+      "rtx.tonemappingMode": "0",
+      "rtx.tonemap.finalizeWithACES": "True",
+      "rtx.tonemap.exposureBias": "-0.5"
+     },
+     {
+      "rtx.autoExposure.enabled": "True",
+      "rtx.autoExposure.evMinValue": "-2.0",
+      "rtx.localtonemap.exposure": "0.75",
+      "rtx.localtonemap.shadows": "2.0",
+      "rtx.tonemappingMode": "1",
+      "rtx.tonemap.finalizeWithACES": "False",
+      "rtx.tonemap.exposureBias": "0.0"
+     }
+    ]
+   }
+  }
+ ]
+}
