@@ -4,7 +4,9 @@ Groups: game (Blacklist_game, Blacklist_DX11_game), bridge (NvRemixBridge), dwm,
 NVIDIA Share), other (every other process). Per sample, each group's 3d-engine percent and its all-engine percent
 (summed over the group's processes and engine types; can pass 100). A sample counts only when its "_sample" row has
 at least one counter instance; a group absent from a counted sample used 0 % in it. No counted sample in a window
-reads NOT RECORDED, never 0.
+reads NOT RECORDED, never 0. A "_running" row with percent 0 (the game, bridge or dwm running but without counter
+instances in that sample) makes that group NOT RECORDED in that sample, never 0 (Nov 17, 20261117-114305: the sampler
+never counted the game or the bridge).
 
   gpu_engines.py summary CSV [--from HH:MM:SS[.fff] --to HH:MM:SS[.fff]]   medians per group
   gpu_engines.py --self-test
@@ -47,9 +49,12 @@ def samples(path, t0=None, t1=None):
                 continue
             if (t0 and t < t0) or (t1 and t > t1):
                 continue
-            s = rows.setdefault(p[0], {"t": t, "n": 0, "rows": []})
+            s = rows.setdefault(p[0], {"t": t, "n": 0, "rows": [], "unseen": set()})
             if p[2] == "_sample":
                 s["n"] = int(p[5] or 0)
+            elif p[3] == "_running":
+                if p[4].strip() == "0":
+                    s["unseen"].add(group_of(p[2]))
             elif p[2] != "_error":
                 try:
                     s["rows"].append((group_of(p[2]), p[3], float(p[4])))
@@ -64,6 +69,8 @@ def samples(path, t0=None, t1=None):
             v[f"{g} all"] += pct
             if eng == "3d":
                 v[f"{g} 3d"] += pct
+        for g in s["unseen"]:   # running but without counter instances in this sample: not counted, not 0 %
+            v[f"{g} 3d"] = v[f"{g} all"] = None
         out.append((s["t"], v))
     return sorted(out, key=lambda x: x[0])
 
@@ -76,14 +83,16 @@ def window_stages(path, clock):
     got = samples(path, _time(clock[0]), _time(clock[1]))
     if not got:
         return {}
-    return {f"program gpu% {k}": [v[k] for _, v in got] for k in got[0][1]}
+    out = {f"program gpu% {k}": [v[k] for _, v in got if v[k] is not None] for k in got[0][1]}
+    return {k: v for k, v in out.items() if v}   # a group never counted while it ran is left out (not recorded)
 
 
 def summary(path, t0=None, t1=None):
     got = samples(path, _time(t0) if t0 else None, _time(t1) if t1 else None)
     if not got:
         return {k: NOT_RECORDED for g in ORDER for k in (f"{g} 3d", f"{g} all")}, 0
-    return {k: round(st.median(v[k] for _, v in got), 3) for k in got[0][1]}, len(got)
+    vals = {k: [v[k] for _, v in got if v[k] is not None] for k in got[0][1]}
+    return {k: round(st.median(x), 3) if x else NOT_RECORDED for k, x in vals.items()}, len(got)
 
 
 def self_test():
@@ -127,6 +136,23 @@ def self_test():
         case("only error rows read NOT RECORDED",
              summary(put("err.csv", head + "01:00:00.000,-1,_error,all,,0\n"))[0]["dwm 3d"], NOT_RECORDED)
         case("no window stages when nothing recorded", window_stages(os.path.join(d, "none.csv"), ["01:00:00", "01:00:05"]), {})
+        # The game and bridge running without counter instances (Nov 17 20261117-114305: the sampler's -Continuous
+        # instance list was fixed before they started) read NOT RECORDED, not 0 %. dwm counted (seen 1) stays read.
+        def run(t, rows):
+            return "".join(f"{t},{pid},{proc},_running,{seen},\n" for pid, proc, seen in rows)
+        unseen = [(1000, "Blacklist_game", 0), (2000, "NvRemixBridge", 0), (636, "dwm", 1)]
+        p2 = put("unseen.csv", head + "".join(run(f"01:00:0{i}.000", unseen) + sample(f"01:00:0{i}.000", [(636, "dwm", "3d", 10)])
+                                              for i in range(3)))
+        m2, _ = summary(p2)
+        case("game and bridge running but not counted read NOT RECORDED", (m2["game 3d"], m2["bridge all"]),
+             (NOT_RECORDED, NOT_RECORDED))
+        case("dwm counted while running still reads 10", m2["dwm 3d"], 10.0)
+        st2 = window_stages(p2, ["01:00:00.000", "01:00:05.000"])
+        case("uncounted groups left out of the window stages", ("program gpu% game 3d" in st2,
+                                                                "program gpu% dwm 3d" in st2), (False, True))
+        seen = [(1000, "Blacklist_game", 1)]
+        p3 = put("seen.csv", head + run("01:00:00.000", seen) + sample("01:00:00.000", [(1000, "Blacklist_game", "3d", 40)]))
+        case("game counted while running reads 40", summary(p3)[0]["game 3d"], 40.0)
     print(f"gpu_engines self-test: {sum(ok)} of {len(ok)} pass")
     return 0 if all(ok) else 1
 
