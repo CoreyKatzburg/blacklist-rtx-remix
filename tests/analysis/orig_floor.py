@@ -10,12 +10,16 @@ A stop is scored only when both pictures show the same view: Sam's recorded loca
 The whole spot is judged, not one stop (coordinator, Nov 17 10:4x; one stop of the original against itself already
 reads 0.9877):
   - fewer than MIN_STOPS (10) scored stops: NOT MEASURED;
-  - INSIDE needs both the spot median inside MEDIAN_BAND (0.996 to 1.012) and every scored stop inside STOP_BAND (0.987
-    to 1.030); anything else with enough stops is OUTSIDE and names the stops.
-STOP_BAND is the measured range of the original against itself: --bands recomputes it from the three lit
-original-against-original pairs in PAIRS (55 same-view stops). MEDIAN_BAND is chosen by the coordinator, not measured:
-the three measured spot medians are 1.0008 to 1.0031, too few values to set a band from; --bands only checks they lie
-inside it. If a retake lands outside either band, that is a finding, not a reason to widen them.
+  - INSIDE needs both the spot median inside MEDIAN_BAND (0.996 to 1.012) and every scored stop within STOP_SPREAD (3 %)
+    of that spot median; anything else with enough stops is OUTSIDE and names the stops.
+Both limits are chosen by the coordinator, not measured. MEDIAN_BAND: the three measured spot medians are 1.0008 to
+1.0031, too few values to set a band from. STOP_SPREAD (Nov 17, rule C): about 4 times the pooled sd (0.0073) of the 55
+same-view stops of the three lit original-against-original pairs in PAIRS; over their own spot medians those stops
+range 0.9862 to 1.0288. It replaced a stop band set to the min and max of the 55 stops (0.987 to 1.030): such a band
+fails a clean spot of 10 to 25 stops 29 to 53 % of the time (order statistics, 55 stops), and the band built without
+con_boiler fails con_boiler on 3 stops (worker A, Nov 17). --bands still prints the measured min and max, labelled
+measured and not used as a limit, and checks every pair reads INSIDE. If a retake lands outside a limit, that is a
+finding, not a reason to widen it.
 
   orig_floor.py <new no-Remix spot folder> <reference spot folder>
   orig_floor.py --bands      recompute the ranges from PAIRS, check the bands hold them, score each pair as a spot
@@ -41,7 +45,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "runtime"))
 import gate  # noqa: E402
 
 MEDIAN_BAND = (0.996, 1.012)   # chosen by the coordinator (not measured); the three measured medians lie inside
-STOP_BAND = (0.987, 1.030)     # min and max over the 55 same-view stops of PAIRS, rounded outward to 0.001
+STOP_SPREAD = 0.03             # chosen (coordinator, rule C, Nov 17), not measured: |stop / spot median - 1| <= 3 %,
+POOLED_SD = 0.0073             # about 4 x this pooled sd of the 55 same-view stops of PAIRS (measured)
 MIN_STOPS = 10
 MAX_LOCATION = 8.0             # units (cm), worker B's same-camera limit
 MAX_DEG = 1.0                  # pfm_brightness.DEFAULT_MAX_POSE_ERROR_DEG
@@ -92,16 +97,19 @@ def stops_of(spot: str) -> list[str]:
 def judge(ratios: dict[str, float]) -> tuple[int, dict]:
     """The spot verdict from the scored stops' ratios."""
     out: dict = {"scored": len(ratios), "minStops": MIN_STOPS, "medianBand": list(MEDIAN_BAND),
-                 "stopBand": list(STOP_BAND)}
+                 "stopSpread": STOP_SPREAD,
+                 "limits": f"median band {MEDIAN_BAND[0]} to {MEDIAN_BAND[1]} (chosen); every stop within "
+                           f"{STOP_SPREAD:.0%} of the spot median (chosen, about 4 x the pooled sd {POOLED_SD})"}
     if len(ratios) < MIN_STOPS:
         out.update(verdict="NOT MEASURED", why=f"{len(ratios)} scored stops, fewer than {MIN_STOPS}")
         return 1, out
     med = statistics.median(ratios.values())
     out.update(median=round(med, 4), min=min(ratios.values()), max=max(ratios.values()))
-    outside = {s: r for s, r in ratios.items() if not STOP_BAND[0] <= r <= STOP_BAND[1]}
+    outside = {s: r for s, r in ratios.items() if abs(r / med - 1.0) > STOP_SPREAD}
     why = ([f"median {med:.4f} outside {MEDIAN_BAND[0]} to {MEDIAN_BAND[1]}"]
            if not MEDIAN_BAND[0] <= med <= MEDIAN_BAND[1] else []) + \
-          [f"{s} {r:.4f} outside {STOP_BAND[0]} to {STOP_BAND[1]}" for s, r in outside.items()]
+          [f"{s} {r:.4f} is {r / med - 1:+.1%} from the spot median, more than {STOP_SPREAD:.0%}"
+           for s, r in outside.items()]
     if why:
         out.update(verdict="OUTSIDE", why="; ".join(why))
         return 3, out
@@ -132,14 +140,16 @@ def bands() -> int:
               f"{out['verdict']}")
         ok &= code == 0
     lo, hi = min(every), max(every)
-    stop_band = (math.floor(lo * 1000) / 1000, math.ceil(hi * 1000) / 1000)
-    print(f"all scored stops: {len(every)}, range {lo:.4f} to {hi:.4f} -> stop band {stop_band} "
-          f"(in the code: {STOP_BAND})")
+    sd = statistics.stdev(every)
+    print(f"all scored stops: {len(every)}, measured range {lo:.4f} to {hi:.4f}, pooled sd {sd:.4f} "
+          f"(measured, not used as a limit)")
+    print(f"stop rule: every stop within {STOP_SPREAD:.0%} of its spot median: chosen by the coordinator, about "
+          f"{STOP_SPREAD / sd:.1f} x the pooled sd")
     print(f"median band {MEDIAN_BAND}: chosen by the coordinator; measured medians {min(medians):.4f} to "
           f"{max(medians):.4f} from {len(medians)} pairs")
-    ok &= stop_band == STOP_BAND and all(MEDIAN_BAND[0] <= m <= MEDIAN_BAND[1] for m in medians)
-    print("bands OK: the stop band matches the measured range and the measured medians lie inside the chosen band"
-          if ok else "bands DO NOT MATCH")
+    ok &= all(MEDIAN_BAND[0] <= m <= MEDIAN_BAND[1] for m in medians)
+    print("bands OK: every pair reads INSIDE and the measured medians lie inside the chosen band"
+          if ok else "bands DO NOT HOLD the measured pairs")
     return 0 if ok else 3
 
 
@@ -163,8 +173,10 @@ def self_test() -> int:
     cases = [("12 stops, small noise", spot("a", [1.0, 1.004, 0.998, 1.002] * 3), 0),
              ("every stop 2 % brighter: inside the stop band, median outside", spot("b", [1.02] * 12), 3),
              ("every stop 1 % dimmer: inside the stop band, median outside", spot("c1", [0.99] * 12), 3),
-             ("every stop 3 % dimmer (outside both bands: 0.97 < 0.987)", spot("c", [0.97] * 12), 3),
+             ("every stop 3 % dimmer: median outside", spot("c", [0.97] * 12), 3),
              ("one stop at 1.05, good median", spot("d", [1.0] * 11 + [1.05]), 3),
+             ("one stop at 1.04 of the median, good median: only the stop rule", spot("d4", [1.0] * 11 + [1.04]), 3),
+             ("one stop at 1.029 of the median, good median: inside", spot("d3", [1.0] * 11 + [1.029]), 0),
              ("9 scored stops (3 views differ)", spot("e", [1.0] * 12), None),
              ("9 stops only", spot("f", [1.0] * 9), 1),
              ("a change in the top band only", spot("g", [1.0] * 12, img=hud), 0),
@@ -187,8 +199,8 @@ def self_test() -> int:
         ok &= good
         print(f"{name}: exit {code} {out['verdict']} scored {out['scored']} median {out.get('median')} "
               f"{out.get('why', '')} -> {'PASS' if good else 'FAIL'}")
-        if want == 3 and "1.05" in name:
-            ok &= "y165_p0" in out["why"]                            # the bad stop is named
+        if want == 3 and ("1.05" in name or "1.04" in name):
+            ok &= "y165_p0" in out.get("why", "") and "median 1" not in out.get("why", "")   # the bad stop is named, not the median
     print("self-test", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
