@@ -135,6 +135,9 @@ function Gate($folder) {
     Write-Host "  gate: previous run $(if ($prev) { $prev } elseif ($pick.note) { '(none in the same display state)' } else { '(none with the same spots)' }); no-Remix reference $(if ($ref) { $ref } else { '(none)' })"
     & $Py @gateArgs | Out-Host
     $code = $LASTEXITCODE
+    # Windows taken across a frame gap over 500 ms are named in result.md (coordinator, Nov 17: 125334's y0_p30 still
+    # held a 1.6 s gap and nothing said so). Marks only; the gate's exit code is unchanged.
+    & $Py -I (Join-Path $Runtime 'stall_windows.py') $folder --md (Join-Path $folder 'result.md') | Out-Host
     if ($pick.note) {
         Write-Host "  gate: $($pick.note)" -ForegroundColor Yellow
         $md = Join-Path $folder 'result.md'
