@@ -395,6 +395,93 @@ class MouseLag(unittest.TestCase):
         self.assertIsNone(drive.first_turned(dirs[:3], 1000.0))
         self.assertIsNone(drive.first_turned(dirs[2:], 1000.0))      # no frame before the turn to compare with
 
+    def series_spot(self, clock, location, player=lambda: (1, 2), proxy_path=None):
+        """A Spot for teleport_series on a fake clock: hold() and sleep() move the clock, move() records the base yaw
+        it turned to, and the proxy frame number is the 5 ms frame the clock is at (frame 0 at 99.0 s)."""
+        s = drive.Spot.__new__(drive.Spot)
+        s.spot, s.cp = {"fallSeconds": 1.0, "spawnHold": 5.0}, {"map": "m", "location": [-6285.7, -2420.7, 1188.0],
+                                                                "yaw": 80.0, "pitch": -5.0}
+        s.controller, s.pawn, s.windows, s.yaw, s.pitch, s.moves, s.placed = 1, 2, [], 0.0, 0.0, [], []
+        s.hold = lambda t: clock.__setitem__(0, clock[0] + t)
+        s.move = lambda name, y, p, sec: s.moves.append((name, s.base_yaw, s.base_pitch))
+        s.rel_pose = lambda: [0.0, 0.0]
+        frame = lambda: int(round((clock[0] * 1000 - 99000) / 5))   # noqa: E731
+        s.counters = lambda: {"telemetry": 0, "proxy": frame()}
+        s.proxy = mock.Mock(path=proxy_path, last_frame=frame)
+
+        def set_location(pawn, loc):
+            s.placed.append([round(v, 1) for v in loc])
+            clock[1] = (list(loc), clock[0])
+        s.game = mock.Mock(set_location=set_location, location=location, player=player)
+        s.wait_player = lambda cp: (7, 8)
+        return s
+
+    def test_teleport_series_records_the_fall_landing_and_both_cameras(self):
+        # Worker G, Nov 16 (con_boiler fall test): the fall's frame times stop when Sam lands, and each camera is the
+        # median over its own one-second window, not over the whole teleport.
+        import math, os, tempfile
+        clock = [95.0, None]
+
+        def location(pawn):
+            loc, at = clock[1]
+            t = clock[0] - at
+            if loc[2] > 0:   # the spawn
+                return tuple(loc)
+            return (loc[0], loc[1] + 5.2, loc[2] - 200.0 * t if t < 0.405 else -674.0)
+        y = math.radians(-154.0)
+        rows = []
+        for k in range(2601):
+            ms = 99000 + 5 * k
+            if 107000 <= ms <= 108000:
+                cam = "-12030:-2700:-600:1:0:0" if k != 1700 else "5:5:5:0:1:0"   # one stray frame
+            elif 110000 <= ms <= 111000:
+                cam = f"-12040:-2510:-620:{math.cos(y):.6f}:{math.sin(y):.6f}:0"
+            else:
+                cam = "0:0:0:0:1:0"
+            dt = 5.0 if ms <= 100500 else 9.0
+            rows.append(f"{k},{ms}.0,{dt},0.5,100,8,G:0:0:{cam}:0|G:9:1:1:1:1:1:0:0:0")
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "f.csv")
+            with open(p, "w") as fh:
+                fh.write("\n".join(rows) + "\n")
+            s = self.series_spot(clock, location, proxy_path=p)
+            with mock.patch.object(drive.time, "sleep", lambda t: clock.__setitem__(0, clock[0] + t)), \
+                 mock.patch.object(drive.time, "perf_counter", lambda: clock[0]):
+                out = s.teleport_series([{"group": "old1", "location": [-12165, -2524, -592], "count": 1, "yaw": -154}])
+        r = out[0]
+        self.assertEqual(s.placed, [[-6285.7, -2420.7, 1188.0], [-12165.0, -2524.0, -592.0]])   # spawn, then target
+        self.assertEqual([m[1:] for m in s.moves], [(80.0, -5.0), (-154.0, 0.0)])   # spawn view, then the series yaw
+        self.assertEqual((r["group"], r["held"], r["teleport"]),
+                         ("old1", True, {"asked": [-12165.0, -2524.0, -592.0], "landed": [-12165.0, -2518.8, -674.0],
+                                         "yaw": -154.0}))
+        self.assertEqual(r["landedAfterS"], 0.45)
+        self.assertEqual((len(r["fallFrameMs"]), set(r["fallFrameMs"])), (92, {5.0}))   # 100000..100455 ms
+        self.assertEqual(r["at8s"]["camera"], [-12030.0, -2700.0, -600.0, 0.0, 0.0])
+        self.assertEqual(r["atStop"]["camera"], [-12040.0, -2510.0, -620.0, -154.0, 0.0])
+        self.assertEqual(r["at8s"]["samLanded"], [-12165.0, -2518.8, -674.0])
+
+    def test_teleport_series_goes_on_after_a_teleport_the_game_undoes(self):
+        clock = [95.0, None]
+        calls = {"n": 0}
+
+        def location(pawn):
+            loc, _ = clock[1]
+            if loc[2] < 0 and len([p for p in s.placed if p[2] < 0]) == 2 and calls["n"] < 1:
+                calls["n"] += 1
+                raise drive.blmem.MemoryError_("read 4 bytes at 0x45")   # the second teleport: a reload
+            return tuple(loc)
+        s = self.series_spot(clock, location, player=lambda: (s.controller, s.pawn))
+        with mock.patch.object(drive.time, "sleep", lambda t: clock.__setitem__(0, clock[0] + t)), \
+             mock.patch.object(drive.time, "perf_counter", lambda: clock[0]):
+            out = s.teleport_series([{"group": "old1", "location": [-12165, -2524, -592], "count": 2},
+                                     {"group": "floor", "location": [-12165, -2518.8, -674], "count": 1}])
+        self.assertEqual([(r["group"], r["index"], r["held"]) for r in out],
+                         [("old1", 1, True), ("old1", 2, False), ("floor", 3, True)])
+        self.assertIn("read 4 bytes", out[1]["error"])
+        self.assertEqual((s.controller, s.pawn), (7, 8))   # found the player again
+        self.assertEqual(len(s.placed), 6)   # spawn and target for each of the three
+        self.assertIsNone(out[0]["fallFrameMs"])   # no proxy frame log: no frame times, not an error
+
     def test_proxy_rows_are_read_from_the_frame_log(self):
         import os, tempfile
         rows = ["0,900.0,1,1,1,1,G:0:0:1:2:3:1.0:0.0:0.0:0",

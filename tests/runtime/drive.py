@@ -472,6 +472,42 @@ def proxy_camera_dirs(path: str, since_ms: float) -> list[tuple[float, tuple]]:
     return out
 
 
+def proxy_rows(path: str, lo: int, hi: int, tail_bytes: int = 16 << 20) -> list[tuple[int, float, float, list | None]]:
+    """(frame, ms, frame time ms, render camera x,y,z,fx,fy,fz of publish slot 0 or None) of the proxy frame log rows
+    numbered lo..hi, read from the last tail_bytes of the file (about 30,000 rows)."""
+    with open(path, "rb") as f:
+        start = max(0, os.path.getsize(path) - tail_bytes)
+        f.seek(start)
+        lines = f.read().decode("latin-1").splitlines()[1 if start else 0:]   # the first line read mid-file is cut
+    out = []
+    for line in lines:
+        row = line.split(",", 6)
+        try:
+            frame, ms, dt = int(row[0]), float(row[1]), float(row[2])
+        except (ValueError, IndexError):
+            continue
+        if not lo <= frame <= hi:
+            continue
+        cam = None
+        for pub in (row[6].split("|") if len(row) > 6 else []):
+            p = pub.split(":")
+            if len(p) >= 9 and p[2] == "0":
+                cam = [float(v) for v in p[3:9]]
+                break
+        out.append((frame, ms, dt, cam))
+    return out
+
+
+def median_camera(rows) -> list[float] | None:
+    """[x, y, z, yaw, pitch]: the median render camera of proxy rows, as glow_blobs.spot_still computes it."""
+    cams = [r[3] for r in rows if r[3]]
+    if not cams:
+        return None
+    m = np.median(np.array(cams), axis=0)
+    return [round(float(v), 1) for v in (*m[:3], math.degrees(math.atan2(m[4], m[3])),
+                                         math.degrees(math.asin(float(np.clip(m[5], -1, 1)))))]
+
+
 def first_change(shots, t0: float, base, threshold: float) -> float | None:
     """Arrival time of the first screen shot after t0 whose mean absolute difference from `base` exceeds `threshold`
     (grey levels of 255)."""
@@ -579,6 +615,74 @@ class Spot:
             print("CHECKPOINT RESET", json.dumps(resets[-1]), flush=True)
             self.controller, self.pawn = self.wait_player(self.cp)
         raise RuntimeError(f"the game put Sam back on the checkpoint after all {tries} teleports: {resets}")
+
+    def teleport_series(self, series: list[dict]) -> list[dict]:
+        """Worker G, Nov 16 (con_boiler fall test, coordinator): the same teleports many times in one launch, to tell
+        whether the fall after a teleport is what scatters the landing without Remix. series [{"group", "location",
+        "count", "yaw" (else the spot's teleport yaw), "pitch"}], run in order. Each teleport starts the way a spot's
+        first one does: Sam back on the checkpoint position, facing the checkpoint's direction, for spot["spawnHold"] s
+        (5), then the teleport. Per teleport: Sam's height every 50 ms for spot["fallSeconds"] s (3) as fallTrace
+        [[s, z]], the proxy frame times from the teleport until Sam stops falling (fallFrameMs), Sam and the median
+        render camera over the last second before the 8 s read (at8s), and the same once the view is turned to the
+        series yaw and held 2 s (atStop): in reference 175705 the turn, not the landing, is where the camera came in
+        from about 195 to 133 units (worker D). held is teleport()'s rule plus the same player objects. A teleport the
+        game undoes is recorded with its error, and the next one still runs."""
+        spawn_hold, fall_s = float(self.spot.get("spawnHold", 5.0)), float(self.spot.get("fallSeconds", 3.0))
+        default_yaw = float(self.spot.get("teleport", {}).get("yaw", self.cp["yaw"]))
+        out: list[dict] = []
+        for g in series:
+            for _ in range(int(g.get("count", 1))):
+                n = len(out) + 1
+                tp = {"location": [float(v) for v in g["location"]], "yaw": float(g.get("yaw", default_yaw)),
+                      "pitch": float(g.get("pitch", 0.0))}
+                rec = {"group": g["group"], "index": n,
+                       "teleport": {"asked": tp["location"], "landed": None, "yaw": tp["yaw"]}, "held": False}
+                try:
+                    self._series_teleport(f"series{n}", tp, rec, spawn_hold, fall_s)
+                except (RuntimeError, blmem.MemoryError_) as e:
+                    rec["error"] = f"{type(e).__name__}: {e}"
+                    self.controller, self.pawn = self.wait_player(self.cp)
+                print("SERIES", json.dumps(rec)[:800], flush=True)
+                out.append(rec)
+        return out
+
+    def _series_teleport(self, tag: str, tp: dict, rec: dict, spawn_hold: float, fall_s: float) -> None:
+        self.game.set_location(self.pawn, [float(v) for v in self.cp["location"]])
+        self.base_yaw, self.base_pitch = float(self.cp["yaw"]), float(self.cp["pitch"])
+        self.move(f"{tag}_to_spawn_view", 0.0, 0.0, 0.5)
+        self.hold(spawn_hold)
+        pair, f0, t0 = (self.controller, self.pawn), self.proxy.last_frame(), time.perf_counter()
+        self.game.set_location(self.pawn, tp["location"])
+        trace: list[list[float]] = []
+        while (now := time.perf_counter()) - t0 < fall_s:
+            trace.append([round(now - t0, 2), round(float(self.game.location(self.pawn)[2]), 1)])
+            time.sleep(0.05)
+        # landed: the first sample from which Sam's height stays within 1 unit of the last sample
+        land = next(t for i, (t, _) in enumerate(trace) if all(abs(z - trace[-1][1]) <= 1.0 for _, z in trace[i:]))
+        self.hold(max(0.0, 7.0 - (time.perf_counter() - t0)))
+        w8 = self.window(f"{tag}_at8s", "teleport_series", lambda: self.hold(1.0))
+        got = [float(v) for v in self.game.location(self.pawn)]
+        side = float(np.hypot(got[0] - tp["location"][0], got[1] - tp["location"][1]))
+        drop = tp["location"][2] - got[2]
+        same = tuple(self.game.player()) == pair
+        rows = proxy_rows(self.proxy.path, f0, w8["proxy"][1]) if self.proxy.path else []
+        t0ms = t0 * 1000.0
+        rec["teleport"]["landed"] = [round(v, 1) for v in got]
+        rec.update(held=side <= 150 and drop <= 300 and same, sideways=round(side, 1), drop=round(drop, 1),
+                   samePlayer=same, fallTrace=trace, landedAfterS=land,
+                   landedInFallWindow=land < trace[-1][0],
+                   fallFrameMs=[r[2] for r in rows if t0ms <= r[1] <= t0ms + land * 1000.0 + r[2]] or None,
+                   at8s={"samLanded": rec["teleport"]["landed"],
+                         "camera": median_camera([r for r in rows if w8["proxy"][0] <= r[0] <= w8["proxy"][1]]),
+                         "proxy": w8["proxy"]})
+        self.base_yaw, self.base_pitch = tp["yaw"], tp["pitch"]
+        self.move(f"{tag}_to_stop", 0.0, 0.0, 0.5)
+        self.hold(2.0)
+        ws = self.window(f"{tag}_stop", "teleport_series", lambda: self.hold(1.0))
+        sam = [round(float(v), 1) for v in self.game.location(self.pawn)]
+        rows = proxy_rows(self.proxy.path, ws["proxy"][0], ws["proxy"][1]) if self.proxy.path else []
+        rec["atStop"] = {"samLanded": sam, "camera": median_camera(rows), "gamePose": self.rel_pose(),
+                         "proxy": ws["proxy"]}
 
     def _back_at_checkpoint(self) -> bool:
         """True when the player objects cannot be read (a reload) or Sam stands within 150 units of the checkpoint."""
@@ -1839,6 +1943,11 @@ def main() -> int:
             bad = [f"{c['name']}: {c['error']}" for c in result["captures"] if c.get("error")]
             if bad:
                 result["error"] = "; ".join(bad)
+        elif spot.get("teleportSeries"):   # worker G's fall test: the series of teleports and nothing else
+            if not hwnd or not front(hwnd):
+                raise RuntimeError("no game window to bring to the front for the teleport series")
+            s._calibrate_mouse()
+            result["teleportSeries"] = s.teleport_series(spot["teleportSeries"])
         elif spot.get("bench"):
             if not hwnd:
                 raise RuntimeError("no game window to bring to the front for the benchmark")
