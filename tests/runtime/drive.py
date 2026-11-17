@@ -296,7 +296,7 @@ def amp_hold_void(hold: dict) -> str | None:
     """The spot error when a launch-wide minimize did not hold (spot void); None when it held or no Amp window ran."""
     if hold.get("allMinimized") is False:
         return (f"VOID: the Amp window was not minimized throughout the launch (read back before the steps "
-                f"{hold.get('readBack')}; not minimized in {hold.get('notMinimized')})")
+                f"{hold.get('readBack')}; re-minimize failed after {hold.get('reminimizeFailed')})")
     return None
 
 
@@ -987,8 +987,8 @@ class Spot:
         end = self.counters()
         w = {"name": name, "kind": kind, "yaw": self.yaw, "pitch": self.pitch,
              "telemetry": [start["telemetry"], end["telemetry"]], "proxy": [start["proxy"], end["proxy"]], **extra}
+        self.windows.append(w)   # before amp_note, which may re-minimize the Amp window or void the spot
         self.amp_note(w, a, self.amp_minimized())
-        self.windows.append(w)
         if getattr(self, "save_partial", None):
             self.save_partial()
         return w
@@ -1647,8 +1647,8 @@ class Spot:
             clocks.append(c1clock)
             w = {"name": tag, "kind": "still", "yaw": self.yaw, "pitch": self.pitch,
                  "telemetry": [c0["telemetry"], c1["telemetry"]], "proxy": [c0["proxy"], c1["proxy"]], **rec}
-            self.amp_note(w, amp_a, self.amp_minimized())
             self.windows.append(w)
+            self.amp_note(w, amp_a, self.amp_minimized())
         else:
             # Both snapshots sit outside the window's frame range: the Get-PnpDevice list starts a PowerShell process.
             w = self.window(tag, "still", lambda: self.hold(seconds), **rec)
@@ -1674,8 +1674,8 @@ class Spot:
         deadline = time.time() + live_seconds + 60 * steps + 120
         log = os.path.join(self.out, "amp_watchdog.log")
         rec = {"hwnd": hwnd, "before": amp_window.state(with_webview=True), "watchdogLog": log,
-               "watchdogDeadline": time.strftime("%H:%M:%S", time.localtime(deadline)),
-               "watchdogPid": amp_window.start_watchdog(hwnd, deadline, log)}
+               "watchdogDeadline": time.strftime("%H:%M:%S", time.localtime(deadline)), "watchdogCancel": log + ".cancel"}
+        rec["watchdogPid"] = amp_window.start_watchdog(hwnd, deadline, log, cancel=rec["watchdogCancel"])
         print(f"AMP WINDOW test: watchdog pid {rec['watchdogPid']} restores hwnd {hwnd} at {rec['watchdogDeadline']}",
               flush=True)
         return rec
@@ -1703,7 +1703,8 @@ class Spot:
                "watchdogLog": log, "watchdogDeadline": time.strftime("%H:%M:%S", time.localtime(deadline)),
                "notMinimized": []}
         fg0 = user32.GetForegroundWindow()
-        rec["watchdogPid"] = amp_window.start_watchdog(hwnd, deadline, log)
+        rec["watchdogCancel"] = log + ".cancel"
+        rec["watchdogPid"] = amp_window.start_watchdog(hwnd, deadline, log, cancel=rec["watchdogCancel"])
         self.amp_hold = rec
         amp_window.minimize(hwnd)
         self.hold(2.0)
@@ -1727,11 +1728,49 @@ class Spot:
         return amp_window.is_minimized(h["hwnd"]) if h and h.get("hwnd") else None
 
     def amp_note(self, w: dict, a: bool | None, b: bool | None) -> None:
+        """Coordinator, Nov 17 after 144150 (the window came back mid-launch): a window whose start or end read finds
+        the Amp window not minimized is void on its own (amp_void_windows moves it out at the spot's end); the Amp
+        window is minimized again and read back, and only a re-minimize that fails voids the whole spot."""
         if a is None:
             return
         w["ampMinimized"] = [a, b]
-        if not (a and b):
-            self.amp_hold["notMinimized"].append(w["name"])
+        if a and b:
+            return
+        w["ampVoid"] = "the Amp window read not minimized at the window's " + \
+            " and ".join(n for n, ok in (("start", a), ("end", b)) if not ok)
+        self.amp_hold["notMinimized"].append(w["name"])
+        self.amp_reminimize(w["name"])
+
+    def amp_reminimize(self, after: str) -> None:
+        rec = self.amp_hold
+        amp_window.minimize(rec["hwnd"])
+        self.hold(2.0)
+        st = amp_window.state()
+        r = {"after": after, "time": time.strftime("%H:%M:%S"), "readBack": amp_window.read_back("minimized", st),
+             "foreground": amp_window.foreground_program()}
+        rec.setdefault("reminimized", []).append(r)
+        print(f"AMP WINDOW came back by the end of {after} (that window is void); minimized again at {r['time']}: "
+              f"read back {r['readBack']}; foreground {r['foreground']}", flush=True)
+        if not r["readBack"]:
+            rec["reminimizeFailed"] = after
+            raise RuntimeError(f"VOID: the Amp window came back by the end of {after} and did not read back "
+                               f"minimized when minimized again")
+
+    def amp_void_windows(self) -> list:
+        """At the spot's end: the windows amp_note voided leave spot.json's windows for ampVoidWindows, and their
+        pictures (gate\\<stop>_raster.pfm and .json) move to gate_void\\, so no reader scores them."""
+        void = [w for w in self.windows if w.get("ampVoid")]
+        self.windows = [w for w in self.windows if not w.get("ampVoid")]
+        for w in void:
+            w["movedToGateVoid"] = []
+            r = w.get("raster")
+            for p in ([r, r[:-len(".pfm")] + ".json"] if r else []):
+                src = os.path.join(self.out, p)
+                if os.path.exists(src):
+                    os.makedirs(os.path.join(self.out, "gate_void"), exist_ok=True)
+                    os.replace(src, os.path.join(self.out, "gate_void", os.path.basename(src)))
+                    w["movedToGateVoid"].append(p)
+        return void
 
     def amp_hold_end(self) -> None:
         """When the launch ends, also after a failure: the Amp window restored and read back; allMinimized says whether
@@ -1746,9 +1785,15 @@ class Spot:
             rec["after"] = amp_window.state()
         except Exception as e:   # noqa: BLE001
             rec["after"] = {"error": f"{type(e).__name__}: {e}"}
-        rec["allMinimized"] = bool(rec.get("readBack")) and not rec["notMinimized"]
-        print(f"AMP WINDOW after the launch: minimized throughout {rec['allMinimized']}, restored "
-              f"{not rec['after'].get('minimized', True)}", flush=True)
+        # 144150: a spot's watchdog outlived its spot and restored the window inside the next launch.
+        rec["watchdogCancelled"] = amp_window.cancel_watchdog(rec["watchdogCancel"], rec["watchdogLog"])
+        # Every window kept in spot.json read minimized at its start and end: the ones that did not are void on their
+        # own (notMinimized, amp_void_windows). Not minimized throughout = no read-back before the steps, or a
+        # re-minimize that failed.
+        rec["allMinimized"] = bool(rec.get("readBack")) and not rec.get("reminimizeFailed")
+        print(f"AMP WINDOW after the launch: kept windows minimized throughout {rec['allMinimized']}, void windows "
+              f"{rec['notMinimized']}, restored {not rec['after'].get('minimized', True)}, watchdog cancelled "
+              f"{rec['watchdogCancelled']}", flush=True)
 
     def amp_back(self) -> None:
         """After the live steps, also when one failed: the Amp window restored and read back."""
@@ -1758,7 +1803,10 @@ class Spot:
             self.amp_test["after"] = amp_window.state()
         except Exception as e:   # noqa: BLE001
             self.amp_test["after"] = {"error": f"{type(e).__name__}: {e}"}
-        print(f"AMP WINDOW after the live steps: minimized {self.amp_test['after'].get('minimized')}", flush=True)
+        self.amp_test["watchdogCancelled"] = amp_window.cancel_watchdog(self.amp_test["watchdogCancel"],
+                                                                        self.amp_test["watchdogLog"])
+        print(f"AMP WINDOW after the live steps: minimized {self.amp_test['after'].get('minimized')}, watchdog "
+              f"cancelled {self.amp_test['watchdogCancelled']}", flush=True)
 
     def monitors_back(self, cfg: dict, mon: dict) -> None:
         """After the monitor steps, also when one failed: whether both monitors are attached again (the driver sends
@@ -2596,6 +2644,7 @@ def main() -> int:
         if s and s.amp_hold:
             s.amp_hold_end()
             result["ampWindow"]["hold"] = s.amp_hold
+            result["ampVoidWindows"] = s.amp_void_windows()
             if amp_hold_void(s.amp_hold) and not result["error"]:
                 result["error"] = amp_hold_void(s.amp_hold)
         result["ampWindow"]["end"] = amp_state()

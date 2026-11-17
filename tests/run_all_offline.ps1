@@ -70,6 +70,10 @@ foreach ($rel in 'analysis\brightness\pfm_brightness.py', 'analysis\brightness\a
 # Live, no game: the Amp-window watchdog a launch starts must open no window and leave the focus alone. In
 # 20261117-122718 its console window took the focus from the game and the mouse calibration read no turn.
 Step 'amp_window.py --quiet-check' { Native $py @((Join-Path $testsDir 'runtime\amp_window.py'), '--quiet-check') }
+# Live, no game, no window touched: a watchdog told to cancel must exit before its deadline. In 20261117-144150 the
+# watchdog of the previous launch's con_custodial spot restored the Amp window mid-launch and voided it.
+Step 'amp_window.py --cancel-check' { Native $py @((Join-Path $testsDir 'runtime\amp_window.py'), '--cancel-check') }
+Step 'amp_window.py --self-test' { Native $py @((Join-Path $testsDir 'runtime\amp_window.py'), '--self-test') }
 foreach ($file in Get-ChildItem $testsDir -Filter 'verify_materials_*.py' | Sort-Object Name) {
     Step $file.Name { Native $py @($file.FullName) }
 }

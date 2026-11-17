@@ -175,11 +175,17 @@ WATCHDOG_FLAGS = 0x08000000 | 0x00000200 | 0x01000000
 OLD_DETACHED_FLAGS = 0x00000008 | 0x00000200 | 0x01000000   # kept only for quiet_check's fake case
 
 
-def start_watchdog(hwnd: int, deadline: float, log: str | None, flags: int = WATCHDOG_FLAGS) -> int:
-    """A process outside this process tree's job, with no window, that restores the window at `deadline` (epoch s)."""
+def start_watchdog(hwnd: int, deadline: float, log: str | None, flags: int = WATCHDOG_FLAGS,
+                   cancel: str | None = None) -> int:
+    """A process outside this process tree's job, with no window, that restores the window at `deadline` (epoch s),
+    unless the file `cancel` appears first (cancel_watchdog), when it exits without touching the window."""
     args = [sys.executable, "-I", os.path.abspath(__file__), "watchdog", "--hwnd", str(hwnd), "--at", f"{deadline:.1f}"]
     if log:
         args += ["--log", log]
+    if cancel:
+        if os.path.exists(cancel):
+            os.remove(cancel)
+        args += ["--cancel", cancel]
     try:
         p = subprocess.Popen(args, creationflags=flags, close_fds=True, stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -251,14 +257,94 @@ def quiet_check(flags: int = WATCHDOG_FLAGS) -> dict:
     return out
 
 
-def watchdog(hwnd: int, at: float, log: str | None) -> int:
+def _alive(pid: int) -> bool:
+    kernel32.OpenProcess.restype = wt.HANDLE
+    h = kernel32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    try:
+        code = wt.DWORD()
+        return bool(kernel32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259   # STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def cancel_check(broken: bool = False) -> dict:
+    """Live, no game, no window touched: a watchdog (window 0, deadline 4 s out) told to cancel after 1 s must log
+    "cancelled" and be gone before its deadline. broken: the cancel file is never written, so it runs to its deadline
+    and the check must fail."""
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="ampwd-") as d:
+        log, cancel = os.path.join(d, "wd.log"), os.path.join(d, "wd.cancel")
+        deadline = time.time() + 4.0
+        pid = start_watchdog(0, deadline, log, cancel=cancel)
+        time.sleep(1.0)
+        tree = process_tree(pid)
+        logged = cancel_watchdog(cancel, log) if not broken else False
+        time.sleep(1.0)
+        before_deadline = time.time() < deadline
+        left = sorted(p for p in tree if _alive(p))
+        text = open(log, encoding="utf-8").read() if os.path.exists(log) else ""
+        time.sleep(max(0.0, deadline - time.time()) + 1.5)   # let a broken one finish before the folder goes
+    out = {"cancelledLogged": "cancelled" in text, "cancelReturned": logged, "aliveAfterCancel": left,
+           "checkedBeforeDeadline": before_deadline, "log": text.strip().splitlines()}
+    out["ok"] = out["cancelledLogged"] and logged and not left and before_deadline
+    return out
+
+
+def cancel_watchdog(cancel: str, log: str | None, wait: float = 3.0) -> bool:
+    """The caller restored the window itself: tell its watchdog to exit. True when the watchdog logged that it did.
+    Without this a spot's watchdog outlived the spot: 133918 con_custodial's (deadline 14:48:15) restored the Amp
+    window in the middle of the next launch, 144150 con_bright_hall, and voided it."""
+    with open(cancel, "w", encoding="utf-8") as f:
+        f.write(time.strftime("%H:%M:%S"))
+    end = time.time() + wait
+    while time.time() < end:
+        if log and os.path.exists(log):
+            with open(log, encoding="utf-8") as f:
+                if "cancelled" in f.read():
+                    return True
+        time.sleep(0.2)
+    return False
+
+
+def foreground_program() -> str:
+    """The program that owns the foreground window, as "<exe> (pid N)"; "none" when no window has the focus."""
+    h = user32.GetForegroundWindow()
+    if not h:
+        return "none"
+    pid = wt.DWORD()
+    user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+    return f"{_exe(pid.value) or '?'} (pid {pid.value})"
+
+
+def watch_step(seen: bool | None, minimized: bool, fg: str) -> tuple[bool, str | None]:
+    """One look of the watchdog (coordinator, Nov 17: when does the window come back, to the second, and what had the
+    focus then). Returns the new remembered state and a log line on the first look and whenever the state changed."""
+    if seen is not None and minimized == seen:
+        return seen, None
+    what = "minimized" if minimized else "NOT minimized"
+    return minimized, (f"state: {what} (first look)" if seen is None else f"state changed: {what}") + f"; foreground {fg}"
+
+
+def watchdog(hwnd: int, at: float, log: str | None, cancel: str | None = None) -> int:
     def note(msg):
         if log:
             with open(log, "a", encoding="utf-8") as f:
                 f.write(f"{time.strftime('%H:%M:%S')} pid {os.getpid()} {msg}\n")
-    note(f"watching hwnd {hwnd}, restore at {time.strftime('%H:%M:%S', time.localtime(at))}")
+    note(f"watching hwnd {hwnd}, restore at {time.strftime('%H:%M:%S', time.localtime(at))}"
+         f"{'' if not cancel else ', unless cancelled'}")
+    seen, next_look = None, 0.0
     while time.time() < at:
-        time.sleep(min(1.0, max(0.0, at - time.time())))
+        if cancel and os.path.exists(cancel):
+            note("cancelled: the caller restored the window itself; exiting without touching it")
+            return 0
+        if time.time() >= next_look:   # once a second: a line whenever the window's state changes
+            next_look = time.time() + 1.0
+            seen, line = watch_step(seen, bool(user32.IsIconic(hwnd)), foreground_program())
+            if line:
+                note(line)
+        time.sleep(min(0.5, max(0.0, at - time.time())))
     if not user32.IsWindow(hwnd):
         note("window gone; nothing to do")
         return 0
@@ -279,6 +365,16 @@ def self_test() -> int:
              ("asked as is, read as is", read_back("as_is", {"found": True, "minimized": False})),
              ("asked as is, read minimized", not read_back("as_is", {"found": True, "minimized": True})),
              ("no Amp window", not read_back("as_is", {"found": False}))]
+    # The watchdog's once-a-second look: a line on the first look and on each change, none while the state holds.
+    seen, lines = None, []
+    for m in (True, True, False, False, True):
+        seen, line = watch_step(seen, m, "Amp.exe (pid 7)")
+        lines.append(line)
+    cases += [("first look logged", lines[0] == "state: minimized (first look); foreground Amp.exe (pid 7)"),
+              ("no line while the state holds", lines[1] is None and lines[3] is None),
+              ("restore logged with the foreground program",
+               lines[2] == "state changed: NOT minimized; foreground Amp.exe (pid 7)"),
+              ("minimized again logged", lines[4] is not None and lines[4].startswith("state changed: minimized"))]
     for name, ok in cases:
         print(f"{'ok  ' if ok else 'FAIL'} {name}")
     bad = sum(not ok for _, ok in cases)
@@ -310,7 +406,13 @@ def main(argv: list[str]) -> int:
         return 0
     if argv[:1] == ["watchdog"]:
         kv = dict(zip(argv[1::2], argv[2::2]))
-        return watchdog(int(kv["--hwnd"]), float(kv["--at"]), kv.get("--log"))
+        return watchdog(int(kv["--hwnd"]), float(kv["--at"]), kv.get("--log"), kv.get("--cancel"))
+    if argv[:1] == ["--cancel-check"]:
+        r = cancel_check(broken="--break-cancel" in argv)
+        print(json.dumps(r))
+        print(f"cancel check{' (fake case: no cancel file written)' if '--break-cancel' in argv else ''}:",
+              "PASS" if r["ok"] else "FAIL", flush=True)
+        return 0 if r["ok"] else 1
     print(__doc__)
     return 2
 

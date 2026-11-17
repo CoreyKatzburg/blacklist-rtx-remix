@@ -1,5 +1,7 @@
 """Camera steering of drive.py against a fake game that, like Blacklist at gate frame rates, applies mouse input once
 per frame and one frame late. Run from this folder: python -m unittest test_drive (about 15 s, no game)."""
+import os
+import tempfile
 import threading
 import time
 import unittest
@@ -1270,7 +1272,9 @@ class Reference(unittest.TestCase):
             steps = [{"monitorStep": "both_on", "ampWindow": a} for a in asks]
             with mock.patch.object(drive.amp_window, "find", lambda: (55, 1, "Amp")), \
                     mock.patch.object(drive.amp_window, "start_watchdog",
-                                      lambda h, at, log: calls.append(("watchdog", h)) or 999), \
+                                      lambda h, at, log, cancel=None: calls.append(("watchdog", h)) or 999), \
+                    mock.patch.object(drive.amp_window, "cancel_watchdog",
+                                      lambda c, log: calls.append(("cancel", os.path.basename(c))) or True), \
                     mock.patch.object(drive.amp_window, "state",
                                       lambda with_webview=False: {"found": True, "minimized": fake["min"]}), \
                     mock.patch.object(drive.amp_window, "minimize", mini), \
@@ -1292,15 +1296,16 @@ class Reference(unittest.TestCase):
         self.assertEqual([w["ampWindow"]["readBack"] for w in s.windows if "ampWindow" in w],
                          [True, True, True, False, True])
         s, calls, fake = run(fail_in=2)                                   # the game goes while minimized (step 2)
-        self.assertEqual(calls[-1], "restore")
+        self.assertEqual(calls[-2:], ["restore", ("cancel", "amp_watchdog.log.cancel")])   # restored, then cancelled
         self.assertFalse(fake["min"])
         self.assertEqual(s.amp_test["after"]["minimized"], False)
+        self.assertTrue(s.amp_test["watchdogCancelled"])
         with self.assertRaises(ValueError), \
                 mock.patch.object(drive.amp_window, "start_watchdog", lambda *a: self.fail("watchdog for a bad ask")):
             # an unknown state is refused before any change
             spot().bench({"settle": 0, "frames": 1, "liveSteps": [{"monitorStep": "both_on", "ampWindow": "hidden"}]})
 
-    def test_every_launch_holds_the_amp_window_minimized_and_a_window_where_it_was_not_voids_the_spot(self):
+    def test_every_launch_holds_the_amp_window_minimized_and_a_window_where_it_was_not_is_void_alone(self):
         # Coordinator, Nov 17 after 20261117-114305: every launch minimizes the Amp window before any measured step,
         # with the watchdog started first; each window records whether it read minimized at its start and end; a
         # window where it did not voids the spot; the window is restored at the end, also after a failure.
@@ -1311,16 +1316,18 @@ class Reference(unittest.TestCase):
         with self.assertRaises(ValueError):
             drive.amp_hold_wanted({"ampWindow": "hidden"})
 
-        def run(restore_in=None, minimize_takes=True, found=True, fail_in=None, focus_moves=False):
-            calls, fake = [], {"min": False, "n": 0, "fg": 0}
+        def run(restore_in=None, minimize_takes=True, found=True, fail_in=None, focus_moves=False,
+                reminimize_takes=True, out="out"):
+            calls, fake = [], {"min": False, "n": 0, "fg": 0, "minimizes": 0}
             s = drive.Spot.__new__(drive.Spot)
-            s.out, s.windows, s.yaw, s.pitch = "out", [], 0.0, 0.0
+            s.out, s.windows, s.yaw, s.pitch = out, [], 0.0, 0.0
             s.counters = lambda: {"telemetry": 0, "proxy": 0}
             s.hold = lambda seconds, until=None: None
 
             def mini(h):
                 calls.append("minimize")
-                fake["min"] = minimize_takes
+                fake["minimizes"] += 1
+                fake["min"] = minimize_takes if fake["minimizes"] == 1 else reminimize_takes
 
             def foreground():   # the game's window; another window once the watchdog has started, if focus_moves
                 fake["fg"] += 1
@@ -1334,7 +1341,11 @@ class Reference(unittest.TestCase):
                     raise RuntimeError("game gone")
             with mock.patch.object(drive.amp_window, "find", lambda: (55, 1, "Amp") if found else (0, 0, "")), \
                     mock.patch.object(drive.amp_window, "start_watchdog",
-                                      lambda h, at, log: calls.append(("watchdog", h)) or 999), \
+                                      lambda h, at, log, cancel=None: calls.append(("watchdog", h)) or
+                                      fake.update(cancel=cancel) or 999), \
+                    mock.patch.object(drive.amp_window, "cancel_watchdog",
+                                      lambda c, log: fake.update(cancelled=c) or True), \
+                    mock.patch.object(drive.amp_window, "foreground_program", lambda: "Blacklist_DX11_game.exe"), \
                     mock.patch.object(drive.amp_window, "state",
                                       lambda with_webview=False: {"found": True, "minimized": fake["min"]}), \
                     mock.patch.object(drive.amp_window, "is_minimized", lambda h: fake["min"]), \
@@ -1346,11 +1357,12 @@ class Reference(unittest.TestCase):
                 try:
                     s.amp_hold_start()
                     for i in range(3):
-                        s.window(f"still{i + 1}", "still", body)
+                        s.window(f"still{i + 1}", "still", body, raster=f"gate/still{i + 1}_raster.pfm")
                 except RuntimeError as e:
                     calls.append(f"error: {e}")
                 finally:
                     s.amp_hold_end()
+            s.fake = fake
             return s, calls
         s, calls = run()
         self.assertEqual(calls[:2], [("watchdog", 55), "minimize"])                    # watchdog before the change
@@ -1359,10 +1371,39 @@ class Reference(unittest.TestCase):
         self.assertIsNone(drive.amp_hold_void(s.amp_hold))
         self.assertEqual(calls[-1], "restore")
         self.assertFalse(s.amp_hold["after"]["minimized"])
-        s, _ = run(restore_in=2)                                                      # restored inside window 2
-        self.assertEqual([w["ampMinimized"] for w in s.windows], [[True, True], [True, False], [False, False]])
-        self.assertEqual(s.amp_hold["notMinimized"], ["still2", "still3"])
+        # 144150: a spot's watchdog outlived the spot. The watchdog gets a cancel file, written after the restore.
+        self.assertEqual(s.fake["cancel"], os.path.join("out", "amp_watchdog.log.cancel"))
+        self.assertEqual(s.fake["cancelled"], s.fake["cancel"])
+        self.assertTrue(s.amp_hold["watchdogCancelled"])
+        # Coordinator, Nov 17 after 144150: restored inside window 2. Only window 2 is void; the window is minimized
+        # again after it, window 3 reads minimized and is kept, and the spot is not void.
+        with tempfile.TemporaryDirectory() as out:
+            os.makedirs(os.path.join(out, "gate"))
+            for i in (1, 2, 3):
+                for ext in ("pfm", "json"):
+                    open(os.path.join(out, "gate", f"still{i}_raster.{ext}"), "w").close()
+            s, calls = run(restore_in=2, out=out)
+            self.assertEqual([w["ampMinimized"] for w in s.windows], [[True, True], [True, False], [True, True]])
+            self.assertEqual(s.amp_hold["notMinimized"], ["still2"])
+            self.assertEqual([r["after"] for r in s.amp_hold["reminimized"]], ["still2"])
+            self.assertTrue(s.amp_hold["reminimized"][0]["readBack"])
+            self.assertTrue(s.amp_hold["allMinimized"])
+            self.assertIsNone(drive.amp_hold_void(s.amp_hold))
+            void = s.amp_void_windows()   # the spot's end: the void window and its picture leave what gets scored
+            self.assertEqual([w["name"] for w in void], ["still2"])
+            self.assertEqual(void[0]["ampVoid"], "the Amp window read not minimized at the window's end")
+            self.assertEqual([w["name"] for w in s.windows], ["still1", "still3"])
+            self.assertEqual(sorted(os.listdir(os.path.join(out, "gate_void"))),
+                             ["still2_raster.json", "still2_raster.pfm"])
+            self.assertEqual(sorted(os.listdir(os.path.join(out, "gate"))),
+                             ["still1_raster.json", "still1_raster.pfm", "still3_raster.json", "still3_raster.pfm"])
+        s, calls = run(restore_in=2, reminimize_takes=False)                          # the re-minimize fails
+        self.assertIn("error: VOID: the Amp window came back by the end of still2 and did not read back minimized "
+                      "when minimized again", calls)
+        self.assertEqual([w["name"] for w in s.windows], ["still1", "still2"])        # window 3 never ran
+        self.assertFalse(s.amp_hold["allMinimized"])
         self.assertIn("VOID", drive.amp_hold_void(s.amp_hold))
+        self.assertEqual(calls[-1], "restore")
         s, calls = run(minimize_takes=False)                                          # the minimize does not take
         self.assertIn("error: VOID: the Amp window did not read back minimized before the measured steps", calls)
         self.assertEqual(s.windows, [])
