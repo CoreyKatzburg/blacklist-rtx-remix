@@ -47,7 +47,8 @@
 # off (screen frames come from gdigrab; the camera is set in memory). Only the goggle keys and the title-screen
 # keys need the game window in front, which this script does itself.
 param([string[]]$Spots = @(), [switch]$DryRun, [string]$CaptureCheckpoint = '', [switch]$Launch, [string]$Evaluate = '', [switch]$SkipInstall, [string]$SaveFrom = '',
-      [string]$Previous = '', [string]$Reference = '', [switch]$NoRemix, [string]$Variants = '', [string]$RestoreFrom = '')
+      [string]$Previous = '', [string]$Reference = '', [switch]$NoRemix, [string]$Variants = '', [string]$RestoreFrom = '',
+      [string]$SuiteNote = '')
 $ErrorActionPreference = 'Stop'
 $Tests = $PSScriptRoot
 $Runtime = Join-Path $Tests 'runtime'
@@ -572,7 +573,11 @@ $remixCommit = if (-not $stagedRec) { 'unknown: no play-setup\STAGED_REMIX.json'
                else { $stagedRec.commit }
 $build = [ordered]@{ remixCommit = $remixCommit; remixRuntimeSha256 = $runtimeHash; remixClientSha256 = $RemixClientHash
                      proxySha256 = Get-Hash (Join-Path $Setup 'd3d9.dll') }
-@{ spots = @($selected | ForEach-Object name); started = $Stamp; noRemix = [bool]$NoRemix; build = $build
+# offlineSuite (coordinator, Nov 16): which offline suite this launch relies on (-SuiteNote, for example "full suite last passed on
+# 08b9298, only the touched tests ran on <commit>"), and the tests commit with any modified tracked files.
+$suite = [ordered]@{ note = $SuiteNote; testsCommit = (git -C (Split-Path $Tests) rev-parse --short HEAD 2>$null)
+                     testsModified = @(git -C (Split-Path $Tests) status --porcelain --untracked-files=no 2>$null) }
+@{ spots = @($selected | ForEach-Object name); started = $Stamp; noRemix = [bool]$NoRemix; build = $build; offlineSuite = $suite
    variants = @(if ($sweep) { $runs | ForEach-Object dir }) } | ConvertTo-Json | Set-Content (Join-Path $runDir 'manifest.json')
 Write-Step "Builds: dxvk-remix $remixCommit, proxy $($build.proxySha256.Substring(0, 12))"
 
