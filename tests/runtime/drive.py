@@ -32,6 +32,7 @@ import blmem  # noqa: E402
 import gate  # noqa: E402  (file helpers)
 import display  # noqa: E402  (display power state)
 import monitors  # noqa: E402  (which monitors Windows sees; DDC/CI power for the monitor test)
+import game_bits  # noqa: E402  (worker G: Sam invisible / godmode, guards blind, with read-back)
 
 FFMPEG = r"d:\ffmpeg\bin\ffmpeg.exe"
 CAP_W, CAP_H = 320, 180
@@ -560,6 +561,8 @@ def first_turned(dirs, t0: float, degrees: float = 0.5) -> float | None:
 
 # --- one spot ------------------------------------------------------------------------------------------------
 class Spot:
+    bits: tuple[str, ...] = ()   # no "bits" field: relink sets nothing (__init__ sets the spot's own list)
+
     def __init__(self, a, spot: dict, checkpoint: dict):
         self.a, self.spot, self.cp = a, spot, checkpoint
         self.out = a.out
@@ -578,6 +581,10 @@ class Spot:
         self.game, self.process = blmem.attach(a.pid, a.exe_hash)
         self.relinks: list[dict] = []
         self._link_lock = threading.Lock()
+        # spot "bits" (worker G's game_bits, Nov 17): set after the spawn and again after every relink (a checkpoint
+        # reload makes a new pawn and new guards), cleared when the spot ends; every call is kept for spot.json.
+        self.bits: list[str] = list(spot.get("bits", []))
+        self.bit_calls: list[dict] = []
         self.controller, self.pawn = self.wait_player(checkpoint)
         self.base_yaw = float(spot.get("baseYaw", checkpoint["yaw"]))
         self.base_pitch = float(spot.get("basePitch", checkpoint["pitch"]))
@@ -817,6 +824,21 @@ class Spot:
             self.relinks.append({"at": time.strftime("%H:%M:%S"), "afterWindow": len(self.windows),
                                  "old": [hex(v) for v in old], "new": [hex(self.controller), hex(self.pawn)]})
             print("RELINK", self.relinks[-1], flush=True)
+            if self.bits:
+                self.set_bits(True, "relink")
+
+    def set_bits(self, on: bool, why: str) -> dict:
+        """game_bits.apply on this spot's "bits", recorded as it returns, with when and why it was called."""
+        res = {**game_bits.apply(self.game, self.bits, on), "why": why, "at": time.strftime("%H:%M:%S")}
+        self.bit_calls.append(res)
+        print("BITS", json.dumps(res)[:500], flush=True)
+        return res
+
+    def bits_problem(self) -> str | None:
+        """NOT MEASURED when any set call did not read back (a bit that did not read back is never reported set)."""
+        bad = [f"{c['why']} at {c['at']}: {c.get('error') or [b for b, r in c['bits'].items() if not r.get('ok')]}"
+               for c in self.bit_calls if c["on"] and not c["ok"]]
+        return f"NOT MEASURED: bits {self.bits} did not read back ({'; '.join(bad)})" if bad else None
 
     def _rot(self) -> tuple[float, float]:
         controller = self.controller
@@ -1982,6 +2004,103 @@ class Spot:
         return rec
 
     def usd_capture(self, c: dict) -> dict:
+        """c["proxyIni"] {section: {key: value}} (worker E2, Nov 17, stage texture dump): proxy keys set for this
+        capture only and removed afterwards (the proxy reads a missing key as off)."""
+        keys = [(sec, k, str(v)) for sec, kv in c.get("proxyIni", {}).items() for k, v in kv.items()]
+        if not keys:
+            return self._usd_capture(c)
+        set_inis(self.ini, keys)
+        try:
+            rec = self._usd_capture(c)
+        finally:
+            for _, k, _ in keys:
+                remove_ini_key(self.ini, k)
+        rec["proxyIni"] = c["proxyIni"]
+        return rec
+
+    def bind_steps(self, c: dict, dest: str) -> dict:
+        """c["bindSteps"] [{"name", "rtx": {key: value}}] (worker C, Nov 17, dxvk-remix b2c355f and 1d1cb86): one USD
+        capture per step at the same stop, each with only the step's Remix settings changed (con_boiler:
+        rtx.capture.bindInstanceMaterials off, on, off). Per step: rtx.drawLog.waitForCapture=True and the step's
+        settings in one write; 3 s later a new rtx.drawLog.tag in its own write (Remix reads waitForCapture when the
+        tag changes); 3 s later CaptureDraws=1 and Ctrl+Shift+Q once. Remix then writes gate\\\\<tag>_remix_draws.tsv
+        for the frame the capture took, with capture=1 in its header. The step's tsv, draw dump and capture files go to
+        <dest>\\\\<step>\\\\ and the capture files are removed from the game folder. A step whose tsv is missing or reads
+        capture other than 1, or that has no new USD file, is an error."""
+        caps, dumps = os.path.join(self.a.system, "rtx-remix", "captures"), os.path.join(self.a.system, "framedump")
+        rlog = os.path.join(self.a.system, "rtx-remix", "logs", "remix-dxvk.log")
+        steps: list[dict] = []
+        set_ini(self.ini, "RemixConfig", "rtx.captureShowMenuOnHotkey", "False")
+        set_ini(self.ini, "RemixConfig", "rtx.enableReplacementAssets", "False")
+        try:
+            for st in c["bindSteps"]:
+                tag, sdest = f"{c['name']}_{st['name']}", os.path.join(dest, st["name"])
+                os.makedirs(sdest, exist_ok=True)
+                want = os.path.join(self.a.system, "gate", f"{tag}_remix_draws.tsv")
+                before = os.path.getmtime(want) if os.path.exists(want) else None   # an earlier launch's file
+                fresh = lambda: os.path.exists(want) and os.path.getmtime(want) != before
+                old_caps, old_dumps, mark = files_under(caps), files_under(dumps), os.path.getsize(rlog)
+
+                def remix_text() -> str:
+                    with open(rlog, "rb") as f:
+                        f.seek(mark)
+                        return f.read().decode("latin-1")
+                rec: dict = {"name": st["name"], "tag": tag, "rtx": st.get("rtx", {})}
+                set_inis(self.ini, [("RemixConfig", "rtx.drawLog.waitForCapture", "True")] +
+                         [("RemixConfig", k, str(v)) for k, v in rec["rtx"].items()])
+                self.hold(3.0)
+                set_inis(self.ini, [("RemixConfig", "rtx.drawLog.tag", tag)])
+                self.hold(3.0)
+                hwnd = game_window(self.a.pid)
+                if not hwnd or not front(hwnd):
+                    raise RuntimeError("no game window in front for the capture hotkey")
+                rec["askedFrame"], rec["askedAt"] = self.proxy.last_frame(), time.strftime("%H:%M:%S")
+                set_ini(self.ini, "Proxy", "CaptureDraws", "1")
+                tap("CTRL+SHIFT+Q")
+                try:
+                    self.hold(float(c.get("exportSeconds", 300)),
+                              until=lambda: "End USD export" in remix_text() or "Cannot begin" in remix_text())
+                    self.hold(10.0, until=fresh)
+                    self.hold(3.0)   # texture files may still be closing
+                finally:
+                    set_inis(self.ini, [("Proxy", "CaptureDraws", "0"), ("RemixConfig", "rtx.drawLog.tag", "")])
+                rec["remixLog"] = [l for l in remix_text().splitlines() if "GameCapturer" in l][:10]
+                rec["remixFile"], rec["capture"] = None, None
+                if fresh():
+                    rec["remixFile"] = os.path.basename(want)
+                    shutil.copy2(want, os.path.join(sdest, rec["remixFile"]))
+                    with open(want, encoding="latin-1") as f:
+                        m = re.search(r"\tcapture=(\d+)", f.readline())
+                    rec["capture"] = int(m.group(1)) if m else None
+                rec["drawDump"] = written_since(dumps, old_dumps)
+                for n in rec["drawDump"]:
+                    shutil.copy2(os.path.join(dumps, n), os.path.join(sdest, os.path.basename(n)))
+                added = written_since(caps, old_caps)
+                for rel in added:
+                    os.makedirs(os.path.dirname(os.path.join(sdest, rel)), exist_ok=True)
+                    shutil.copy2(os.path.join(caps, rel), os.path.join(sdest, rel))
+                    os.remove(os.path.join(caps, rel))
+                rec["captureFiles"] = len(added)
+                rec["usd"] = [r for r in added if r.lower().endswith((".usd", ".usda", ".usdc"))]
+                problems = ([] if rec["remixFile"] else ["no draw log"]) + \
+                           ([] if not rec["remixFile"] or rec["capture"] == 1 else [f"draw log capture={rec['capture']}"]) + \
+                           ([] if rec["usd"] else ["no new USD capture file"])
+                if problems:
+                    rec["error"] = "; ".join(problems)
+                steps.append(rec)
+        finally:
+            set_inis(self.ini, [("Proxy", "CaptureDraws", "0"), ("RemixConfig", "rtx.drawLog.tag", ""),
+                                ("RemixConfig", "rtx.drawLog.waitForCapture", "False"),
+                                ("RemixConfig", "rtx.enableReplacementAssets", "True")])
+            remove_ini_key(self.ini, "rtx.captureShowMenuOnHotkey")
+            self.hold(3.0)
+        out: dict = {"bindSteps": steps}
+        bad = [f"{s['name']}: {s['error']}" for s in steps if s.get("error")]
+        if bad:
+            out["error"] = "; ".join(bad)
+        return out
+
+    def _usd_capture(self, c: dict) -> dict:
         """Worker E (Nov 16): which texture each draw binds. Teleports to c["teleport"], takes the y0_p0 stop as
         <name>_y0_p0 (final.pfm and, when listed in rasterStops, the ray-tracing-off raster), then asks in the same
         second for the proxy's draw dump ([Proxy] CaptureDraws) and a Remix USD capture (Ctrl+Shift+Q with
@@ -2002,6 +2121,9 @@ class Spot:
         rec["rayTracing"] = self.rt_is_on()
         dest = os.path.join(self.out, name, "capture")
         os.makedirs(dest, exist_ok=True)
+        if c.get("bindSteps"):
+            rec.update(self.bind_steps(c, dest))
+            return rec
         # c["drawLog"] (worker C, Nov 16, white tanks): Remix's per-draw log for one frame with the proxy's draw dump
         # of the same moment, first as the scene is (replacement assets on), then again while the USD capture runs.
         draw_log = c.get("drawLog")
@@ -2213,6 +2335,11 @@ def main() -> int:
         if gap > 150:
             raise RuntimeError(f"Sam spawned {gap:.0f} units from the recorded checkpoint position")
         s.home = list(loc)
+        if s.bits:   # before the teleport: the landing is what godmode and blind protect
+            result["bits"] = {"asked": s.bits, "calls": s.bit_calls}
+            s.set_bits(True, "start")
+            if s.bits_problem():
+                raise RuntimeError(s.bits_problem())
         if spot.get("landWithin"):
             result["landWithin"] = s.land_within(spot["teleport"], spot["landWithin"])
             if result["landWithin"]["result"] != "LANDED":   # no stills from a landing the pairing would refuse
@@ -2297,6 +2424,13 @@ def main() -> int:
         print("SPOT ERROR", result["error"])
         traceback.print_exc(file=sys.stdout)   # where it failed, in drive.log
     finally:
+        if s and s.bits:   # clear, so the next spot starts clean; a set that failed after a relink voids the spot
+            try:
+                s.set_bits(False, "end")
+            except Exception as e:   # noqa: BLE001
+                s.bit_calls.append({"on": False, "ok": False, "why": "end", "error": f"{type(e).__name__}: {e}"})
+            if s.bits_problem() and not result["error"]:
+                result["error"] = s.bits_problem()
         if s:
             result["windows"] = s.windows
             result["relinks"] = s.relinks

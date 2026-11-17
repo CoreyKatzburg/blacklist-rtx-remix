@@ -1234,6 +1234,157 @@ class Reference(unittest.TestCase):
         self.assertEqual(rec["error"], "no new USD capture file")
         self.assertIn("Cannot begin capture", rec["remixLog"][0])
 
+    def test_bits_are_set_again_after_a_relink_and_a_bit_that_did_not_read_back_voids_the_spot(self):
+        # Worker G's game_bits on the spot "bits" field: every call is recorded; a relink (new pawn, new guards) sets
+        # them again; a set that did not read back makes the spot NOT MEASURED. No "bits" field: no call at all.
+        import threading, types
+        calls = []
+
+        def fake_apply(game, bits, on=True):
+            calls.append((tuple(bits), on))
+            ok = not (on and len(calls) == 2 and game.fail_second)   # the set after the relink fails
+            return {"on": on, "asked": list(bits), "ok": ok, "error": None,
+                    "bits": {b: {"ok": ok or b != "blind"} for b in bits}}
+
+        def spot(bits, fail_second=False):
+            s = drive.Spot.__new__(drive.Spot)
+            s.game = types.SimpleNamespace(player=lambda: (0x10, 0x20), fail_second=fail_second)
+            s.bits, s.bit_calls, s.relinks, s.windows = list(bits), [], [], []
+            s._link_lock, s.controller, s.pawn = threading.Lock(), 1, 2
+            return s
+
+        with mock.patch.object(drive.game_bits, "apply", fake_apply):
+            s = spot(["godmode", "blind"])
+            s.set_bits(True, "start")
+            s.relink()
+            s.set_bits(False, "end")
+            self.assertEqual([c["why"] for c in s.bit_calls], ["start", "relink", "end"])
+            self.assertEqual(calls, [(("godmode", "blind"), True)] * 2 + [(("godmode", "blind"), False)])
+            self.assertIsNone(s.bits_problem())
+            calls.clear()
+            s = spot(["godmode", "blind"], fail_second=True)
+            s.set_bits(True, "start")
+            s.relink()
+            self.assertIn("NOT MEASURED", s.bits_problem())
+            self.assertIn("relink", s.bits_problem())
+            self.assertIn("blind", s.bits_problem())
+            calls.clear()
+            s = spot([])
+            s.relink()
+            self.assertEqual(calls, [])
+            self.assertEqual(s.bit_calls, [])
+
+    def test_bind_steps_take_one_capture_per_setting_and_void_a_log_the_capture_did_not_fill(self):
+        # Worker C's binding proof: off, on, off at one stop. Each step's own tsv must come from the captured frame
+        # (capture=1) under that step's setting, its capture files land in its own folder, E2's proxy keys exist only
+        # during the capture, and everything is put back. The fake case: a Remix that ignores waitForCapture writes
+        # the log at once with capture=0, and every step must then read as an error.
+        import os, re, shutil, tempfile, types
+
+        def run(honours_wait):
+            tmp = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, tmp, True)
+            system, out = os.path.join(tmp, "SYSTEM"), os.path.join(tmp, "out")
+            caps, dumps = os.path.join(system, "rtx-remix", "captures"), os.path.join(system, "framedump")
+            logs, gate_dir = os.path.join(system, "rtx-remix", "logs"), os.path.join(system, "gate")
+            for d in (caps, dumps, logs, gate_dir, out):
+                os.makedirs(d)
+            rlog = os.path.join(logs, "remix-dxvk.log")
+            with open(rlog, "w") as f:
+                f.write("[GameCapturer][old] End USD export\n")   # an earlier capture's line must not count
+            ini = os.path.join(system, "d3d9_proxy.ini")
+            with open(ini, "w", newline="") as f:
+                f.write("[Proxy]\r\nCaptureDraws=0\r\n[RemixConfig]\r\nrtx.x = 1\r\n")
+            state = {"frame": 0, "last_tag": "", "armed": None, "n": 0}
+            writes: list[str] = []
+            real_write = drive.write_ini
+
+            def record(path, text):
+                writes.append(text)
+                real_write(path, text)
+
+            def opt(text, key):
+                m = re.search(r"(?m)^" + re.escape(key) + r" = (.*?)\r?$", text)
+                return m.group(1).strip() if m else ""
+
+            def write_log(tag, captured, text):
+                with open(os.path.join(gate_dir, f"{tag}_remix_draws.tsv"), "w") as f:
+                    f.write(f"remixframe\tframe={state['frame']}\ttag={tag}\tdraws=1\tcapture={captured}\n"
+                            f"bind={opt(text, 'rtx.capture.bindInstanceMaterials')}\n")
+
+            def frame(seconds=0, until=None):
+                state["frame"] += 1
+                with open(ini) as f:
+                    text = f.read()
+                tag = opt(text, "rtx.drawLog.tag")
+                if tag and tag != state["last_tag"]:
+                    if honours_wait and opt(text, "rtx.drawLog.waitForCapture") == "True":
+                        state["armed"] = tag
+                    else:
+                        write_log(tag, 0, text)
+                state["last_tag"] = tag
+                return until() if until else None
+
+            def press(key):
+                self.assertEqual(key, "CTRL+SHIFT+Q")
+                with open(ini) as f:
+                    text = f.read()
+                self.assertIn("rtx.enableReplacementAssets = False", text)
+                self.assertIn("CaptureDraws=1", text)
+                self.assertIn("DumpStageTexturesPs=BF48978C", text)   # E2's keys during the capture
+                state["n"] += 1
+                open(os.path.join(dumps, f"f{state['frame']}_draws.tsv"), "w").close()
+                os.makedirs(os.path.join(caps, "meshes"), exist_ok=True)
+                open(os.path.join(caps, f"capture_{state['n']}.usda"), "w").close()
+                open(os.path.join(caps, "meshes", "m.usd"), "w").close()
+                if state["armed"]:
+                    write_log(state["armed"], 1, text)
+                    state["armed"] = None
+                with open(rlog, "a") as f:
+                    f.write(f"[GameCapturer][{state['n']}] New capture\n[GameCapturer][{state['n']}] End USD export\n")
+
+            s = drive.Spot.__new__(drive.Spot)
+            s.a = types.SimpleNamespace(system=system, pid=1)
+            s.ini, s.out = ini, out
+            s.proxy = types.SimpleNamespace(last_frame=lambda: state["frame"])
+            s.teleport, s.move, s.stop = (lambda tp: {"sideways": 0}), (lambda *a: None), (lambda name: None)
+            s.rt_is_on, s.hold = (lambda: {"rayTracedLastFrames": [True]}), frame
+            key = "rtx.capture.bindInstanceMaterials"
+            c = {"name": "bind_boiler", "teleport": {},
+                 "bindSteps": [{"name": "bind_off1", "rtx": {key: "False"}}, {"name": "bind_on", "rtx": {key: "True"}},
+                               {"name": "bind_off2", "rtx": {key: "False"}}],
+                 "proxyIni": {"Proxy": {"DumpStageTexturesPs": "BF48978C,4BAFE381", "DumpStageTexturesStages": "0,1,2,12"}}}
+            with mock.patch.object(drive, "tap", press), mock.patch.object(drive, "game_window", lambda pid: 5), \
+                    mock.patch.object(drive, "front", lambda h: True), mock.patch.object(drive, "write_ini", record):
+                rec = s.usd_capture(c)
+            with open(ini) as f:
+                text = f.read()
+            return rec, caps, os.path.join(out, "bind_boiler", "capture"), text, writes
+
+        rec, caps, dest, text, writes = run(True)
+        self.assertNotIn("error", rec)
+        self.assertEqual([st["capture"] for st in rec["bindSteps"]], [1, 1, 1])
+        for st, want in zip(rec["bindSteps"], ["False", "True", "False"]):
+            with open(os.path.join(dest, st["name"], f"bind_boiler_{st['name']}_remix_draws.tsv")) as f:
+                self.assertEqual(f.read().splitlines()[1], f"bind={want}")   # logged under its own setting
+            self.assertEqual(len(st["usd"]), 2)
+            self.assertTrue(os.path.exists(os.path.join(dest, st["name"], "meshes", "m.usd")))
+            self.assertEqual(len(st["drawDump"]), 1)
+        self.assertEqual(drive.files_under(caps), {})
+        # The tag never arrives in the same write as waitForCapture=True, and never before it.
+        for i, w in enumerate(writes):
+            if re.search(r"(?m)^rtx\.drawLog\.tag = \S", w):
+                self.assertIn("rtx.drawLog.waitForCapture = True", writes[i - 1])
+        self.assertIn("rtx.drawLog.waitForCapture = False", text)
+        self.assertRegex(text, r"(?m)^rtx\.drawLog\.tag = \r?$")
+        self.assertIn("rtx.enableReplacementAssets = True", text)
+        self.assertIn("CaptureDraws=0", text)
+        self.assertNotIn("captureShowMenuOnHotkey", text)
+        self.assertNotIn("DumpStageTextures", text)
+        rec, *_ = run(False)
+        self.assertEqual([st.get("error") for st in rec["bindSteps"]], ["draw log capture=0"] * 3)
+        self.assertIn("bind_on: draw log capture=0", rec["error"])
+
     def test_draw_log_asks_both_logs_in_one_write_and_retakes_a_capture_the_logged_frame_missed(self):
         # Worker C's white-tank launch: Remix's draw log and the proxy's draw dump must reach the same frame, so the tag
         # and CaptureDraws=1 arrive in one ini write; the tag is cleared by sending it empty. The capture's logged frame
