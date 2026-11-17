@@ -68,6 +68,17 @@ if (Invoke-Cl 'draw_log_test' "/W4 /WX `"$here\draw_log_test.cpp`"") {
     Invoke-Check 'draw_log_test' { & "$build\draw_log_test.exe" }
 }
 
+# 2c. USD capture material binding (rtx.capture.bindInstanceMaterials). The /DFORCE_OPTION_OFF build runs the
+#     "option on" expectations with the option off and must fail: that proves the test needs the fix to pass.
+if (Invoke-Cl 'capture_binding_test' "/W4 /WX `"$here\capture_binding_test.cpp`"") {
+    Invoke-Check 'capture_binding_test' { & "$build\capture_binding_test.exe" }
+}
+if (Invoke-Cl 'capture_binding_test_off' "/W4 /WX /DFORCE_OPTION_OFF `"$here\capture_binding_test.cpp`"") {
+    Write-Host '=== capture_binding_test_off (must fail) ===' -ForegroundColor Cyan
+    & "$build\capture_binding_test_off.exe" | Out-Null
+    if ($LASTEXITCODE -eq 0) { $failed.Add('capture_binding_test_off passed without the fix') } else { Write-Host 'ok   fails without the fix' }
+}
+
 # 3. Bridge command queue (real header, linked with the x64 bridge util library).
 $libutil = Join-Path $bridgeDir '_Comp64Release\src\util\libutil.a'
 if (Test-Path -LiteralPath $libutil) {
