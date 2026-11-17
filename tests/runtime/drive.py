@@ -33,6 +33,7 @@ import gate  # noqa: E402  (file helpers)
 import display  # noqa: E402  (display power state)
 import monitors  # noqa: E402  (which monitors Windows sees; DDC/CI power for the monitor test)
 import game_bits  # noqa: E402  (worker G: Sam invisible / godmode, guards blind, with read-back)
+import amp_window  # noqa: E402  (the Amp app window: state per launch; minimized only for the Amp-window test)
 
 FFMPEG = r"d:\ffmpeg\bin\ffmpeg.exe"
 CAP_W, CAP_H = 320, 180
@@ -267,6 +268,14 @@ def quit_step(hwnd: int, key: str) -> None:
 
 def clock() -> str:
     return time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
+
+
+def amp_state(with_webview: bool = True) -> dict:
+    """The Amp app window's state, rectangle and monitor (amp_window.py); a failed read is recorded, not raised."""
+    try:
+        return amp_window.state(with_webview=with_webview)
+    except Exception as e:   # noqa: BLE001
+        return {"found": None, "error": f"{type(e).__name__}: {e}"}
 
 
 def minimize_restore(hwnd: int, seconds: float) -> dict:
@@ -562,6 +571,7 @@ def first_turned(dirs, t0: float, degrees: float = 0.5) -> float | None:
 # --- one spot ------------------------------------------------------------------------------------------------
 class Spot:
     bits: tuple[str, ...] = ()   # no "bits" field: relink sets nothing (__init__ sets the spot's own list)
+    amp_test: dict | None = None   # the Amp-window test's watchdog and records, when a live step asks "ampWindow"
 
     def __init__(self, a, spot: dict, checkpoint: dict):
         self.a, self.spot, self.cp = a, spot, checkpoint
@@ -1391,7 +1401,15 @@ class Spot:
             if bad:
                 raise ValueError(f"monitorStep {bad[0]!r} is not one of {MONITOR_STEPS}")
             mon: dict = {}   # monitor test state: layout before, whether the second monitor is still off
+            asks = [k.get("ampWindow") for k in cfg["liveSteps"] if k.get("ampWindow")]
+            if any(a not in amp_window.ASKS for a in asks):
+                raise ValueError(f"ampWindow must be one of {amp_window.ASKS}, got {asks}")
+            if asks and not all(k.get("monitorStep") for k in cfg["liveSteps"]):
+                raise ValueError("ampWindow needs a monitorStep on every live step (the plug-on windows it compares)")
             try:
+                if asks:   # the watchdog runs before the first change, whatever happens to this process afterwards
+                    self.amp_test = self.amp_watch(sum(float(k.get("seconds", seconds)) for k in cfg["liveSteps"]),
+                                                   len(cfg["liveSteps"]))
                 for i, keys in enumerate(cfg["liveSteps"]):
                     # "display": "awake" / "asleep" (coordinator, Nov 16: idle GPU power follows the display state): the
                     # displays are woken by a 0-count mouse move or put to sleep (SC_MONITORPOWER 2) before the step,
@@ -1406,10 +1424,21 @@ class Spot:
                         raise ValueError(f"live step {i + 1}: benchLoad {load!r} is not none, capture or sampler")
                     step_seconds = float(keys.pop("seconds", seconds))
                     mstep = keys.pop("monitorStep", None)
+                    amp_ask = keys.pop("ampWindow", None)
                     for k, v in keys.items():
                         set_ini(self.ini, "RemixConfig", k, str(v))
                     if mstep:
-                        self.monitor_step(f"live_step{i + 1}", mstep, step_seconds, cfg, mon, liveRtx=keys)
+                        amp_rec = self.amp_step(amp_ask) if amp_ask else None
+                        w = self.monitor_step(f"live_step{i + 1}", mstep, step_seconds, cfg, mon, liveRtx=keys)
+                        if amp_rec is not None:   # both reads sit outside the window's frame range
+                            amp_rec["end"] = amp_window.state()
+                            amp_rec["readBack"] = all(amp_window.read_back(amp_ask, amp_rec[k]) for k in ("start", "end"))
+                            w["ampWindow"] = amp_rec
+                            print(f"live_step{i + 1}: Amp window asked {amp_ask}, minimized "
+                                  f"{amp_rec['start'].get('minimized')} / {amp_rec['end'].get('minimized')}, read back "
+                                  f"{amp_rec['readBack']}", flush=True)
+                            if getattr(self, "save_partial", None):
+                                self.save_partial()
                         continue
                     shown = display.wake() if want == "awake" else display.sleep() if want == "asleep" else None
                     slept = slept or want == "asleep"
@@ -1448,6 +1477,8 @@ class Spot:
                     display.wake()
                 if mon:
                     self.monitors_back(cfg, mon)
+                if self.amp_test:
+                    self.amp_back()
         # cfg["lightSwitch"] (worker B, Nov 16, fog fade sweep at con_custodial): after the lit-room bench window, the
         # light switch with its light dumps, so each variant launch also measures the fade (frames/light_switch.gray).
         if cfg.get("lightSwitch"):
@@ -1601,6 +1632,38 @@ class Spot:
               f"at end {[(m['name'], m['available'], m['active']) for m in w['monitors']['end']]}, game window "
               f"{w['gameWindow']['start']} / {w['gameWindow']['end']}", flush=True)
         return w
+
+    def amp_watch(self, live_seconds: float, steps: int) -> dict:
+        """The Amp-window test (coordinator, Nov 17): the Amp app's window is found and a detached watchdog started that
+        restores it at a fixed deadline (live steps + 60 s each + 120 s) whatever happens to this process."""
+        hwnd = amp_window.find()[0]
+        if not hwnd:
+            raise RuntimeError("ampWindow asked but no Amp app window was found")
+        deadline = time.time() + live_seconds + 60 * steps + 120
+        log = os.path.join(self.out, "amp_watchdog.log")
+        rec = {"hwnd": hwnd, "before": amp_window.state(with_webview=True), "watchdogLog": log,
+               "watchdogDeadline": time.strftime("%H:%M:%S", time.localtime(deadline)),
+               "watchdogPid": amp_window.start_watchdog(hwnd, deadline, log)}
+        print(f"AMP WINDOW test: watchdog pid {rec['watchdogPid']} restores hwnd {hwnd} at {rec['watchdogDeadline']}",
+              flush=True)
+        return rec
+
+    def amp_step(self, ask: str) -> dict:
+        """Put the Amp window in the asked state ("minimized" or "as_is") before a live step, then read it back."""
+        hwnd = self.amp_test["hwnd"]
+        (amp_window.minimize if ask == "minimized" else amp_window.restore)(hwnd)
+        self.hold(2.0)
+        return {"asked": ask, "start": amp_window.state()}
+
+    def amp_back(self) -> None:
+        """After the live steps, also when one failed: the Amp window restored and read back."""
+        try:
+            amp_window.restore(self.amp_test["hwnd"])
+            time.sleep(1.0)
+            self.amp_test["after"] = amp_window.state()
+        except Exception as e:   # noqa: BLE001
+            self.amp_test["after"] = {"error": f"{type(e).__name__}: {e}"}
+        print(f"AMP WINDOW after the live steps: minimized {self.amp_test['after'].get('minimized')}", flush=True)
 
     def monitors_back(self, cfg: dict, mon: dict) -> None:
         """After the monitor steps, also when one failed: whether both monitors are attached again (the driver sends
@@ -2314,7 +2377,7 @@ def main() -> int:
     os.makedirs(a.out, exist_ok=True)
     display.send_log = os.path.join(a.out, display.SENDS_PREFIX + "_drive.csv")   # display.csv's input column
     result = {"name": spot["name"], "mission": spot.get("mission"), "nearField": spot.get("nearField", 300),
-              "error": None, "windows": []}
+              "error": None, "windows": [], "ampWindow": {"start": amp_state()}}   # recorded like the display state
     s = None
     ctypes.windll.winmm.timeBeginPeriod(1)
     try:
@@ -2431,7 +2494,10 @@ def main() -> int:
                 s.bit_calls.append({"on": False, "ok": False, "why": "end", "error": f"{type(e).__name__}: {e}"})
             if s.bits_problem() and not result["error"]:
                 result["error"] = s.bits_problem()
+        result["ampWindow"]["end"] = amp_state()
         if s:
+            if s.amp_test:
+                result["ampWindowTest"] = s.amp_test
             result["windows"] = s.windows
             result["relinks"] = s.relinks
             result["mouseCalibration"] = s.calibration

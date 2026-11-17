@@ -1234,6 +1234,72 @@ class Reference(unittest.TestCase):
         self.assertEqual(rec["error"], "no new USD capture file")
         self.assertIn("Cannot begin capture", rec["remixLog"][0])
 
+    def test_amp_window_steps_start_the_watchdog_first_read_back_each_window_and_restore_after_a_failure(self):
+        # Coordinator, Nov 17: as is, minimized, as is, minimized, as is inside one launch. The detached watchdog starts
+        # before any change; each window records the state asked and read back at its start and end (a minimize that
+        # did not take reads back false); the window is restored after the steps, also when a step failed.
+        def spot():
+            s = drive.Spot.__new__(drive.Spot)
+            s.ini, s.out, s.windows = "x.ini", "out", []
+            s.move = s.bench_window = s.dump = lambda *a: None
+            s.counters = lambda: {"telemetry": 0, "proxy": 0}
+            s.yaw = s.pitch = 0.0
+            s.hold = lambda seconds, until=None: None
+            return s
+
+        def run(ignore_minimize_in=None, fail_in=None):
+            calls, fake = [], {"min": False, "step": 0}
+            s = spot()
+
+            def mini(h):
+                calls.append("minimize")
+                fake["min"] = fake["step"] + 1 != ignore_minimize_in or fake["min"]
+
+            def rest(h):
+                calls.append("restore")
+                fake["min"] = False
+
+            def step(self_, tag, name, seconds, cfg, mon, **k):
+                fake["step"] += 1
+                if fake["step"] == fail_in:
+                    raise RuntimeError("game gone")
+                w = {"name": tag, "monitorStep": name}
+                self_.windows.append(w)
+                return w
+            asks = ["as_is", "minimized", "as_is", "minimized", "as_is"]
+            steps = [{"monitorStep": "both_on", "ampWindow": a} for a in asks]
+            with mock.patch.object(drive.amp_window, "find", lambda: (55, 1, "Amp")), \
+                    mock.patch.object(drive.amp_window, "start_watchdog",
+                                      lambda h, at, log: calls.append(("watchdog", h)) or 999), \
+                    mock.patch.object(drive.amp_window, "state",
+                                      lambda with_webview=False: {"found": True, "minimized": fake["min"]}), \
+                    mock.patch.object(drive.amp_window, "minimize", mini), \
+                    mock.patch.object(drive.amp_window, "restore", rest), \
+                    mock.patch.object(drive.Spot, "monitor_step", step):
+                try:
+                    s.bench({"settle": 0, "frames": 1, "liveSteps": steps, "liveStepSeconds": 45})
+                except RuntimeError:
+                    pass
+            return s, calls, fake
+        s, calls, fake = run()
+        self.assertEqual(calls[0], ("watchdog", 55))                       # before the first change
+        live = [w for w in s.windows if w["name"].startswith("live_step")]
+        self.assertEqual([w["ampWindow"]["asked"] for w in live], ["as_is", "minimized", "as_is", "minimized", "as_is"])
+        self.assertEqual([w["ampWindow"]["start"]["minimized"] for w in live], [False, True, False, True, False])
+        self.assertTrue(all(w["ampWindow"]["readBack"] for w in live))
+        self.assertEqual(s.amp_test["after"]["minimized"], False)
+        s, _, _ = run(ignore_minimize_in=4)                               # the second minimize does not take
+        self.assertEqual([w["ampWindow"]["readBack"] for w in s.windows if "ampWindow" in w],
+                         [True, True, True, False, True])
+        s, calls, fake = run(fail_in=2)                                   # the game goes while minimized (step 2)
+        self.assertEqual(calls[-1], "restore")
+        self.assertFalse(fake["min"])
+        self.assertEqual(s.amp_test["after"]["minimized"], False)
+        with self.assertRaises(ValueError), \
+                mock.patch.object(drive.amp_window, "start_watchdog", lambda *a: self.fail("watchdog for a bad ask")):
+            # an unknown state is refused before any change
+            spot().bench({"settle": 0, "frames": 1, "liveSteps": [{"monitorStep": "both_on", "ampWindow": "hidden"}]})
+
     def test_bits_are_set_again_after_a_relink_and_a_bit_that_did_not_read_back_voids_the_spot(self):
         # Worker G's game_bits on the spot "bits" field: every call is recorded; a relink (new pawn, new guards) sets
         # them again; a set that did not read back makes the spot NOT MEASURED. No "bits" field: no call at all.
