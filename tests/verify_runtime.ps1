@@ -554,6 +554,21 @@ function Set-GoggleBindings($path, $keys) {
     [IO.File]::WriteAllText($path, $text)
 }
 
+# Spot configs nest deeper than ConvertTo-Json's depth limit: worker B's see-through variants keep [section, key, value]
+# triples under bench.switchPoses[].switches[].ini, and -Depth 5 wrote them into spot_config.json as the text
+# "System.Object[]" (20261117-165257-settings: drive.py died in switch_test before any probe step). Every copy and
+# write of a spot goes through ConvertTo-SpotJson, which refuses output where a nested value became text.
+function Test-JsonCut([string]$json) {
+    $m = [regex]::Match($json, '.{0,60}"(System\.Object\[\]|@\{[^"]*)".{0,20}')
+    if ($m.Success) { $m.Value.Trim() } else { $null }
+}
+function ConvertTo-SpotJson($o) {
+    $json = $o | ConvertTo-Json -Depth 100
+    $cut = Test-JsonCut $json
+    if ($cut) { throw "spot config cut short by ConvertTo-Json (a nested value became text): $cut" }
+    $json
+}
+
 $sweep = $null
 if ($Variants) {
     if ($NoRemix -or $CaptureCheckpoint) { throw '-Variants measures Remix settings at an existing spot.' }
@@ -606,13 +621,15 @@ if (-not $selected.Count -and -not $CaptureCheckpoint) { throw "No spots selecte
 # One launch each: a spot, or for -Variants the same spot once per variant (drive.py runs only its "bench").
 $runs = @(if ($sweep) {
     foreach ($v in $sweep.variants) {
-        $copy = $selected[0] | ConvertTo-Json -Depth 6 | ConvertFrom-Json
-        $bench = $sweep.bench | ConvertTo-Json -Depth 6 | ConvertFrom-Json   # a variant's own bench keys win
+        $copy = ConvertTo-SpotJson $selected[0] | ConvertFrom-Json
+        $bench = ConvertTo-SpotJson $sweep.bench | ConvertFrom-Json   # a variant's own bench keys win
         foreach ($p in @(if ($v.bench) { $v.bench.PSObject.Properties })) { $bench | Add-Member $p.Name $p.Value -Force }
         $copy | Add-Member bench $bench -Force
         [pscustomobject]@{ dir = $v.name; spot = $copy; variant = $v }
     }
 } else { foreach ($one in $selected) { [pscustomobject]@{ dir = $one.name; spot = $one; variant = $null } } })
+# Every spot's config is checked before the game starts, so a config that cannot be written whole stops here.
+foreach ($cfgRun in $runs) { $null = ConvertTo-SpotJson $cfgRun.spot }
 # This run closes the game between spots. It must never close a game it did not start (Corey's own session).
 $running = Get-Process Blacklist_game, Blacklist_DX11_game, Blacklist_Launcher, NvRemixBridge -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($running) { throw "$($running.Name) is already running (pid $($running.Id), started $($running.StartTime.ToString('HH:mm:ss'))). Close it yourself or wait: this script does not close a game it did not start." }
@@ -807,7 +824,7 @@ try {
                 if (-not $cine.WaitForExit(120000)) { $cine.Kill(); Write-Step "$($spot.name): cutscene recorder timed out" }
                 Write-Step "$($spot.name): $((Get-Content (Join-Path $spotDir 'cinematic.log') -Tail 1))"
             }
-            $spot | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $spotDir 'spot_config.json')
+            ConvertTo-SpotJson $spot | Set-Content (Join-Path $spotDir 'spot_config.json')
             $driveArgs = @((Join-Path $Runtime 'drive.py'), 'spot', '--pid', $game.Id) + $hashArgs + @(
                 '--spot', (Join-Path $spotDir 'spot_config.json'), '--checkpoint', (Join-Path $cp 'checkpoint.json'),
                 '--system', $S, '--root', $Root, '--out', $spotDir) + @(if ($NoRemix) { '--no-remix' })

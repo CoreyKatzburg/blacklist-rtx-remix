@@ -337,6 +337,26 @@ Check 'Add-MachineState: plug off in machine_before.json and the manifest' ($mbj
 Remove-Item $ResultsRoot -Recurse -Force
 Check 'Add-MachineState records the display state class' ($gateText.Contains("display_state.py') launch `$mb") -and $gateText.Contains("Add-Member displayState"))
 
+# Spot configs written whole (20261117-165257-settings: -Depth 5 wrote worker B's ini triples as "System.Object[]").
+foreach ($n in 'Test-JsonCut', 'ConvertTo-SpotJson') {
+    $f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true) | Select-Object -First 1
+    if (-not $f) { throw "missing $n" }
+    . ([scriptblock]::Create($f.Extent.Text))
+}
+$seeThrough = Get-Content (Join-Path $PSScriptRoot 'variants_con_bright_hall_seethrough.json') -Raw | ConvertFrom-Json
+$benchSpot = [pscustomobject]@{ name = 'con_bright_hall'; bench = $seeThrough.bench }   # as verify_runtime builds a variant run
+Check 'spot json: the old -Depth 5 write of the see-through spot is caught' ([bool](Test-JsonCut ($benchSpot | ConvertTo-Json -Depth 5 -WarningAction SilentlyContinue)))
+Check 'spot json: the see-through spot passes whole' (-not (Test-JsonCut (ConvertTo-SpotJson $benchSpot)))
+$cutThrew = $false
+try { $null = ConvertTo-SpotJson @{ ini = 'System.Object[]' } } catch { $cutThrew = $_.Exception.Message -like 'spot config cut short*' }
+Check 'spot json: a value that became text is refused' $cutThrew
+$back = ConvertTo-SpotJson $seeThrough.bench | ConvertFrom-Json
+Check 'spot json: the see-through ini triple comes back whole' ((@($back.switchPoses[0].switches[0].ini[0]) -join '|') -eq 'Lights|FlareStandIns|1')
+$whole = @(Get-ChildItem $PSScriptRoot -Filter 'variants_*.json' | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json }) +
+         @((Get-Content (Join-Path $PSScriptRoot 'spots.json') -Raw | ConvertFrom-Json).spots)
+$bad = @($whole | Where-Object { $j = ConvertTo-SpotJson $_; ($j | ConvertFrom-Json | ConvertTo-Json -Depth 100 -Compress) -ne ($_ | ConvertTo-Json -Depth 100 -Compress) })
+Check "spot json: every variants file and spots.json spot ($($whole.Count)) round-trips unchanged" ($bad.Count -eq 0)
+
 "failures $fail"
 exit [int]($fail -gt 0)
 
