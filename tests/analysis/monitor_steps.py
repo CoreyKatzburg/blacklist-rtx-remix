@@ -1,13 +1,18 @@
 """Does detaching the monitors explain the morning's fast frames? (worker C, Nov 16)
 
-Morning launches on Nov 16 ran with both DisplayPort monitors (HKC2731, ACI27A8) switched off at their buttons, which
-normally drops them off the PC. At con_custodial the morning held pose read 32.73 ms GPU (0c13881, 10:24). Today the
+Morning launches on Nov 16 ran with both DisplayPort monitors (HKC2731, ACI27A8) switched off by the Alexa smart plug
+they share (Corey: always the plug, never their buttons; nothing else is on it), which cuts their power and normally
+drops them off the PC. At con_custodial the morning held pose read 32.73 ms GPU (0c13881, 10:24). Today the
 displays asleep read about 2.9 ms less than awake (171502 held steps: ASLEEP_COST_MS), and about 3 ms stays unexplained.
 This scores one held-pose launch whose live steps carry "monitorStep": both_on, second_off, both_off, both_on_again
 (in that order), each with the monitor state Windows reported at the step's start and end.
-second_off is a software step done by the test driver. both_off is done by Corey (both monitors off together,
-remotely): the step starts when both monitors read detached and ends at the last poll that still reads both detached.
-The driver records it with "skipped" (and no frames) when the monitors did not change within 10 minutes.
+Both switch-offs are done by Corey by hand; the driver only waits (DDC/CI VCP 0xD6=5 darkens ACI27A8's panel but Windows
+keeps it attached and active: worker D, monitor_proof 21:58 Nov 16). second_off: Corey takes ACI27A8's power away (its
+cable); the step starts when the primary reads attached and the second detached, and ends at the last poll that still
+reads that (at most the step's seconds). both_off: both monitors off together at the plug; the step starts when both
+read detached and ends at the last poll that still reads both detached. Each is recorded with "skipped" (and no
+frames) when its state was not reached in time (180 s / 600 s). second_off may also be left out of the launch; then
+Q2 reads NOT ANSWERED.
 
 Usage:
   monitor_steps.py --self-test
@@ -22,15 +27,15 @@ console display state ("on" / "off").
   deactivated  available but not active (a software disconnect; NOT the morning state)
   asleep       available and active but power off (NOT the morning state)
 
-VOID (no verdicts) for the driver's own steps (both_on, second_off, both_on_again) when: a step's monitors are not
-what it asks for at start and end (both attached; second_off the primary attached and the other detached); the game
-window is minimized or not foreground at start or end; a step has fewer than MIN_FRAMES scored frames; or both_on and
-both_on_again differ by more than NOISE_MS.
-both_off never voids the launch. Anything wrong with it makes Q1 "NOT ANSWERED (<why>)" and prints a FINDING line:
-skipped; monitors not both detached at start and end (deactivated or asleep or still attached); the game window
-minimized (a minimized game recreates its swap chain in a loop, so its GPU ms mean nothing); or fewer than MIN_FRAMES
-scored frames (the game stopped or slowed presenting with no monitor). Foreground is not required with no monitor;
-it is printed.
+VOID (no verdicts) for the driver's own steps (both_on, both_on_again) when: a step's monitors are not both attached
+at start and end; the game window is minimized or not foreground at start or end; a step has fewer than MIN_FRAMES
+scored frames; or both_on and both_on_again differ by more than NOISE_MS.
+Corey's hand steps never void the launch: anything wrong with both_off makes Q1 "NOT ANSWERED (<why>)", anything wrong
+with second_off makes Q2 "NOT ANSWERED (<why>)", and each prints a FINDING line: skipped; monitors not in the step's
+state at start and end (both_off both detached; second_off the primary attached and the second detached); the game
+window minimized (a minimized game recreates its swap chain in a loop, so its GPU ms mean nothing); or fewer than
+MIN_FRAMES scored frames (the game stopped or slowed presenting). Foreground is not required in a hand step; it is
+printed.
 
 Per step: median gpuTimeMs over ray-traced telemetry frames, skipping the first SKIP_MS (a monitor change can recreate
 the swap chain and hitch).
@@ -78,6 +83,7 @@ def states(snapshot, primary_name):
     return {"primary": classify(prim[0]), "second": classify(other[0])}
 
 
+HAND = {"both_off": "q1", "second_off": "q2"}   # Corey's steps, and the question each one answers
 WANT = {"both_on": ("attached", "attached"), "second_off": ("attached", "detached"),
         "both_off": ("detached", "detached"), "both_on_again": ("attached", "attached")}
 
@@ -101,40 +107,43 @@ def steps_from(windows, frames):
 
 
 def check(steps):
-    """Returns (void reasons, why Q1 is not answered or None, findings)."""
+    """Returns (void reasons, {"q1": why Q1 is not answered or None, "q2": same for Q2}, findings)."""
     names = [s["step"] for s in steps]
-    if [n for n in names if n != "both_off"] != [n for n in ORDER if n != "both_off"] or \
-            names not in (ORDER, [n for n in ORDER if n != "both_off"]):
-        return [f"steps {names} are not {ORDER}"], None, []
-    reasons, q1_not, findings = [], None, []
+    # ORDER, with both_off and / or second_off left out; both_on and both_on_again are always needed.
+    if names != [n for n in ORDER if n in names] or "both_on" not in names or "both_on_again" not in names:
+        return [f"steps {names} are not {ORDER} (second_off and both_off may be left out)"], {}, []
+    reasons, findings, not_ans = [], [], {"q1": None, "q2": None}
     first = (steps[0]["w"].get("monitors") or {}).get("start") or []
     primary_name = next((m["name"] for m in first if m.get("primary")), None)
     if primary_name is None:
-        return [f"both_on start lists no primary monitor: {first}"], None, []
+        return [f"both_on start lists no primary monitor: {first}"], {}, []
     for s in steps:
         mon = s["w"].get("monitors") or {}
         game = s["w"].get("gameWindow") or {}
         want = dict(zip(("primary", "second"), WANT[s["step"]]))
-        if s["step"] == "both_off":
+        if s["step"] in HAND:
+            q, why = HAND[s["step"]], None
             if s["w"].get("skipped"):
-                q1_not = f"skipped: {s['w']['skipped']}"
-                findings.append(f"both_off skipped: {s['w']['skipped']}")
+                not_ans[q] = f"skipped: {s['w']['skipped']}"
+                findings.append(f"{s['step']} skipped: {s['w']['skipped']}")
                 continue
             got = [states(mon.get(w) or [], primary_name) for w in ("start", "end")]
             gws = [game.get(w) or {} for w in ("start", "end")]
             if any(g != want for g in got):
-                q1_not = f"state {got[0]} at start, {got[1]} at end"
-                findings.append(f"both_off monitors {got[0]} at start, {got[1]} at end, not both detached")
+                why = f"state {got[0]} at start, {got[1]} at end"
+                findings.append(f"{s['step']} monitors {got[0]} at start, {got[1]} at end, want {want}")
             if any(g.get("minimized") is not False for g in gws):
-                q1_not = "game minimized or window not recorded"
-                findings.append(f"with no monitor the game window was {gws[0] or 'not recorded'} at start, "
+                why = "game minimized or window not recorded"
+                findings.append(f"{s['step']}: the game window was {gws[0] or 'not recorded'} at start, "
                                 f"{gws[1] or 'not recorded'} at end (minimized or not recorded)")
             if s["n"] < MIN_FRAMES:
-                q1_not = q1_not or f"{s['n']} scored frames"
-                findings.append(f"with no monitor the game presented {s['presented']} frames, {s['n']} ray-traced after "
+                why = why or f"{s['n']} scored frames"
+                findings.append(f"{s['step']}: the game presented {s['presented']} frames, {s['n']} ray-traced after "
                                 f"the first {SKIP_MS / 1000:.0f} s (below {MIN_FRAMES})")
-            if not q1_not:
-                findings.append(f"with no monitor: {s['presented']} frames presented, game window {gws[0]} at start, "
+            if why:
+                not_ans[q] = why
+            else:
+                findings.append(f"{s['step']}: {s['presented']} frames presented, game window {gws[0]} at start, "
                                 f"{gws[1]} at end")
             continue
         if s["n"] < MIN_FRAMES:
@@ -147,14 +156,17 @@ def check(steps):
             if gw.get("minimized") is not False or gw.get("foreground") is not True:
                 reasons.append(f"{s['name']} {when}: game window {gw or 'not recorded'}, want not minimized and foreground")
     if "both_off" not in names:
-        q1_not = "both_off not recorded"
+        not_ans["q1"] = "both_off not recorded"
+    if "second_off" not in names:
+        not_ans["q2"] = "second_off not recorded"
     on = [s["gpu"] for s in steps if s["step"] in ("both_on", "both_on_again") and s["gpu"] is not None]
     if len(on) == 2 and abs(on[0] - on[1]) > NOISE_MS:
         reasons.append(f"both_on and both_on_again differ {abs(on[0] - on[1]):.2f} ms, above {NOISE_MS}")
-    return reasons, q1_not, findings
+    return reasons, not_ans, findings
 
 
-def verdicts(steps, q1_not=None):
+def verdicts(steps, not_ans=None):
+    q1_not, q2_not = (not_ans or {}).get("q1"), (not_ans or {}).get("q2")
     g = {s["step"]: s["gpu"] for s in steps}
     d1 = d2 = None
     if q1_not:
@@ -169,6 +181,9 @@ def verdicts(steps, q1_not=None):
             q1 = "NO DISPLAY COST"
         else:
             q1 = "PARTIAL"
+    e1 = e2 = None
+    if q2_not:
+        return {"q1": (q1, d1, d2), "q2": (f"NOT ANSWERED ({q2_not})", e1, e2)}
     e1, e2 = g["both_on"] - g["second_off"], g["both_on_again"] - g["second_off"]
     if e1 >= CAUSE_MS and e2 >= CAUSE_MS:
         q2 = "SECOND MONITOR COSTS"
@@ -182,11 +197,11 @@ def verdicts(steps, q1_not=None):
 def score(steps):
     lines = [f"{s['name']:12s} {s['step']:14s} gpu {s['gpu'] if s['gpu'] is None else round(s['gpu'], 2)!s:>7} "
              f"({s['n']} frames)" for s in steps]
-    reasons, q1_not, findings = check(steps)
+    reasons, not_ans, findings = check(steps)
     lines += [f"FINDING: {f}" for f in findings]
     if reasons:
         return 1, lines + [f"VOID: {r}" for r in reasons], None
-    v = verdicts(steps, q1_not)
+    v = verdicts(steps, not_ans)
     q1, d1, d2 = v["q1"]
     q2, e1, e2 = v["q2"]
     if d1 is None:
@@ -196,7 +211,10 @@ def score(steps):
                      f"(asleep was {ASLEEP_COST_MS}; the morning needs about {ASLEEP_COST_MS + 3.0:.1f})")
         both_off = next(s["gpu"] for s in steps if s["step"] == "both_off")
         lines.append(f"both_off {both_off:.2f} ms against the morning's held {MORNING_HELD_MS} ms (report only)")
-    lines.append(f"Q2 second monitor detached: {q2}, {e1:+.2f} / {e2:+.2f} ms faster than both on")
+    if e1 is None:
+        lines.append(f"Q2 second monitor detached: {q2}")
+    else:
+        lines.append(f"Q2 second monitor detached: {q2}, {e1:+.2f} / {e2:+.2f} ms faster than both on")
     return 0, lines, v
 
 
@@ -218,18 +236,21 @@ def mon(name, primary, state):
     return {"name": name, "primary": primary and active, "available": available, "active": active, "power": power}
 
 
-def fake_launch(gpus, override=None, frames_per_step=1100, game=None, skip=False, drop_off=False, off_frames=None):
+def fake_launch(gpus, override=None, frames_per_step=1100, game=None, skip=False, drop_off=False, off_frames=None,
+                drop_second=False, swap=False, skip_second=False, short_second=None):
     """Four steps of 44 s at 40 ms a frame, flat GPU ms per step with +-0.05 ripple. override: {step: (prim, second)};
     game: {step: gameWindow snapshot}; skip: both_off recorded as skipped; drop_off: no both_off window at all."""
     windows, frames, f, q = [], {}, 1000, 0.0
     for i, (step, g) in enumerate(zip(ORDER, gpus)):
-        if step == "both_off" and drop_off:
+        if (step == "both_off" and drop_off) or (step == "second_off" and drop_second):
             continue
-        if step == "both_off" and skip:
+        if (step == "both_off" and skip) or (step == "second_off" and skip_second):
             windows.append({"name": f"live_step{i + 1}", "monitorStep": step, "skipped": "no change in 600 s"})
             continue
         a = f
-        for k in range(off_frames if step == "both_off" and off_frames is not None else frames_per_step):
+        n = off_frames if step == "both_off" and off_frames is not None else \
+            short_second if step == "second_off" and short_second is not None else frames_per_step
+        for k in range(n):
             f += 1
             q += 40.0
             frames[f] = (q, g + (0.05 if k % 2 else -0.05), True)
@@ -238,6 +259,8 @@ def fake_launch(gpus, override=None, frames_per_step=1100, game=None, skip=False
         gw = (game or {}).get(step, {"minimized": False, "foreground": True})
         windows.append({"name": f"live_step{i + 1}", "telemetry": [a, f], "monitorStep": step,
                         "monitors": {"start": snap, "end": snap}, "gameWindow": {"start": gw, "end": gw}})
+    if swap:  # steps recorded out of order: both_off before both_on
+        windows[0], windows[-2] = windows[-2], windows[0]
     return windows, frames
 
 
@@ -252,32 +275,53 @@ def self_test():
         ("partial, 4.2 ms", [38.7, 38.2, 34.5, 38.6], {}, 0, (P, U), None),
         ("second faster than one neighbour only", [38.7, 38.0, 35.6, 38.4], {}, 0, (S, U), None),
         ("both_off only deactivated", [38.7, 38.6, 32.8, 38.6], {"override": {"both_off": ("deactivated", "deactivated")}},
-         0, ("NOT ANSWERED (state", F), "not both detached"),
+         0, ("NOT ANSWERED (state", F), "both_off monitors"),
         ("both_off only asleep", base, {"override": {"both_off": ("asleep", "asleep")}}, 0, ("NOT ANSWERED (state", F),
-         "not both detached"),
+         "both_off monitors"),
         ("both_off skipped (no change in 10 min)", base, {"skip": True}, 0, ("NOT ANSWERED (skipped", F), "skipped"),
         ("both_off not recorded", base, {"drop_off": True}, 0, ("NOT ANSWERED (both_off not recorded", F), None),
         ("no monitor: game minimized is a finding, not a void", base,
          {"game": {"both_off": {"minimized": True, "foreground": False}}}, 0, ("NOT ANSWERED (game minimized", F), "minimized"),
         ("no monitor: game in background is fine", base, {"game": {"both_off": {"minimized": False, "foreground": False}}},
-         0, (S, F), "with no monitor: "),
+         0, (S, F), "both_off: 1100 frames presented"),
         ("no monitor: game stopped presenting", base, {"off_frames": 40}, 0, ("NOT ANSWERED (0 scored frames", F),
          "presented 40 frames"),
-        ("second_off left the second attached", [38.7, 38.6, 32.8, 38.6],
-         {"override": {"second_off": ("attached", "attached")}}, 1, None, None),
+        ("second_off left the second attached: Q2 not answered, not void", [38.7, 38.6, 32.8, 38.6],
+         {"override": {"second_off": ("attached", "attached")}}, 0, (R, "NOT ANSWERED (state"), "second_off monitors"),
+        ("second_off only asleep", base, {"override": {"second_off": ("attached", "asleep")}}, 0,
+         (S, "NOT ANSWERED (state"), "second_off monitors"),
+        ("second_off skipped, both_off done", base, {"skip_second": True}, 0, (S, "NOT ANSWERED (skipped"),
+         "second_off skipped"),
+        ("both skipped", base, {"skip_second": True, "skip": True}, 0,
+         ("NOT ANSWERED (skipped", "NOT ANSWERED (skipped"), "both_off skipped"),
+        ("second_off game minimized", base, {"game": {"second_off": {"minimized": True, "foreground": False}}}, 0,
+         (S, "NOT ANSWERED (game minimized"), "second_off: the game window"),
+        ("second_off too short", base, {"override": {}, "off_frames": None, "frames_per_step": 1100,
+                                        "short_second": 40}, 0, (S, "NOT ANSWERED (0 scored frames"),
+         "second_off: the game presented 40"),
         ("both_on_again came back with one monitor", [38.7, 38.6, 32.8, 38.6],
          {"override": {"both_on_again": ("attached", "detached")}}, 1, None, None),
         ("both_on and both_on_again drift 1 ms", [38.7, 38.6, 32.8, 37.7], {}, 1, None, None),
-        ("game minimized in a driver step", base, {"game": {"second_off": {"minimized": True, "foreground": False}}},
+        ("game minimized in a driver step", base, {"game": {"both_on": {"minimized": True, "foreground": False}}},
          1, None, None),
         ("too few frames in a driver step", base, {"frames_per_step": 300}, 1, None, None),
+        # Tonight's launch: second_off left out (DDC darkens ACI27A8 but Windows keeps it attached).
+        ("second_off left out, Q1 still scored", base, {"drop_second": True}, 0,
+         (S, "NOT ANSWERED (second_off not recorded)"), None),
+        ("second_off left out, detached reaches the morning", [38.7, 0.0, 32.8, 38.6], {"drop_second": True}, 0,
+         (R, "NOT ANSWERED (second_off not recorded)"), None),
+        ("second_off left out, both_off skipped", base, {"drop_second": True, "skip": True}, 0,
+         ("NOT ANSWERED (skipped", "NOT ANSWERED (second_off not recorded)"), "skipped"),
+        ("second_off left out, both_on_again drift still voids", [38.7, 0.0, 32.8, 37.7], {"drop_second": True}, 1,
+         None, None),
+        ("steps out of order", base, {"drop_second": True, "swap": True}, 1, None, None),
     ]
     bad = 0
     for name, gpus, kw, want_code, want, finding in cases:
         code, lines, v = score(steps_from(*fake_launch(gpus, **kw)))
         got = (v["q1"][0], v["q2"][0]) if v else None
         ok = code == want_code and (got == want if want is None or got is None else
-                                    got[0].startswith(want[0]) and got[1] == want[1])
+                                    got[0].startswith(want[0]) and got[1].startswith(want[1]))
         if finding:
             ok = ok and any(l.startswith("FINDING") and finding in l for l in lines)
         bad += not ok
