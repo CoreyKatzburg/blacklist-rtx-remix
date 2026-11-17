@@ -297,8 +297,13 @@ class Builder:
             bump = 5.0 if self.case == "lag_within_margin" else (5.5 if self.case == "lag_over_margin" else 0.0)
             # the bump goes on the game share (trials gameMs), which input_latency_ms judges; the screen share
             # (samples_ms) is only printed under input_latency_screen_ms
-            trials = [{"screenMs": 22.0, "gameMs": round(14.0 + bump + ((i % 3) - 1) * 0.5, 2)} for i in range(20)]
-            spot["mouse_lag"] = {"samples_ms": [22.0] * 20, "game_share_ms": round(14.0 + bump, 2), "after_game_ms": 8.0,
+            # 24 ms: above the fake's 14 ms frame, since a game share shorter than one frame is a false turn (gate
+            # short_lag_trials); lag_short_turns puts 3 turns under it, lag_two_short_turns 2
+            trials = [{"screenMs": 22.0, "gameMs": round(24.0 + bump + ((i % 3) - 1) * 0.5, 2), "t0": 1000.0 * i,
+                       "turnedFrame": 100 + i} for i in range(20)]
+            for i in range({"lag_short_turns": 3, "lag_two_short_turns": 2}.get(self.case, 0)):
+                trials.append({"screenMs": 22.0, "gameMs": 5.0, "t0": 50000.0 + i, "turnedFrame": 900 + i})
+            spot["mouse_lag"] = {"samples_ms": [22.0] * 20, "game_share_ms": round(24.0 + bump, 2), "after_game_ms": 8.0,
                                  "trials": trials, "method": "fake 20x5deg gdigrab"}
         if self.case == "spot_error":
             spot["error"] = "RuntimeError: loaded map 'menu', checkpoint was recorded in 'S_CON_Global'"
@@ -455,6 +460,8 @@ CASES = {
     "lag_within_margin": ((), ()),                      # +5 ms over the reference: the margin's edge still passes
     "lag_over_margin": (("input_latency_ms",), ()),     # +5.5 ms over the reference
     "no_mouse_lag": ((), ("input_latency_ms",)),        # missing mouse_lag in spot.json: NOT MEASURED, fails the gate
+    "lag_short_turns": ((), ("input_latency_ms",)),     # 3 turns at 5 ms, under the 14 ms frame: NOT MEASURED
+    "lag_two_short_turns": ((), ()),                    # 2 such turns: still judged, the two are named
     "fps_regression": (("fps_regression",), ()),        # 15% below the previous run
     "fps_drop_9pct": ((), ()),                          # 9% below the previous run: passes
     "fps_previous_plug_off": ((), ("fps_regression",)),  # same FPS, previous run had the monitors off: NOT COMPARABLE

@@ -1278,6 +1278,9 @@ def _lag_stats(raw) -> dict | None:
             "n": len(vals)}
 
 
+LAG_SHORT_MAX = 3   # turns shorter than one frame that make a spot's mouse_lag NOT MEASURED
+
+
 def spot_mouse_lag(spot: dict) -> dict | None:
     """Game share of the mouse lag from spot.json['mouse_lag'].trials[].gameMs (mouse turn to the first proxy frame
     with the turned camera): median, IQR spread and count; None unless at least 20 trials have a finite gameMs."""
@@ -1286,6 +1289,52 @@ def spot_mouse_lag(spot: dict) -> dict | None:
     if not isinstance(trials, list):
         return None
     return _lag_stats([t.get("gameMs") for t in trials if isinstance(t, dict)])
+
+
+def short_lag_trials(spot: dict, frame_ms: float | None) -> list[dict] | None:
+    """The mouse_lag trials whose game share is shorter than one median frame of the spot (frame_ms): index, gameMs and,
+    when drive.py recorded them, t0 (SendInput on the proxy clock) and turnedFrame. None without frame_ms.
+    Worker C, 5aea373 (tests/analysis/mouse_lag_phase.py): drive.first_turned took acos of the plain dot product of two
+    camera vectors that the proxy logs to 4 decimals, so an unchanged vector (0.9997, -0.0196, 0) read 1.19 degrees
+    from itself and the first frame after SendInput counted as turned; that rule matches 100 of 100 Remix turns, and
+    it made the low group (152548 paladin_1 11 turns at 9.6 to 23.5 ms with about 33 ms frames). drive.py now
+    normalises both vectors; this guard names any turn the game could not have shown that fast, and
+    input_lag_check reads the spot NOT MEASURED at LAG_SHORT_MAX or more (coordinator, Nov 17)."""
+    if frame_ms is None:
+        return None
+    ml = spot.get("mouse_lag")
+    trials = ml.get("trials") if isinstance(ml, dict) else None
+    out = []
+    for i, t in enumerate(trials if isinstance(trials, list) else []):
+        g = t.get("gameMs") if isinstance(t, dict) else None
+        if isinstance(g, (int, float)) and not isinstance(g, bool) and math.isfinite(g) and g < frame_ms:
+            out.append({"trial": i, "gameMs": g, **{k: t[k] for k in ("t0", "turnedFrame") if k in t}})
+    return out
+
+
+def reference_is_no_remix(reference: str | None) -> bool:
+    """Whether --reference is a no-Remix run. verify_runtime.ps1 puts a reference together per spot from several runs
+    (reference-chosen: manifest "chosenFrom" names one run per spot, no "noRemix"). Such a reference is no-Remix only
+    when every spot it lists comes from a run whose own manifest says noRemix; one Remix spot refuses it all
+    (coordinator, Nov 17 after 152548, where the light checks read NOT MEASURED on 133918 and 191120)."""
+    def own(folder):
+        m = os.path.join(folder, "manifest.json")
+        return load_json(m) if os.path.exists(m) else None
+    man = own(reference) if reference else None
+    if not isinstance(man, dict):
+        return False
+    chosen = man.get("chosenFrom")
+    if not isinstance(chosen, dict):
+        return bool(man.get("noRemix"))
+    spots = man.get("spots") or list(chosen)
+    return bool(spots) and all(isinstance(chosen.get(s), str) and bool((own(chosen[s]) or {}).get("noRemix"))
+                               for s in spots)
+
+
+def spot_frame_ms(spot: dict, no_remix: bool) -> float | None:
+    """The spot's median Present-to-Present interval in ms over its scene windows (spot_proxy_interval)."""
+    iv = spot_proxy_interval(spot, no_remix)
+    return 1000.0 / iv[0] if iv else None
 
 
 def spot_screen_lag(spot: dict) -> dict | None:
@@ -1336,11 +1385,31 @@ def _fmt_lag(s: dict | None) -> str:
     return f"{s['median']:.1f} ms (spread {s['spread']:.1f}, {s['n']} turns)"
 
 
-def input_lag_check(run: Run, good: list[dict], reference: dict[str, dict] | None) -> None:
+def _judge_lag(spot: dict, no_remix: bool) -> tuple[dict | None, str]:
+    """(game-share stats or None, text) for one spot: the stats are None when fewer than 20 turns have a game share,
+    when the spot has no median frame interval to check turns against, or when LAG_SHORT_MAX or more turns are
+    shorter than one frame (short_lag_trials). The text names every short turn."""
+    frame = spot_frame_ms(spot, no_remix)
+    short = short_lag_trials(spot, frame)
+    if short is None:
+        return None, "not measured (no median frame interval to check turns shorter than a frame)"
+    named = "".join(f", #{t['trial']} {t['gameMs']:.1f} ms" + (f" frame {t['turnedFrame']}" if "turnedFrame" in t else "")
+                    for t in short)
+    note = f"; {len(short)} turns shorter than one frame ({frame:.1f} ms){named}" if short else ""
+    if len(short) >= LAG_SHORT_MAX:
+        return None, f"not measured ({len(short)} turns shorter than one frame ({frame:.1f} ms){named})"
+    stats = spot_mouse_lag(spot)
+    return stats, _fmt_lag(stats) + note
+
+
+def input_lag_check(run: Run, good: list[dict], reference: dict[str, dict] | None, no_remix: bool = False,
+                    ref_no_remix: bool = True) -> None:
     """input_latency_ms: each spot's median game share of the mouse lag (spot_mouse_lag, >= 20 turns) against the same
     spot in the no-Remix reference run (--reference), within input_lag_margin_ms (a GUESS). It is the mouse turn to the
     first game frame with the turned camera and leaves out everything after the game hands the frame on, so for Remix
     it is a lower bound. Without --reference or when any spot lacks it: NOT MEASURED, there is no fixed limit.
+    A spot of either run with LAG_SHORT_MAX or more turns shorter than its median frame (short_lag_trials), or with no
+    median frame to check them against, counts as lacking it; fewer short turns are named in the detail.
     input_latency_screen_ms: the screen share (samples_ms) is always NOT MEASURED until the desktop grab is shown to
     work in Remix runs; its numbers go in the detail. It is in SOFT_NM, so it does not fail the gate."""
     sources = "spot.json mouse_lag.samples_ms (desktop grab): this run and --reference"
@@ -1354,26 +1423,26 @@ def input_lag_check(run: Run, good: list[dict], reference: dict[str, dict] | Non
           "everything after the game hands the frame on, a lower bound for Remix): this run and --reference"
     margin = THRESHOLDS["input_lag_margin_ms"]
     threshold = f"<= reference + {margin:g} ms per spot (GUESS margin)"
-    ours = {s["name"]: spot_mouse_lag(s) for s in good}
-    shown = "; ".join(f"{n} {_fmt_lag(v)}" for n, v in ours.items())
+    ours = {s["name"]: _judge_lag(s, no_remix) for s in good}
+    shown = "; ".join(f"{n} {txt}" for n, (_, txt) in ours.items())
     if reference is None:
         run.add("input_latency_ms", NOT_MEASURED, None, threshold,
                 f"no reference run given (--reference), so not compared; this run: {shown or 'no spot measured'}", src)
         return
     diffs, missing = [], []
-    for name, now in ours.items():
-        base = spot_mouse_lag(reference[name]) if name in reference else None
+    for name, (now, now_txt) in ours.items():
+        base, base_txt = _judge_lag(reference[name], ref_no_remix) if name in reference else (None, "no such spot")
         if now is None or base is None:
-            missing.append(name)
+            missing.append(f"{name} (this run {now_txt}; reference {base_txt})")
         else:
-            diffs.append((now["median"] - base["median"], name, now, base))
+            diffs.append((now["median"] - base["median"], name, now_txt, base_txt))
     if not diffs or missing:
         run.add("input_latency_ms", NOT_MEASURED, None, threshold,
-                "no comparable mouse_lag for: " + (", ".join(missing) or "no spot measured"), src)
+                "no comparable mouse_lag for: " + ("; ".join(missing) or "no spot measured"), src)
         return
     worst = max(d[0] for d in diffs)
     detail = f"worst spot {worst:+.2f} ms over reference; " + "; ".join(
-        f"{n} {_fmt_lag(a)} vs {_fmt_lag(b)}" for _, n, a, b in diffs)
+        f"{n} {a} vs {b}" for _, n, a, b in diffs)
     run.add("input_latency_ms", PASS if worst <= margin else FAIL, round(worst, 2), threshold, detail, src)
 
 
@@ -1977,10 +2046,9 @@ def evaluate(folder: str, previous: str | None = None, reference: str | None = N
         run.add("latency_overhead_ms", PASS if med_wait <= THRESHOLDS["max_wait_overhead_ms"] else FAIL, med_wait,
                 f"<= {THRESHOLDS['max_wait_overhead_ms']:g} ms",
                 f"median CPU/bridge wait {med_wait:.2f} ms (p99 {p99_wait:.2f} ms)", tsrc)
-    input_lag_check(run, good, ref_spots)
+    ref_no_remix = reference_is_no_remix(reference)
+    input_lag_check(run, good, ref_spots, no_remix, ref_no_remix)
     frame_interval_check(run, good, ref_spots, no_remix)
-    ref_manifest = os.path.join(reference, "manifest.json") if reference else None
-    ref_no_remix = bool(ref_manifest and os.path.exists(ref_manifest) and load_json(ref_manifest).get("noRemix"))
     reference_position_check(run, good, ref_spots)
     glow_checks(run, good, ref_spots, ref_no_remix)
     lamps_dimmed_check(run, good, ref_spots, ref_no_remix)

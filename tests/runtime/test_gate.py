@@ -207,6 +207,53 @@ class MathTest(unittest.TestCase):
         self.assertAlmostEqual(gate.spot_screen_lag({"mouse_lag": {"samples_ms": [20.0] * 10 + [24.0] * 10}})["median"],
                                22.0)
 
+    def test_turns_shorter_than_one_frame_are_named_and_three_make_the_spot_not_measured(self):
+        # Worker C, 5aea373: un-normalised camera vectors made the first frame after SendInput count as turned (152548
+        # paladin_1: 11 of 20 turns at 9.6 to 23.5 ms with about 33 ms frames). A turn shorter than one frame is named.
+        trials = [{"gameMs": 40.0 + i, "t0": 1000.0 * i, "turnedFrame": 10 + i} for i in range(20)]
+        spot = {"mouse_lag": {"trials": trials + [{"gameMs": 2.1, "t0": 30000.0, "turnedFrame": 77},
+                                                  {"gameMs": 33.2, "t0": 31000.0},
+                                                  {"gameMs": 33.3}, {"gameMs": None}]}}
+        self.assertEqual(gate.short_lag_trials(spot, 33.3),
+                         [{"trial": 20, "gameMs": 2.1, "t0": 30000.0, "turnedFrame": 77},
+                          {"trial": 21, "gameMs": 33.2, "t0": 31000.0}])   # exactly one frame is not shorter
+        self.assertIsNone(gate.short_lag_trials(spot, None))
+        self.assertEqual(gate.short_lag_trials({}, 33.3), [])
+        # Through the gate on fake runs (14 ms frames): 3 turns at 5 ms read NOT MEASURED, 2 are named and judged.
+        with tempfile.TemporaryDirectory() as t:
+            for case, want in (("lag_short_turns", gate.NOT_MEASURED), ("lag_two_short_turns", gate.PASS)):
+                ok, result, why = fakerun.check_case(os.path.join(t, case), case)
+                self.assertTrue(ok, f"{case}: {why}")
+                lag = next(c for c in result["checks"] if c["check"] == "input_latency_ms")
+                self.assertEqual(lag["status"], want, case)
+                n = 3 if case == "lag_short_turns" else 2
+                self.assertIn(f"{n} turns shorter than one frame (14.0 ms), #20 5.0 ms frame 900", lag["detail"], case)
+
+    def test_a_put_together_reference_is_no_remix_only_when_every_spot_comes_from_a_no_remix_run(self):
+        # 152548: reference-chosen took con_bright_hall from 191120 and the rest from 133918, both no-Remix, and the
+        # light checks read "the reference run is not a no-Remix run" because the merged manifest has no noRemix.
+        with tempfile.TemporaryDirectory() as root:
+            def run(name, man):
+                d = os.path.join(root, name)
+                os.makedirs(d)
+                with open(os.path.join(d, "manifest.json"), "w", encoding="utf-8") as f:
+                    json.dump(man, f)
+                return d
+            a = run("a", {"noRemix": True, "spots": ["s1"]})
+            b = run("b", {"noRemix": True, "spots": ["s2"]})
+            rx = run("rx", {"noRemix": False, "spots": ["s2"]})
+            good = run("good", {"spots": ["s1", "s2"], "chosenFrom": {"s1": a, "s2": b}})
+            mixed = run("mixed", {"spots": ["s1", "s2"], "chosenFrom": {"s1": a, "s2": rx}})
+            gone = run("gone", {"spots": ["s1", "s2"], "chosenFrom": {"s1": a, "s2": os.path.join(root, "nope")}})
+            short = run("short", {"spots": ["s1", "s2"], "chosenFrom": {"s1": a}})
+            self.assertTrue(gate.reference_is_no_remix(good))
+            self.assertFalse(gate.reference_is_no_remix(mixed))              # one Remix spot mixed in
+            self.assertFalse(gate.reference_is_no_remix(gone))               # a source run without its manifest
+            self.assertFalse(gate.reference_is_no_remix(short))              # a spot with no source named
+            self.assertTrue(gate.reference_is_no_remix(a))                   # a plain no-Remix run, as before
+            self.assertFalse(gate.reference_is_no_remix(rx))
+            self.assertFalse(gate.reference_is_no_remix(None))
+
     def test_brightness_hdr_clip_and_black_raster_guard(self):
         b_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "analysis", "brightness"))
         if b_dir not in sys.path:
