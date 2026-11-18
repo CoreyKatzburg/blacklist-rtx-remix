@@ -24,6 +24,7 @@
 #include "proxy_diagnostics.h"
 #include "proxy_log.h"
 #include "proxy_types.h"
+#include "query_probe.h"
 #include "stage_texture_dump.h"
 #include "texture_fill.h"
 
@@ -98,6 +99,7 @@ HRESULT(WINAPI* g_createDepthStencilSurface)(IDirect3DDevice9*, UINT, UINT, D3DF
 HRESULT(WINAPI* g_createOffscreenPlainSurface)(IDirect3DDevice9*, UINT, UINT, D3DFORMAT, D3DPOOL, IDirect3DSurface9**, HANDLE*) = nullptr;
 HRESULT(WINAPI* g_createQuery)(IDirect3DDevice9*, D3DQUERYTYPE, IDirect3DQuery9**) = nullptr;
 HRESULT(WINAPI* g_queryGetData)(IDirect3DQuery9*, void*, DWORD, DWORD) = nullptr;
+HRESULT(WINAPI* g_queryIssue)(IDirect3DQuery9*, DWORD) = nullptr;   // hooked only with QueryStatsFrames > 0 at load
 HRESULT(WINAPI* g_lockRect)(IDirect3DTexture9*, UINT, D3DLOCKED_RECT*, const RECT*, DWORD) = nullptr;
 HRESULT(WINAPI* g_unlockRect)(IDirect3DTexture9*, UINT) = nullptr;
 HRESULT(WINAPI* g_vertexBufferLock)(IUnknown*, UINT, UINT, void**, DWORD) = nullptr;
@@ -330,6 +332,12 @@ bool LoadRealD3D9(HINSTANCE proxyInstance) {
     g_presentHook = diag.frameTiming != 0 || diag.hitchSampler ||
                     GetPrivateProfileIntW(L"Proxy", L"PresentHook", 0, iniPath) != 0;
     g_queryMode = GetPrivateProfileIntW(L"Proxy", L"QueryMode", 1, iniPath);
+    proxy::g_queryProbe.SetFrames(proxy::ParseQueryStatsFrames(
+        static_cast<int>(GetPrivateProfileIntW(L"Proxy", L"QueryStatsFrames", 0, iniPath))));
+    proxy::g_skipBracketDraws =
+        proxy::ParseSkipBracketDraws(static_cast<int>(GetPrivateProfileIntW(L"Proxy", L"SkipBracketDraws", 0, iniPath)));
+    WriteLog("Proxy keys: QueryStatsFrames %u, SkipBracketDraws %u", proxy::g_queryProbe.Frames(),
+             proxy::g_skipBracketDraws);
     g_formatGuard = GetPrivateProfileIntW(L"Proxy", L"FormatGuard", 1, iniPath) != 0;
     proxy::SetTextureFillCounts(GetPrivateProfileIntW(L"Proxy", L"TextureFillCounts", debuggingTelemetry, iniPath) != 0);
     WriteLog("Proxy keys: EnableDebuggingTelemetry %d, TextureFillCounts %d", debuggingTelemetry,
@@ -618,6 +626,10 @@ void ReloadLiveIniSwitches() {
     g_filterCfg.alphaTestFromTexkill = alphaTestFromTexkill;
 
     proxy::SetSkinTraceEnabled(GetPrivateProfileIntW(L"Proxy", L"SkinTrace", 0, iniPath) != 0);
+    const uint32_t skipBracketDraws =
+        proxy::ParseSkipBracketDraws(static_cast<int>(GetPrivateProfileIntW(L"Proxy", L"SkipBracketDraws", 0, iniPath)));
+    if (skipBracketDraws != proxy::g_skipBracketDraws) WriteLog("SkipBracketDraws: now %u", skipBracketDraws);
+    proxy::g_skipBracketDraws = skipBracketDraws;
     proxy::SetFilterConfig(g_filterCfg);
 }
 
@@ -636,6 +648,14 @@ HRESULT WINAPI HookPresent(IDirect3DDevice9* self, const RECT* sourceRect,
     lightpub::SetShowGamePicture(proxy::ShouldShowGamePicture());
     if (g_lightsEnabled) lightpub::OnPresent();
     proxy::FilterEndFrameBeforePresent(self, hook, g_cameraTracker, g_presentCount);
+    {
+        proxy::QueryProbeCounts q;
+        uint32_t first = 0;
+        if (proxy::QueryProbeEndFrame(static_cast<uint32_t>(g_presentCount), &q, &first))
+            WriteLog("QueryProbe: frames %u-%ld issued %u answered %u (pixels>0 %u) polled %u (pixels>0 %u) "
+                     "skipped scene-hdr %u other %u", first, g_presentCount, q.issued, q.answered, q.answeredNonZero,
+                     q.polled, q.polledNonZero, q.skippedSceneHdr, q.skippedOther);
+    }
     proxy::DecalTagEndFrame();
     proxy::ParticleTagEndFrame();
     proxy::TexHashLogEndFrame(g_presentCount);
@@ -996,7 +1016,9 @@ UINT WINAPI HookGetAvailableTextureMem(IDirect3DDevice9* self) {
 
 // QueryMode=1: polls the bridge at most once per QueryPollMs per occlusion query and returns its
 // last real pixel count in between, preventing tight spin-polls from stalling behind bridge flushes.
-struct OcclusionQuery { IDirect3DQuery9* query; DWORD lastPixels; LONGLONG lastPoll; bool hasResult; };
+// gameRead: the game has read this query (QueryProbe counts Issue only on those, which leaves out the proxy's own
+// bracket query).
+struct OcclusionQuery { IDirect3DQuery9* query; DWORD lastPixels; LONGLONG lastPoll; bool hasResult; bool gameRead; };
 constexpr size_t kOcclusionQueryTableSize = 4096;
 OcclusionQuery g_occlusionQueries[kOcclusionQueryTableSize] = {};
 SRWLOCK g_occlusionLock = SRWLOCK_INIT;
@@ -1008,15 +1030,14 @@ OcclusionQuery* FindOcclusionQuery(IDirect3DQuery9* query, bool insert) {
         if (entry.query == query) return &entry;
         if (!entry.query) {
             if (!insert) return nullptr;
-            entry = {query, 0, 0, false};
+            entry = {query, 0, 0, false, false};
             return &entry;
         }
     }
     return nullptr;
 }
 
-HRESULT WINAPI HookQueryGetData(IDirect3DQuery9* self, void* data, DWORD size, DWORD flags) {
-    CallTimer timer(proxy::kQueryGetData);
+HRESULT QueryGetDataCached(IDirect3DQuery9* self, void* data, DWORD size, DWORD flags) {
     if (!g_queryMode || !data || size != sizeof(DWORD)) return g_queryGetData(self, data, size, flags);
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -1041,9 +1062,43 @@ HRESULT WINAPI HookQueryGetData(IDirect3DQuery9* self, void* data, DWORD size, D
             pixels = current->lastPixels;
         }
         ReleaseSRWLockExclusive(&g_occlusionLock);
+        if (result == S_OK) proxy::QueryProbePoll(fresh);
     }
     *static_cast<DWORD*>(data) = pixels;
     return S_OK;
+}
+
+HRESULT WINAPI HookQueryGetData(IDirect3DQuery9* self, void* data, DWORD size, DWORD flags) {
+    CallTimer timer(proxy::kQueryGetData);
+    if (!proxy::g_queryProbe.Enabled()) return QueryGetDataCached(self, data, size, flags);
+    // QueryProbe (query_probe.h, X1): count what the game is handed, and mark the query as one the game reads.
+    const HRESULT result = QueryGetDataCached(self, data, size, flags);
+    if (result != S_OK || !data || size != sizeof(DWORD)) return result;
+    const DWORD pixels = *static_cast<DWORD*>(data);
+    bool occlusion = false;
+    AcquireSRWLockExclusive(&g_occlusionLock);
+    if (OcclusionQuery* entry = FindOcclusionQuery(self, false)) {
+        entry->gameRead = true;
+        occlusion = true;
+    }
+    ReleaseSRWLockExclusive(&g_occlusionLock);
+    if (!occlusion) return result;
+    proxy::QueryProbeAnswer(pixels);
+    if (!g_queryMode) proxy::QueryProbePoll(pixels);   // without QueryMode every answer is a real read
+    return result;
+}
+
+// Hooked only when QueryStatsFrames > 0 at load (HookCreateQuery). Counts D3DISSUE_END on occlusion queries the
+// game has read; the proxy's bracket query is issued but never read, so it stays out of the count.
+HRESULT WINAPI HookQueryIssue(IDirect3DQuery9* self, DWORD flags) {
+    if (flags & D3DISSUE_END) {
+        bool gameQuery = false;
+        AcquireSRWLockExclusive(&g_occlusionLock);
+        if (OcclusionQuery* entry = FindOcclusionQuery(self, false)) gameQuery = entry->gameRead;
+        ReleaseSRWLockExclusive(&g_occlusionLock);
+        if (gameQuery) proxy::QueryProbeIssueEnd();
+    }
+    return g_queryIssue(self, flags);
 }
 
 // FormatGuard: caches CheckDeviceFormat per (format, usage, resourceType) and refuses unsupported
@@ -1220,7 +1275,7 @@ HRESULT WINAPI HookCreateIndexBuffer(IDirect3DDevice9* self, UINT length, DWORD 
 HRESULT WINAPI HookCreateQuery(IDirect3DDevice9* self, D3DQUERYTYPE type, IDirect3DQuery9** query) {
     const HRESULT result = g_createQuery(self, type, query);
     if (SUCCEEDED(result) && query && *query) {
-        if (g_queryMode) {
+        if (g_queryMode || proxy::g_queryProbe.Enabled()) {
             AcquireSRWLockExclusive(&g_occlusionLock);
             if (type == D3DQUERYTYPE_OCCLUSION) {
                 if (OcclusionQuery* entry = FindOcclusionQuery(*query, true)) {
@@ -1235,8 +1290,9 @@ HRESULT WINAPI HookCreateQuery(IDirect3DDevice9* self, D3DQUERYTYPE type, IDirec
         }
         const MethodSlot slots[] = {
             {7, reinterpret_cast<void*>(&HookQueryGetData), reinterpret_cast<void**>(&g_queryGetData)},
+            {6, reinterpret_cast<void*>(&HookQueryIssue), reinterpret_cast<void**>(&g_queryIssue)},
         };
-        HookObjectMethods(*query, slots, ARRAYSIZE(slots));
+        HookObjectMethods(*query, slots, proxy::g_queryProbe.Enabled() ? ARRAYSIZE(slots) : 1);
     }
     return result;
 }
