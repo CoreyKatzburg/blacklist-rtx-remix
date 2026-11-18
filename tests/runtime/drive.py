@@ -165,6 +165,13 @@ def ini_with(text: str, section: str, key: str, value: str) -> str:
     return text
 
 
+def ini_get(text: str, section: str, key: str) -> str | None:
+    """The value of key in [section] only, or None when the section or key is missing."""
+    body = re.search(r"(?ms)^[ \t]*\[" + re.escape(section) + r"\][ \t]*\r?$(.*?)(?=^[ \t]*\[|\Z)", text)
+    value = body and re.search(r"(?m)^[ \t]*" + re.escape(key) + r"[ \t]*=[ \t]*([^\r\n]*?)[ \t]*\r?$", body.group(1))
+    return value.group(1) if value else None
+
+
 def remove_ini_key(path: str, key: str) -> None:
     with open(path, encoding="latin-1", newline="") as f:
         text = f.read()
@@ -2022,7 +2029,12 @@ class Spot:
                     for section, key, value in v["restore"]:
                         set_ini(self.ini, section, key, value)
                     self.hold(3.0)
-                write_ini(self.ini, original)
+                # Everything back except GateDump: the proxy dumps whenever the tag changes, so putting back the
+                # y0_p0 tag that `original` holds dumped y0_p0 again about 1.4 s after every switch dump (20261117-
+                # 232827). The step's own tag stays and the proxy sees no change.
+                with open(self.ini, encoding="latin-1", newline="") as f:
+                    tag = ini_get(f.read(), "Proxy", "GateDump")
+                write_ini(self.ini, original if tag is None else ini_with(original, "Proxy", "GateDump", tag))
                 self.hold(3.0)
 
     def await_log(self, want: dict, mark: int) -> dict:

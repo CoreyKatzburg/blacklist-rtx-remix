@@ -1090,6 +1090,53 @@ class Reference(unittest.TestCase):
             ("capture", "frames/switch_hide.gray", 30), ("lights", "hide_lights.tsv", False),
             ("capture", "frames/switch_base3.gray", 60), ("lights", "base3_lights.tsv", True), ("raster", "switch_base3")])
 
+    def test_switch_steps_put_the_ini_back_without_asking_the_y0_p0_dump_again(self):
+        # Run 20261117-232827: putting the ini back after each step also put back GateDump=y0_p0, and the proxy (which
+        # dumps whenever the tag changes) dumped y0_p0 again about 1.4 s after every switch dump. Here a fake proxy
+        # records each tag change across every ini write; only the step dumps may appear, and every other key must be
+        # back as it was.
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            ini = os.path.join(tmp, "d3d9_proxy.ini")
+            start = "[Proxy]\r\nGateDump=y0_p0\r\nSkipBracketDraws=0\r\n[Lights]\r\nFlareStandIns=1\r\n"
+            with open(ini, "w", encoding="latin-1", newline="") as fh:
+                fh.write(start)
+            dumps, last = [], ["y0_p0"]
+            real_write = drive.write_ini
+
+            def proxy_reads(path, text):
+                real_write(path, text)
+                tag = drive.ini_get(text, "Proxy", "GateDump")
+                if tag and tag != last[0]:
+                    dumps.append(tag)
+                last[0] = tag or ""
+
+            s = drive.Spot.__new__(drive.Spot)
+            s.spot = {"name": "con_bright_hall", "switches": [
+                {"name": "base", "ini": [["Lights", "FlareStandIns", "1"]]},
+                {"name": "skip", "ini": [["Proxy", "SkipBracketDraws", "1"]]},
+                {"name": "off", "ini": [["Lights", "FlareStandIns", "0"]]}]}
+            s.out, s.ini = tmp, ini
+            s.a = mock.Mock(pid=1)
+            s.log = mock.Mock(new_text=lambda: "")
+            s.move = s.hold = lambda *a, **k: None
+            s.capture = lambda rel, n: None
+            s.dump = lambda tag: drive.set_ini(ini, "Proxy", "GateDump", tag)
+            s.light_dump = lambda dest, draws=False: None
+            s.rel_pose = lambda: [0.0, 0.0]
+            s.sam_moved = lambda tag: False
+            s.stop_position = lambda w: None
+            s.window = lambda name, kind, body, **k: (body(), {})[1]
+            with mock.patch.object(drive, "write_ini", proxy_reads):
+                s.switch_test()
+            with open(ini, encoding="latin-1", newline="") as fh:
+                end = fh.read()
+        self.assertEqual(dumps, ["switch_base", "switch_skip", "switch_off"])
+        self.assertEqual(end, start.replace("GateDump=y0_p0", "GateDump=switch_off"))
+        # The key is read from its own section only.
+        self.assertIsNone(drive.ini_get("[Lights]\r\nGateDump=a\r\n[Proxy]\r\nX=1\r\n", "Proxy", "GateDump"))
+        self.assertEqual(drive.ini_get("[Proxy]\nGateDump = b \n", "Proxy", "GateDump"), "b")
+
     def test_light_dump_keeps_the_same_frames_draw_dump_once_it_is_whole(self):
         # drawDump: the proxy writes f<frame>_draws.tsv beside the light dump and it may still be growing when the
         # light dump appears, so it is copied only once its size has held still; without draws it is not copied.
