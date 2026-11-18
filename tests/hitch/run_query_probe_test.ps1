@@ -1,11 +1,13 @@
-# Query probe check (worker B, X1 [Proxy] QueryStatsFrames and X2 [Proxy] SkipBracketDraws). No GPU, no game.
-#   normal build of query_probe_test.cpp must PASS
-#   each mutant build (marker ignored, mask ignored, every poll counted as pixels>0, window one frame late) must FAIL
+# Query probe check (worker B, X1 [Proxy] QueryStatsFrames and the rebuilt X2 [Proxy] SkipBracketDraws). No GPU, no game.
+#   normal build of query_probe_test.cpp (linked with the real pass_graph.cpp) must PASS
+#   each mutant build (key ignored, the first X2's before-marker span, draws reading the scene HDR skipped, every poll
+#   counted as pixels>0, window one frame late) must FAIL
 #   source checks on d3d9_proxy.cpp and draw_filter.cpp, each with a fake source that must fail it:
 #     both keys default to 0 (off) at load and at live reload
 #     Issue (slot 6) is hooked only when QueryStatsFrames > 0; GetData (slot 7) stays the only hook otherwise
 #     HookQueryGetData returns the old path (QueryGetDataCached) untouched while the probe is off
-#     draw_filter.cpp gives SkipBracketDrawClass the live key g_skipBracketDraws
+#     draw_filter.cpp calls SkipAfterHandoffClass exactly once, with the live key, inside the MarkerDoneThisFrame()
+#     branch after the composite and ModernFilter skips; the old SkipBracketDrawClass call is gone
 # Exit code 0 = all as required, 1 = something is not.
 [CmdletBinding()]
 param()
@@ -24,7 +26,7 @@ function Build-Test([string]$name, [string]$define) {
     $obj = Join-Path $build $name
     New-Item -ItemType Directory -Force -Path $obj | Out-Null
     $cmd = "call `"$vcvars`" x86 >nul && cl.exe /nologo /std:c++17 /O2 /MT /W4 /WX /EHsc $define /I`"$unified`" " +
-           "`"$(Join-Path $here 'query_probe_test.cpp')`" /Fe:`"$exe`" /Fo:`"$obj\\`" /link /NOLOGO"
+           "`"$(Join-Path $here 'query_probe_test.cpp')`" `"$unified\pass_graph.cpp`" `"$unified\shader_traits.cpp`" /Fe:`"$exe`" /Fo:`"$obj\\`" /link /NOLOGO"
     & $env:ComSpec /d /s /c $cmd | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "compile of $name failed (exit $LASTEXITCODE)" }
     $exe
@@ -37,7 +39,7 @@ $normal = Build-Test 'query_probe_test' ''
 if ($LASTEXITCODE -ne 0) { Write-Host 'FAIL: the normal build did not pass' -ForegroundColor Red; $ok = $false }
 else { Write-Host 'ok: the normal build passes' }
 
-$mutants = @('QUERY_PROBE_MUTANT_IGNORE_MARKER', 'QUERY_PROBE_MUTANT_IGNORE_MASK',
+$mutants = @('QUERY_PROBE_MUTANT_IGNORE_KEY', 'QUERY_PROBE_MUTANT_BEFORE_MARKER_ONLY', 'QUERY_PROBE_MUTANT_SKIP_READERS',
              'QUERY_PROBE_MUTANT_POLL_COUNTS_ZERO', 'QUERY_PROBE_MUTANT_WINDOW_OFF_BY_ONE')
 foreach ($m in $mutants) {
     $exe = Build-Test ("query_probe_" + $m.ToLowerInvariant()) "/D$m"
@@ -69,8 +71,21 @@ function Test-ProxySource([string]$text) {
     $problems
 }
 function Test-FilterSource([string]$text) {
-    if ($text -match 'SkipBracketDrawClass\(g_skipBracketDraws, g_cfg\.passFilter, g_modernAwaitingComposite,') { @() }
-    else { @('draw_filter.cpp does not pass g_skipBracketDraws, PassFilter and the hand-off flag to SkipBracketDrawClass') }
+    $problems = @()
+    $call = 'SkipAfterHandoffClass\(g_skipBracketDraws, g_cfg\.passFilter, g_passGraph\.MarkerDoneThisFrame\(\),\s*' +
+            'g_modernAwaitingComposite, pixel\.composite, g_rt0 == CurrentSceneHdrTarget\(\),\s*ctx\.stage0ReadsSceneHdr\)'
+    $n = [regex]::Matches($text, 'SkipAfterHandoffClass\(').Count
+    if ($n -ne 1) { $problems += "SkipAfterHandoffClass is called $n times, not once" }
+    if ($text -notmatch $call) { $problems += 'SkipAfterHandoffClass is not given the live key and draw state' }
+    # Placement: inside if (MarkerDoneThisFrame()) { if (g_modernAwaitingComposite) { composite ... ModernFilter skip ...
+    # X2 ... } g_drawIsWasted = dec.skipDraw; return; }
+    $placed = '(?s)if \(g_passGraph\.MarkerDoneThisFrame\(\)\) \{\s*if \(g_modernAwaitingComposite\) \{\s*' +
+              'if \(pixel\.composite && g_rt0\) \{[^}]*\}\s*' +
+              'if \(g_rt0 != CurrentSceneHdrTarget\(\) \|\| ctx\.stage0ReadsSceneHdr\) \{[^}]*\}\s*' +
+              '(//[^\n]*\n\s*)*if \(' + $call + '\) \{[^}]*\}\s*\}\s*g_drawIsWasted = dec\.skipDraw;\s*return;'
+    if ($text -notmatch $placed) { $problems += 'SkipAfterHandoffClass is not the last check inside the marker-done branch' }
+    if ($text -match 'SkipBracketDrawClass') { $problems += 'the old SkipBracketDrawClass call is still there' }
+    $problems
 }
 
 $proxyText = Get-Content -Raw (Join-Path $unified 'd3d9_proxy.cpp')
@@ -78,7 +93,13 @@ $filterText = Get-Content -Raw (Join-Path $unified 'draw_filter.cpp')
 
 $p = @(Test-ProxySource $proxyText) + @(Test-FilterSource $filterText)
 if ($p.Count) { $p | ForEach-Object { Write-Host "FAIL: $_" -ForegroundColor Red }; $ok = $false }
-else { Write-Host 'ok: keys default to 0, Issue hooked only with the probe on, GetData passes through while off, X2 reads the live key' }
+else { Write-Host 'ok: keys default to 0, Issue hooked only with the probe on, GetData passes through while off, X2 reads the live key in the marker-done branch' }
+
+# The X2 block in draw_filter.cpp, from its comment to its closing brace; the fakes move or copy it.
+$x2Block = '(?s)\r?\n[ \t]*// SkipBracketDraws \(query_probe\.h, X2\).*?return;\s*\}'
+$x2Match = [regex]::Match($filterText, $x2Block)
+if (-not $x2Match.Success) { Write-Host 'FAIL: the X2 block was not found in draw_filter.cpp' -ForegroundColor Red; $ok = $false }
+$x2Text = $x2Match.Value.Replace('$', '$$')
 
 # Fake sources: each must be caught.
 $fakes = [ordered]@{
@@ -87,7 +108,11 @@ $fakes = [ordered]@{
     'Issue always hooked'                  = { Test-ProxySource ($proxyText -replace 'proxy::g_queryProbe\.Enabled\(\) \? ARRAYSIZE\(slots\) : 1', 'ARRAYSIZE(slots)') }
     'Issue listed before GetData'          = { Test-ProxySource ($proxyText -replace '\{7, reinterpret_cast<void\*>\(&HookQueryGetData\)', '{6, reinterpret_cast<void*>(&HookQueryIssue)') }
     'GetData counts with the probe off'    = { Test-ProxySource ($proxyText -replace 'if \(!proxy::g_queryProbe\.Enabled\(\)\) return QueryGetDataCached\(self, data, size, flags\);', '') }
-    'X2 given a fixed mask'                = { Test-FilterSource ($filterText -replace 'SkipBracketDrawClass\(g_skipBracketDraws,', 'SkipBracketDrawClass(3u,') }
+    'X2 given a fixed key'                 = { Test-FilterSource ($filterText -replace 'SkipAfterHandoffClass\(g_skipBracketDraws,', 'SkipAfterHandoffClass(1u,') }
+    'X2 moved after the branch (old place)' = { Test-FilterSource (($filterText -replace $x2Block, '') -replace '(\r?\n    SetBracket\(device, dec\.openBracket\);)', ($x2Text + '$1')) }
+    'X2 called twice'                      = { Test-FilterSource ($filterText -replace $x2Block, ($x2Text + $x2Text)) }
+    'X2 before the ModernFilter skip'      = { Test-FilterSource (($filterText -replace $x2Block, '') -replace '(\r?\n\s*if \(g_rt0 != CurrentSceneHdrTarget\(\) \|\| ctx\.stage0ReadsSceneHdr\) \{)', ($x2Text + '$1')) }
+    'old SkipBracketDrawClass call left'   = { Test-FilterSource ($filterText + "`n// SkipBracketDrawClass(g_skipBracketDraws, 0, 0, 0, 0, 0);`n") }
 }
 foreach ($name in $fakes.Keys) {
     $found = @(& $fakes[$name])

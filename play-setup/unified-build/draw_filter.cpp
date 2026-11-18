@@ -451,6 +451,15 @@ void PassFilterBeforeDraw(IDirect3DDevice9* device,
                 g_skipCurrentDrawForModern = true;
                 return;
             }
+            // SkipBracketDraws (query_probe.h, X2): a draw onto the scene HDR target over Remix's picture, before the
+            // composite. Every draw after the hand-off comes through this branch.
+            if (SkipAfterHandoffClass(g_skipBracketDraws, g_cfg.passFilter, g_passGraph.MarkerDoneThisFrame(),
+                                      g_modernAwaitingComposite, pixel.composite, g_rt0 == CurrentSceneHdrTarget(),
+                                      ctx.stage0ReadsSceneHdr)) {
+                QueryProbeSkip(1);
+                g_skipCurrentDrawForModern = true;
+                return;
+            }
         }
         g_drawIsWasted = dec.skipDraw;
         return;
@@ -471,14 +480,6 @@ void PassFilterBeforeDraw(IDirect3DDevice9* device,
     }
     g_drawIsScene = dec.isScene;
     g_drawIsWasted = dec.skipDraw;
-    // SkipBracketDraws (query_probe.h, X2): non-scene draws between the ModernFilter hand-off and the composite marker.
-    // The marker-done and hand-off-draw paths returned above, so only that span reaches here.
-    if (const int skipClass = SkipBracketDrawClass(g_skipBracketDraws, g_cfg.passFilter, g_modernAwaitingComposite,
-                                                   g_passGraph.MarkerDoneThisFrame(), dec.isScene,
-                                                   g_rt0 == CurrentSceneHdrTarget())) {
-        QueryProbeSkip(skipClass);
-        g_skipCurrentDrawForModern = true;
-    }
     SetBracket(device, dec.openBracket);
 }
 

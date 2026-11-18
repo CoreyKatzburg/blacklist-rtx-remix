@@ -12,12 +12,15 @@
 //   skipped:  draws X2 skipped in the window (0 while X2 is off).
 // Installing the Issue hook needs the key at load, so a launch sets it in the ini before the game starts.
 //
-// X2, [Proxy] SkipBracketDraws=mask (reloads live; 0 = off). Under PassFilter, skips the non-scene draws the game
-// makes after the proxy has handed Remix's picture to it (ModernFilter hand-off) and before the composite marker:
-//   1 = draws onto the scene HDR target (sprites, particles, glows drawn over Remix's picture)
-//   2 = draws onto any other target (the game's post passes before the composite)
-// Scene draws, the hand-off draw, the composite and everything after the marker are never skipped.
-// tests\hitch\run_query_probe_test.ps1 checks this header (normal build PASS, each mutant FAIL) and the hook sites.
+// X2, [Proxy] SkipBracketDraws=1 (reloads live; 0 = off, any value above 0 = on). Under PassFilter, skips the draws
+// the game makes onto the scene HDR target after the ModernFilter hand-off has put Remix's picture there and before
+// the composite draw takes it (sprites, particles, glows drawn over Remix's picture), when the draw does not read the
+// scene HDR. HandoffBeforePost returns true only once the hand-off marker is done (handoff_renderer.cpp), so every
+// such draw reaches draw_filter.cpp's MarkerDoneThisFrame() branch; the call sits there, after the composite draw and
+// after the draws ModernFilter already skips (other targets, draws reading the scene HDR). "skipped other" in the log
+// line stays 0: nothing is left for a second class to skip.
+// tests\hitch\run_query_probe_test.ps1 checks this header against the real PassGraph hand-off (normal build PASS,
+// each mutant FAIL) and the hook sites.
 #include <windows.h>
 
 #include <cstdint>
@@ -31,21 +34,23 @@ inline uint32_t ParseQueryStatsFrames(int raw) {
     return static_cast<uint32_t>(raw) > kQueryProbeMaxFrames ? kQueryProbeMaxFrames : static_cast<uint32_t>(raw);
 }
 
-inline uint32_t ParseSkipBracketDraws(int raw) { return raw > 0 ? static_cast<uint32_t>(raw) & 3u : 0u; }
+inline uint32_t ParseSkipBracketDraws(int raw) { return raw > 0 ? 1u : 0u; }
 
-// 0 = draw, 1 = skip (onto the scene HDR target), 2 = skip (other target).
-inline int SkipBracketDrawClass(uint32_t mask, bool passFilter, bool afterHandoff, bool markerDone, bool isScene,
-                                bool rt0IsSceneHdr) {
-#ifdef QUERY_PROBE_MUTANT_IGNORE_MARKER
-    markerDone = false;
+// 1 = skip (a draw onto the scene HDR target over Remix's picture), 0 = draw. markerDone and awaitingComposite are
+// the live PassGraph::MarkerDoneThisFrame() and g_modernAwaitingComposite; after a hand-off both are true.
+inline int SkipAfterHandoffClass(uint32_t on, bool passFilter, bool markerDone, bool awaitingComposite,
+                                 bool isComposite, bool rt0IsSceneHdr, bool stage0ReadsSceneHdr) {
+#ifdef QUERY_PROBE_MUTANT_IGNORE_KEY
+    on = 1;
 #endif
-    if (!mask || !passFilter || !afterHandoff || markerDone || isScene) return 0;
-    const int cls = rt0IsSceneHdr ? 1 : 2;
-#ifdef QUERY_PROBE_MUTANT_IGNORE_MASK
-    return cls;
-#else
-    return (mask & static_cast<uint32_t>(cls)) ? cls : 0;
+#ifdef QUERY_PROBE_MUTANT_BEFORE_MARKER_ONLY
+    markerDone = !markerDone;   // the first X2's span (after the hand-off, before the marker), which is empty
 #endif
+    if (!on || !passFilter || !markerDone || !awaitingComposite || isComposite) return 0;
+#ifdef QUERY_PROBE_MUTANT_SKIP_READERS
+    stage0ReadsSceneHdr = false;
+#endif
+    return (rt0IsSceneHdr && !stage0ReadsSceneHdr) ? 1 : 0;
 }
 
 struct QueryProbeCounts {
