@@ -208,7 +208,8 @@ function Remove-OwnPlayLock([string]$path, [datetime]$since) {
 # latest play-HHmmss.log names when its last Play script started (a time before the run folder's means after
 # midnight); the lock is removed only by Remove-OwnPlayLock's rule against that time.
 function Remove-RunPlayLock([string]$path, [string]$runDir) {
-    if ((Split-Path -Leaf $runDir) -notmatch '^(\d{8})-(\d{6})') { return $false }
+    # No-Remix runs are named reference-<stamp> (Nov 18 00:04: 233607's lock stayed and was removed by hand).
+    if ((Split-Path -Leaf $runDir) -notmatch '^(?:reference-)?(\d{8})-(\d{6})') { return $false }
     $day = $Matches[1]; $runStart = [datetime]::ParseExact("$day$($Matches[2])", 'yyyyMMddHHmmss', $null)
     $starts = @(Get-ChildItem -LiteralPath $runDir -Filter 'play-*.log' -File -ErrorAction SilentlyContinue |
         Where-Object Name -match '^play-(\d{6})\.log$' | ForEach-Object {

@@ -51,6 +51,17 @@ $naive = [datetime]'2026-11-17 00:01:30'
 Check 'fake: no midnight rule removes the older lock' ((Remove-OwnPlayLock $lock $naive) -and -not (Test-Path $lock))
 Write-LockAt ([datetime]'2026-11-18 00:01:40')
 Check 'midnight run: lock its last Play script wrote is removed' ((Remove-RunPlayLock $lock $r2) -and -not (Test-Path $lock))
+# A no-Remix run is named reference-<stamp> (Nov 18 00:04, reference-20261117-233607: its lock stayed). Its last Play
+# script started at 23:57:05, so its lock goes and a lock from before it stays.
+$r3 = New-Run 'reference-20261117-233607' @('233625', '235705')
+Write-LockAt ([datetime]'2026-11-17 23:50:00')
+Check 'no-Remix run: lock older than its last Play script stays' ((-not (Remove-RunPlayLock $lock $r3)) -and (Test-Path $lock))
+Write-LockAt ([datetime]'2026-11-17 23:57:12')
+Check 'no-Remix run: lock its last Play script wrote is removed' ((Remove-RunPlayLock $lock $r3) -and -not (Test-Path $lock))
+$r4 = New-Run 'notes-20261117-233607' @('235705')
+Write-LockAt ([datetime]'2026-11-17 23:57:12')
+Check 'other folder names: nothing removed' ((-not (Remove-RunPlayLock $lock $r4)) -and (Test-Path $lock))
+Remove-Item $lock -ErrorAction SilentlyContinue
 
 # Proxy key read-back (run 200741: QueryStatsFrames is printed only on the load line and read "not proven").
 $plog = Join-Path $dir 'proxy.log'
