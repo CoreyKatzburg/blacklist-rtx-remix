@@ -849,7 +849,17 @@ def score_variants_sweep(
         ]
         if ae_ratio is not None and ae_ratio > PASS_THRESHOLDS["max_stop_ratio"] and min(all_ratios) > PASS_THRESHOLDS["max_stop_ratio"]:
             verdict = "exposure_falsified_lights_too_strong"
-        elif passing_variants or (ae_ratio is not None and ae_ratio <= PASS_THRESHOLDS["max_stop_ratio"]):
+        elif (
+            not passing_variants
+            and ae_ratio is not None
+            and ae_ratio < PASS_THRESHOLDS["min_stop_ratio"]
+            and max(all_ratios) < PASS_THRESHOLDS["min_spot_median_ratio"]
+        ):
+            verdict = "scene_underlit_exposure_lifting"
+        elif passing_variants or (
+            ae_ratio is not None
+            and PASS_THRESHOLDS["min_stop_ratio"] <= ae_ratio <= PASS_THRESHOLDS["max_stop_ratio"]
+        ):
             verdict = "exposure_confirmed"
         else:
             verdict = "mixed_exposure_and_lights"
@@ -876,7 +886,34 @@ def score_variants_sweep(
     }
 
 
-POSE_DEPTH_MAX_PIXELS = 0.05  # matches picture_cost.py POSE_MAX_PIXELS
+# Held-pose background depth guard, calibrated across all 19 held-pose multi-step runs on disk
+# (17 switch_* spot runs from Nov 15-17 across con_custodial, con_bright_hall, con_boiler plus
+# 20261117-182542-settings and 20261117-183045-settings):
+#   - Full-frame |depth - depth_step1| > 0.01 cm is 6.16%..8.61%, 100% confined to Sam Fisher's
+#     third-person foreground idle breathing silhouette (cols 81..154/320, rows 57..179/180 at
+#     near depth 143..203 cm, bounded by x in [0.22, 0.52], y in [0.30, 1.00]).
+#   - Outside SAM_IDLE_SILHOUETTE_BOX (48,528 / 57,600 = 84.25% of frame), max changed share across
+#     all 19 held-pose runs is 0 / 48,528 = 0.000000, whereas a 1-pixel horizontal camera shift
+#     (~0.25 deg) changes 21.83%..85.69% of background pixels and real 0.15..0.66 deg return slips
+#     change 60.84%..97.12%.
+SAM_IDLE_SILHOUETTE_BOX = (0.22, 0.52, 0.30, 1.00)  # (x0, x1, y0, y1) normalized image coords
+POSE_DEPTH_MAX_PIXELS = 0.01  # max background changed pixel share outside SAM_IDLE_SILHOUETTE_BOX
+POSE_DEPTH_DIFF_CM = 0.01
+
+POSE_DEPTH_GUARD_SPEC = {
+    "sam_idle_silhouette_box_xyxy": list(SAM_IDLE_SILHOUETTE_BOX),
+    "background_pixel_share": round(
+        1.0 - (SAM_IDLE_SILHOUETTE_BOX[1] - SAM_IDLE_SILHOUETTE_BOX[0]) * (SAM_IDLE_SILHOUETTE_BOX[3] - SAM_IDLE_SILHOUETTE_BOX[2]),
+        4,
+    ),
+    "depth_delta_threshold_cm": POSE_DEPTH_DIFF_CM,
+    "max_background_changed_share": POSE_DEPTH_MAX_PIXELS,
+    "calibration_source": (
+        "19 held-pose multi-step runs on disk (Nov 15-17 switch_* plus 182542 con_custodial and 183045 con_boiler): "
+        "0.0000% max background diff (0/48,528 px) vs 6.16%..8.61% inside Sam's foreground silhouette box; "
+        "1-px synthetic shift changes 21.8%..85.7% of background pixels"
+    ),
+}
 
 DEFAULT_LIVE_RTX = {
     "rtx.autoExposure.enabled": "True",
@@ -899,11 +936,29 @@ def _describe_live_rtx(rtx_keys: dict[str, Any], stag: str) -> str:
     return "base" if not diffs else ",".join(diffs)
 
 
-def _pose_depth_diff_share(depth_a: np.ndarray | None, depth_b: np.ndarray | None) -> float | None:
-    """Share of pixels whose game depth differs by > 0.01, or None when either depth dump is absent."""
+def _pose_depth_diff_shares(
+    depth_a: np.ndarray | None,
+    depth_b: np.ndarray | None,
+) -> tuple[float | None, float | None]:
+    """Returns (background_diff_share, full_frame_diff_share) where |depth_a - depth_b| > POSE_DEPTH_DIFF_CM,
+    masking Sam's third-person foreground silhouette box from background_diff_share."""
     if depth_a is None or depth_b is None or depth_a.shape != depth_b.shape:
-        return None
-    return float((np.abs(depth_a - depth_b) > 0.01).mean())
+        return None, None
+    h, w = depth_a.shape
+    x0, x1, y0, y1 = SAM_IDLE_SILHOUETTE_BOX
+    c0, c1 = int(math.floor(x0 * w)), int(math.ceil(x1 * w))
+    r0, r1 = int(math.floor(y0 * h)), int(math.ceil(y1 * h))
+    bg_mask = np.ones((h, w), dtype=bool)
+    bg_mask[r0:r1, c0:c1] = False
+    diff = np.abs(depth_a - depth_b) > POSE_DEPTH_DIFF_CM
+    bg_share = float(diff[bg_mask].mean()) if bool(bg_mask.any()) else float(diff.mean())
+    return bg_share, float(diff.mean())
+
+
+def _pose_depth_diff_share(depth_a: np.ndarray | None, depth_b: np.ndarray | None) -> float | None:
+    """Background share of pixels outside SAM_IDLE_SILHOUETTE_BOX whose game depth differs by > 0.01."""
+    bg_share, _ = _pose_depth_diff_shares(depth_a, depth_b)
+    return bg_share
 
 
 def _read_depth_pfm(gate_dir: str, tag: str) -> np.ndarray | None:
@@ -1131,7 +1186,7 @@ def score_live_steps(
         rt_ok = None if rt_share is None else (rt_share >= 0.90)
         eff_med = tel_info.get("effective_exposure_median")
         ae_med = tel_info.get("auto_exposure_median")
-        depth_diff = _pose_depth_diff_share(base_depth, _read_depth_pfm(gate_dir, stag))
+        depth_diff, full_depth_diff = _pose_depth_diff_shares(base_depth, _read_depth_pfm(gate_dir, stag))
         cmp_res = (
             pb.compare_final_to_raster(f_img, raster_img, mask_hud=True)
             if (raster_img is not None and ref_placed)
@@ -1155,6 +1210,7 @@ def score_live_steps(
             "last2s_auto_exp_f2f_max_rel": tel_info.get("last2s_auto_exp_f2f_max_rel"),
             "last2s_eff_exp_f2f_max_rel": tel_info.get("last2s_eff_exp_f2f_max_rel"),
             "depth_diff_vs_step1": depth_diff,
+            "full_frame_depth_diff_vs_step1": full_depth_diff,
             "gamma_mean": float(f_stats["gamma_mean"]),
             "linear_mean": float(f_stats["linear_mean"]),
             "near_white_share": float(f_stats["near_white_share"]),
@@ -1166,6 +1222,7 @@ def score_live_steps(
     bN = raw_steps.get(end_tag, {})
     b1_settled = b1.get("exposure_settled") is True
     bN_settled = bN.get("exposure_settled") is True
+    bN_pose_ok = bN.get("depth_diff_vs_step1") is None or bN["depth_diff_vs_step1"] <= POSE_DEPTH_MAX_PIXELS
     base_luma = (
         b1.get("gamma_mean")
         if (b1.get("ray_traced") is not False and b1_settled)
@@ -1187,6 +1244,7 @@ def score_live_steps(
 
     steps_scored: dict[str, Any] = {}
     passing_steps: list[str] = []
+    stop_band_passing_steps: list[str] = []
     for stag, entry in raw_steps.items():
         if entry.get("status") == "MISSING_FINAL":
             steps_scored[stag] = entry
@@ -1228,41 +1286,51 @@ def score_live_steps(
         if entry["ray_traced"] is False:
             out["measurement_status"] = "NOT_MEASURED"
             out["gate_pass"] = False
+            out["stop_band_pass"] = False
             out["counts_as_proven_fix"] = False
             out["reasons"] = ["not_ray_traced"]
         elif entry["exposure_settled"] is not True:
             out["measurement_status"] = "NOT_MEASURED"
             out["gate_pass"] = None
+            out["stop_band_pass"] = None
             out["counts_as_proven_fix"] = False
             out["reasons"] = ["exposure not settled"]
         elif not took_ok:
             out["measurement_status"] = "NOT_MEASURED"
             out["gate_pass"] = False
+            out["stop_band_pass"] = False
             out["counts_as_proven_fix"] = False
             out["reasons"] = ["live_rtx_did_not_take"]
-        elif entry["depth_diff_vs_step1"] is not None and entry["depth_diff_vs_step1"] > POSE_DEPTH_MAX_PIXELS:
+        elif (
+            entry["depth_diff_vs_step1"] is not None and entry["depth_diff_vs_step1"] > POSE_DEPTH_MAX_PIXELS
+        ) or not bN_pose_ok:
             out["measurement_status"] = "NOT_MEASURED"
             out["gate_pass"] = False
+            out["stop_band_pass"] = False
             out["counts_as_proven_fix"] = False
             out["reasons"] = ["intra_launch_pose_moved"]
         elif not b1_settled or not bN_settled:
             out["measurement_status"] = "NOT_MEASURED"
             out["gate_pass"] = None
+            out["stop_band_pass"] = None
             out["counts_as_proven_fix"] = False
             out["reasons"] = ["exposure not settled"]
         elif de["status"] == "NOT_MEASURED":
             out["measurement_status"] = "NOT_MEASURED"
             out["gate_pass"] = None
+            out["stop_band_pass"] = None
             out["counts_as_proven_fix"] = False
             out["reasons"] = [de["reason"]]
         elif not ref_placed or raster_img is None or entry["vs_raster"] is None:
             out["measurement_status"] = "NOT_MEASURED"
             out["gate_pass"] = None
+            out["stop_band_pass"] = None
             out["counts_as_proven_fix"] = False
             out["reasons"] = [ref_place_reason or ref_err_reason or "missing_reference"]
         elif entry["vs_raster"].get("black_raster"):
             out["measurement_status"] = "NOT_MEASURED"
             out["gate_pass"] = None
+            out["stop_band_pass"] = None
             out["counts_as_proven_fix"] = False
             out["reasons"] = ["black_raster"]
         else:
@@ -1270,15 +1338,23 @@ def score_live_steps(
             vr = entry["vs_raster"]
             ratio = vr["gamma_mean_ratio"]
             nw_delta = vr["near_white_delta"]
+            stop_reasons: list[str] = []
             reasons: list[str] = []
             if entry["nonfinite_pixels"] > 0 or vr["nonfinite_pixels"] > 0:
+                stop_reasons.append("nonfinite_pixels")
                 reasons.append("nonfinite_pixels")
             if entry["gamma_mean"] < PASS_THRESHOLDS["min_scene_luma"]:
-                reasons.append(f"below_luma_floor ({entry['gamma_mean']:.4f} < {PASS_THRESHOLDS['min_scene_luma']})")
+                msg = f"below_luma_floor ({entry['gamma_mean']:.4f} < {PASS_THRESHOLDS['min_scene_luma']})"
+                stop_reasons.append(msg)
+                reasons.append(msg)
             if ratio is None or ratio < PASS_THRESHOLDS["min_stop_ratio"]:
-                reasons.append(f"too_dark_stop ({ratio:.3f}x < {PASS_THRESHOLDS['min_stop_ratio']}x)")
+                msg = f"too_dark_stop ({ratio:.3f}x < {PASS_THRESHOLDS['min_stop_ratio']}x)"
+                stop_reasons.append(msg)
+                reasons.append(msg)
             elif ratio > PASS_THRESHOLDS["max_stop_ratio"]:
-                reasons.append(f"too_bright_stop ({ratio:.3f}x > {PASS_THRESHOLDS['max_stop_ratio']}x)")
+                msg = f"too_bright_stop ({ratio:.3f}x > {PASS_THRESHOLDS['max_stop_ratio']}x)"
+                stop_reasons.append(msg)
+                reasons.append(msg)
             if ratio is not None and (
                 ratio < PASS_THRESHOLDS["min_spot_median_ratio"]
                 or ratio > PASS_THRESHOLDS["max_spot_median_ratio"]
@@ -1288,7 +1364,10 @@ def score_live_steps(
                     f"[{PASS_THRESHOLDS['min_spot_median_ratio']}, {PASS_THRESHOLDS['max_spot_median_ratio']}])"
                 )
             if nw_delta > PASS_THRESHOLDS["max_near_white_delta"]:
-                reasons.append(f"near_white_excess (+{nw_delta:.4f} > +{PASS_THRESHOLDS['max_near_white_delta']})")
+                msg = f"near_white_excess (+{nw_delta:.4f} > +{PASS_THRESHOLDS['max_near_white_delta']})"
+                stop_reasons.append(msg)
+                reasons.append(msg)
+            out["stop_band_pass"] = len(stop_reasons) == 0
             out["gate_pass"] = len(reasons) == 0
             out["counts_as_proven_fix"] = bool(
                 out["gate_pass"]
@@ -1296,6 +1375,8 @@ def score_live_steps(
                 and not out.get("requires_dedicated_off_on_off")
             )
             out["reasons"] = reasons
+            if out["stop_band_pass"]:
+                stop_band_passing_steps.append(stag)
             if out["gate_pass"]:
                 passing_steps.append(stag)
 
@@ -1328,11 +1409,25 @@ def score_live_steps(
             and min(all_ratios) > PASS_THRESHOLDS["max_stop_ratio"]
         ):
             verdict = "exposure_falsified_lights_too_strong"
-        elif passing_steps or (ae_ratio is not None and ae_ratio <= PASS_THRESHOLDS["max_stop_ratio"]):
+        elif (
+            not passing_steps
+            and ae_ratio is not None
+            and ae_ratio < PASS_THRESHOLDS["min_stop_ratio"]
+            and max(all_ratios) < PASS_THRESHOLDS["min_spot_median_ratio"]
+        ):
+            verdict = "scene_underlit_exposure_lifting"
+        elif (
+            passing_steps
+            or stop_band_passing_steps
+            or (
+                ae_ratio is not None
+                and PASS_THRESHOLDS["min_stop_ratio"] <= ae_ratio <= PASS_THRESHOLDS["max_stop_ratio"]
+            )
+        ):
             verdict = "exposure_confirmed"
         else:
             verdict = "mixed_exposure_and_lights"
-    elif passing_steps:
+    elif passing_steps or stop_band_passing_steps:
         verdict = "exposure_confirmed"
     else:
         verdict = "inconclusive"
@@ -1369,6 +1464,7 @@ def score_live_steps(
         "mode": "live_steps",
         "sweep_design": sweep_design,
         "settle_guard": EXPOSURE_SETTLE_SPEC,
+        "pose_depth_guard": POSE_DEPTH_GUARD_SPEC,
         "live_dir": os.path.abspath(vdir),
         "spot": spot_name,
         "reference_tag": ref_tag,
@@ -1383,12 +1479,117 @@ def score_live_steps(
         "base_drift_rel": drift_eval["base_drift_rel"],
         "diagnostic_isolation_variants": diagnostic_isolation_variants,
         "cause_narrowing_only_variants": cause_narrowing_only_variants,
+        "stop_band_passing_variants": stop_band_passing_steps,
         "passing_variants": passing_steps,
         "candidate_fixes_needing_off_on_off": candidate_fixes_needing_off_on_off,
         "confirmed_fixes": confirmed_fixes,
         "cause_narrowing_note": cause_narrowing_note,
         "causal_verdict": verdict,
         "variants": steps_scored,
+    }
+
+
+def score_cross_spot_live_steps(
+    live_dirs: list[str],
+    reference_dirs: list[str],
+    ref_tag: str = "y0_p0",
+) -> dict[str, Any]:
+    """Scores two or more single-launch liveSteps runs jointly across rooms to test whether any global
+    camera exposure / tonemapping setting satisfies the two-sided scene_brightness bounds everywhere."""
+    spot_results = [score_live_steps(d, reference_dirs, ref_tag=ref_tag) for d in live_dirs]
+    by_spot = {r["spot"]: r for r in spot_results}
+    measured_spots = [s for s, r in by_spot.items() if r.get("causal_verdict") != "NOT_MEASURED"]
+    if len(measured_spots) < 2:
+        return {
+            "mode": "cross_spot_live_steps",
+            "measured_spots": measured_spots,
+            "cross_spot_verdict": "NOT_MEASURED",
+            "spots": by_spot,
+        }
+
+    # Common non-base steps across measured spots in step order
+    first_vars = by_spot[measured_spots[0]]["variants"]
+    common_steps = [
+        stag
+        for stag, entry in first_vars.items()
+        if not entry.get("is_base")
+        and all(
+            stag in by_spot[sp]["variants"]
+            and by_spot[sp]["variants"][stag].get("measurement_status") == "MEASURED"
+            for sp in measured_spots
+        )
+    ]
+
+    overbright_base_spots: list[str] = []
+    for sp in measured_spots:
+        btag = by_spot[sp]["base_first"]
+        b_vr = (by_spot[sp]["variants"].get(btag) or {}).get("vs_raster") or {}
+        b_ratio = b_vr.get("gamma_mean_ratio")
+        if b_ratio is not None and b_ratio > PASS_THRESHOLDS["max_stop_ratio"]:
+            overbright_base_spots.append(sp)
+
+    steps_under_max_on_overbright: list[str] = []
+    steps_crushing_other_spot_below_min: list[str] = []
+    joint_stop_band_passing: list[str] = []
+    joint_median_band_passing: list[str] = []
+    step_cross_table: dict[str, dict[str, Any]] = {}
+
+    for stag in common_steps:
+        per_spot_ratios: dict[str, float | None] = {}
+        all_stop_ok = True
+        all_med_ok = True
+        fixes_overbright = bool(overbright_base_spots)
+        crushes_any = False
+        for sp in measured_spots:
+            sv = by_spot[sp]["variants"][stag]
+            vr = sv.get("vs_raster") or {}
+            rat = vr.get("gamma_mean_ratio")
+            per_spot_ratios[sp] = rat
+            if not sv.get("stop_band_pass"):
+                all_stop_ok = False
+            if not sv.get("gate_pass"):
+                all_med_ok = False
+            if sp in overbright_base_spots and (rat is None or rat > PASS_THRESHOLDS["max_stop_ratio"]):
+                fixes_overbright = False
+            if (rat is not None and rat < PASS_THRESHOLDS["min_stop_ratio"]) or (
+                sv.get("gamma_mean", 1.0) < PASS_THRESHOLDS["min_scene_luma"]
+            ):
+                crushes_any = True
+        if fixes_overbright:
+            steps_under_max_on_overbright.append(stag)
+            if crushes_any:
+                steps_crushing_other_spot_below_min.append(stag)
+        if all_stop_ok:
+            joint_stop_band_passing.append(stag)
+        if all_med_ok:
+            joint_median_band_passing.append(stag)
+        step_cross_table[stag] = {
+            "label": first_vars[stag].get("label"),
+            "gamma_mean_ratio_by_spot": per_spot_ratios,
+            "fixes_overbright_stop_band": fixes_overbright,
+            "crushes_spot_below_min": crushes_any,
+            "joint_stop_band_pass": all_stop_ok,
+            "joint_median_band_pass": all_med_ok,
+        }
+
+    if joint_median_band_passing or joint_stop_band_passing:
+        cross_verdict = "joint_exposure_candidate_found"
+    elif steps_under_max_on_overbright and len(steps_crushing_other_spot_below_min) == len(steps_under_max_on_overbright):
+        cross_verdict = "global_exposure_fix_ruled_out_room_radiance_diverges"
+    else:
+        cross_verdict = "no_global_exposure_pass"
+
+    return {
+        "mode": "cross_spot_live_steps",
+        "measured_spots": measured_spots,
+        "overbright_base_spots": overbright_base_spots,
+        "steps_under_max_stop_on_overbright_spots": steps_under_max_on_overbright,
+        "steps_crushing_other_spot_below_min": steps_crushing_other_spot_below_min,
+        "joint_stop_band_passing_variants": joint_stop_band_passing,
+        "joint_median_band_passing_variants": joint_median_band_passing,
+        "cross_spot_verdict": cross_verdict,
+        "step_summary": step_cross_table,
+        "spots": by_spot,
     }
 
 
@@ -1597,46 +1798,59 @@ def run_self_test() -> None:
             ag["spots"]["spot_clamp"]["exposure_telemetry"]["normalized_pre_tonemap_radiance_ratio_median"] is not None
         ), ag["spots"]["spot_clamp"]
 
-        # 6. score_live_steps: clean PASS + failing fake cases for live_rtx_did_not_take,
-        #    intra_launch_pose_moved, and reference_pose_mismatch
-        yy, xx = np.mgrid[0:32, 0:32]
-        depth_ok = (100.0 + 10.0 * ((xx // 4) % 2) + yy * 0.5).astype(np.float32)
-        depth_moved = np.roll(depth_ok, 1, axis=1)
+        # 6. score_live_steps: clean PASS + Sam foreground idle sway (0% background diff, ~10.9% full-frame diff -> MEASURED)
+        #    + failing fake cases for live_rtx_did_not_take, 1-px camera shift / 2.5% subtle background move (intra_launch_pose_moved),
+        #    and reference_pose_mismatch + cross-spot divergence vs joint pass
+        yy, xx = np.mgrid[0:180, 0:320]
+        depth_ok = (300.0 + 15.0 * ((xx // 4) % 2) + yy * 0.5).astype(np.float32)
+        depth_ok[65:179, 85:140] = 165.0  # Sam Fisher third-person foreground silhouette (~165 cm)
+        depth_sam_sway = depth_ok.copy()
+        depth_sam_sway[65:179, 85:140] = 173.0  # 6,270 / 57,600 = 10.89% full-frame diff inside SAM_IDLE_SILHOUETTE_BOX, 0% outside
+        depth_moved = np.roll(depth_ok, 1, axis=1)  # 1-px horizontal camera slip (~0.25 deg)
+        depth_subtle_bg = depth_ok.copy()
+        depth_subtle_bg[10:40, 260:300] += 5.0  # 1,200 / 48,528 = 2.47% background diff (> 1.0% limit, < old 5% full-frame limit)
 
         live_ref = os.path.join(tmp, "live_ref")
         _write_uniform_pfm(os.path.join(live_ref, "con_custodial", "gate", "y0_p0_raster.pfm"), 0.14)
-        with open(os.path.join(live_ref, "con_custodial", "spot.json"), "w", encoding="utf-8") as f:
-            json.dump({"name": "con_custodial", "windows": [{"name": "y0_p0", "kind": "still", "proxy": [10, 20]}]}, f)
-        with open(os.path.join(live_ref, "con_custodial", "proxy_frames.csv"), "w", encoding="utf-8") as f:
-            f.write("frame,dt,draws,prims,tex,lights,pub\n")
-            for fr in range(10, 21):
-                f.write(f"{fr},16.6,100,1000,10,5,c:0:0:10.0:20.0:30.0:1.0:0.0:0.0\n")
+        _write_uniform_pfm(os.path.join(live_ref, "con_boiler", "gate", "y0_p0_raster.pfm"), 0.155)
+        for sp_name in ("con_custodial", "con_boiler"):
+            with open(os.path.join(live_ref, sp_name, "spot.json"), "w", encoding="utf-8") as f:
+                json.dump({"name": sp_name, "windows": [{"name": "y0_p0", "kind": "still", "proxy": [10, 20]}]}, f)
+            with open(os.path.join(live_ref, sp_name, "proxy_frames.csv"), "w", encoding="utf-8") as f:
+                f.write("frame,dt,draws,prims,tex,lights,pub\n")
+                for fr in range(10, 21):
+                    f.write(f"{fr},16.6,100,1000,10,5,c:0:0:10.0:20.0:30.0:1.0:0.0:0.0\n")
 
         def _build_live_case(
             case_name: str,
+            spot_name: str = "con_custodial",
             stuck_rtx: bool = False,
             move_depth: bool = False,
+            subtle_bg_move: bool = False,
+            sam_sway: bool = False,
             far_cam: bool = False,
             ramp_step3: bool = False,
             ramp_base_end: bool = False,
             single_candidate_off_on_off: bool = False,
+            step_lumas: tuple[float, float, float, float] | None = None,
         ):
             cdir = os.path.join(tmp, case_name, "01_live_exposure")
             os.makedirs(cdir, exist_ok=True)
             with open(os.path.join(tmp, case_name, "manifest.json"), "w", encoding="utf-8") as f:
-                json.dump({"spots": ["con_custodial"], "variants": ["01_live_exposure"]}, f)
+                json.dump({"spots": [spot_name], "variants": ["01_live_exposure"]}, f)
+            l1, l2, l3, l4 = step_lumas if step_lumas is not None else (0.48, 0.17, 0.16, 0.481)
             if single_candidate_off_on_off:
                 steps_meta = [
-                    ("live_step1", 0.48, 5.75, 4.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "-2.0", "rtx.localtonemap.exposure": "0.75"}),
-                    ("live_step2", 0.16, 1.75, 1.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "0.0", "rtx.localtonemap.exposure": "0.75", "rtx.localtonemap.shadows": "0.0"}),
-                    ("live_step3", 0.481, 5.75, 4.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "-2.0", "rtx.localtonemap.exposure": "0.75"}),
+                    ("live_step1", l1, 5.75, 4.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "-2.0", "rtx.localtonemap.exposure": "0.75"}),
+                    ("live_step2", l3, 1.75, 1.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "0.0", "rtx.localtonemap.exposure": "0.75", "rtx.localtonemap.shadows": "0.0"}),
+                    ("live_step3", l4, 5.75, 4.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "-2.0", "rtx.localtonemap.exposure": "0.75"}),
                 ]
             else:
                 steps_meta = [
-                    ("live_step1", 0.48, 5.75, 4.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "-2.0", "rtx.localtonemap.exposure": "0.75"}),
-                    ("live_step2", 0.17, (5.75 if stuck_rtx else 1.0), (4.31 if stuck_rtx else 0.75), {"rtx.autoExposure.enabled": "False", "rtx.localtonemap.exposure": "0.75"}),
-                    ("live_step3", 0.16, 1.75, 1.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "0.0", "rtx.localtonemap.exposure": "0.75", "rtx.localtonemap.shadows": "0.0"}),
-                    ("live_step4", 0.481, 5.75, 4.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "-2.0", "rtx.localtonemap.exposure": "0.75"}),
+                    ("live_step1", l1, 5.75, 4.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "-2.0", "rtx.localtonemap.exposure": "0.75"}),
+                    ("live_step2", l2, (5.75 if stuck_rtx else 1.0), (4.31 if stuck_rtx else 0.75), {"rtx.autoExposure.enabled": "False", "rtx.localtonemap.exposure": "0.75"}),
+                    ("live_step3", l3, 1.75, 1.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "0.0", "rtx.localtonemap.exposure": "0.75", "rtx.localtonemap.shadows": "0.0"}),
+                    ("live_step4", l4, 5.75, 4.31, {"rtx.autoExposure.enabled": "True", "rtx.autoExposure.evMinValue": "-2.0", "rtx.localtonemap.exposure": "0.75"}),
                 ]
             wins = []
             t_rows = []
@@ -1645,10 +1859,15 @@ def run_self_test() -> None:
                 f0 = 100 + idx * (n_fr + 10)
                 wins.append({"name": st, "kind": "still", "telemetry": [f0, f0 + n_fr - 1], "proxy": [f0, f0 + n_fr - 1], "liveRtx": rtx_d})
                 _write_uniform_pfm(os.path.join(cdir, "gate", f"{st}_final.pfm"), val)
-                _write_depth_pfm(
-                    os.path.join(cdir, "gate", f"{st}_gamedepth.pfm"),
-                    depth_moved if (move_depth and st == "live_step3") else depth_ok,
-                )
+                if move_depth and st == "live_step3":
+                    d_arr = depth_moved
+                elif subtle_bg_move and st == "live_step3":
+                    d_arr = depth_subtle_bg
+                elif sam_sway and st != "live_step1":
+                    d_arr = depth_sam_sway
+                else:
+                    d_arr = depth_ok
+                _write_depth_pfm(os.path.join(cdir, "gate", f"{st}_gamedepth.pfm"), d_arr)
                 for k in range(n_fr):
                     fr = f0 + k
                     qpc_ms = float(fr) * (1000.0 / 30.0)
@@ -1681,7 +1900,7 @@ def run_self_test() -> None:
                         )
                     )
             with open(os.path.join(cdir, "spot.json"), "w", encoding="utf-8") as f:
-                json.dump({"name": "con_custodial", "windows": wins}, f)
+                json.dump({"name": spot_name, "windows": wins}, f)
             with open(os.path.join(cdir, "telemetry.jsonl"), "w", encoding="utf-8") as f:
                 f.write("\n".join(t_rows) + "\n")
             cam_x = 25.0 if far_cam else 10.5
@@ -1691,7 +1910,7 @@ def run_self_test() -> None:
                     f.write(f"{fr},16.6,100,1000,10,5,c:0:0:{cam_x}:20.0:30.0:1.0:0.0:0.0\n")
             return os.path.join(tmp, case_name)
 
-        live_ok = score_variants_sweep(_build_live_case("live_ok"), [live_ref])
+        live_ok = score_variants_sweep(_build_live_case("live_ok", sam_sway=True), [live_ref])
         assert live_ok["mode"] == "live_steps" and live_ok["causal_verdict"] == "exposure_confirmed", live_ok
         assert live_ok["sweep_design"] == "multi_variant_screening", live_ok
         assert live_ok["passing_variants"] == ["live_step2", "live_step3"], live_ok
@@ -1700,6 +1919,10 @@ def run_self_test() -> None:
         assert live_ok["candidate_fixes_needing_off_on_off"] == ["live_step2", "live_step3"], live_ok
         assert live_ok["confirmed_fixes"] == [], live_ok
         assert live_ok["variants"]["live_step3"]["exposure_settled"] is True, live_ok["variants"]["live_step3"]
+        # Verify Sam's foreground idle sway (~10.89% full-frame diff) has 0.0 background diff and stays MEASURED
+        assert live_ok["variants"]["live_step3"]["full_frame_depth_diff_vs_step1"] > 0.10, live_ok["variants"]["live_step3"]
+        assert live_ok["variants"]["live_step3"]["depth_diff_vs_step1"] == 0.0, live_ok["variants"]["live_step3"]
+        assert live_ok["variants"]["live_step3"]["measurement_status"] == "MEASURED", live_ok["variants"]["live_step3"]
 
         # Step whose exposure is still ramping over last 2 s -> NOT_MEASURED ("exposure not settled")
         live_ramp = score_live_steps(_build_live_case("live_ramp", ramp_step3=True), [live_ref])
@@ -1730,13 +1953,44 @@ def run_self_test() -> None:
         assert live_stuck["variants"]["live_step2"]["measurement_status"] == "NOT_MEASURED", live_stuck
         assert live_stuck["variants"]["live_step2"]["reasons"] == ["live_rtx_did_not_take"], live_stuck
 
+        # 1-pixel camera move AND subtle 2.47% background move (> 1% limit) both fail with intra_launch_pose_moved
         live_slip = score_live_steps(_build_live_case("live_slip", move_depth=True), [live_ref])
         assert live_slip["variants"]["live_step3"]["measurement_status"] == "NOT_MEASURED", live_slip
         assert live_slip["variants"]["live_step3"]["reasons"] == ["intra_launch_pose_moved"], live_slip
 
+        live_bg_subtle = score_live_steps(_build_live_case("live_bg_subtle", subtle_bg_move=True), [live_ref])
+        assert live_bg_subtle["variants"]["live_step3"]["measurement_status"] == "NOT_MEASURED", live_bg_subtle
+        assert live_bg_subtle["variants"]["live_step3"]["reasons"] == ["intra_launch_pose_moved"], live_bg_subtle
+
         live_far = score_live_steps(_build_live_case("live_far", far_cam=True), [live_ref])
         assert live_far["reference_placed"] is False and live_far["causal_verdict"] == "NOT_MEASURED", live_far
         assert live_far["variants"]["live_step2"]["reasons"][0].startswith("reference_pose_mismatch"), live_far
+
+        # 7. Cross-spot liveSteps scoring:
+        #    (a) Custodial brought into [1.50x, 1.85x] stop band (0.232 / 0.14 = 1.657x) while Boiler drops below
+        #        0.50x (0.036 / 0.155 = 0.232x) -> scene_underlit_exposure_lifting on Boiler and
+        #        cross_spot_verdict == "global_exposure_fix_ruled_out_room_radiance_diverges"
+        cust_div_dir = _build_live_case(
+            "cross_cust_div", spot_name="con_custodial", sam_sway=True, step_lumas=(0.51, 0.246, 0.232, 0.512)
+        )
+        boil_div_dir = _build_live_case(
+            "cross_boil_div", spot_name="con_boiler", sam_sway=True, step_lumas=(0.126, 0.036, 0.035, 0.123)
+        )
+        sc_boil_div = score_live_steps(boil_div_dir, [live_ref])
+        assert sc_boil_div["causal_verdict"] == "scene_underlit_exposure_lifting", sc_boil_div
+        cross_div = score_cross_spot_live_steps([cust_div_dir, boil_div_dir], [live_ref])
+        assert cross_div["cross_spot_verdict"] == "global_exposure_fix_ruled_out_room_radiance_diverges", cross_div
+        assert cross_div["joint_stop_band_passing_variants"] == [], cross_div
+        assert cross_div["steps_under_max_stop_on_overbright_spots"] == ["live_step2", "live_step3"], cross_div
+        assert cross_div["steps_crushing_other_spot_below_min"] == ["live_step2", "live_step3"], cross_div
+
+        #    (b) Joint exposure candidate where both rooms land inside [0.60x, 1.50x] -> "joint_exposure_candidate_found"
+        boil_ok_dir = _build_live_case(
+            "cross_boil_ok", spot_name="con_boiler", sam_sway=True, step_lumas=(0.31, 0.14, 0.135, 0.308)
+        )
+        cross_ok = score_cross_spot_live_steps([_build_live_case("cross_cust_ok", sam_sway=True), boil_ok_dir], [live_ref])
+        assert cross_ok["cross_spot_verdict"] == "joint_exposure_candidate_found", cross_ok
+        assert cross_ok["joint_median_band_passing_variants"] == ["live_step2", "live_step3"], cross_ok
 
     print("exposure_vs_lights.py: ALL SELF-TESTS PASSED")
 
@@ -1746,7 +2000,12 @@ def main() -> int:
     ap.add_argument("--self-test", action="store_true", help="Run synthetic unit tests and exit.")
     ap.add_argument("--run", action="append", default=[], help="Saved Remix gate run folder(s) to analyze.")
     ap.add_argument("--score-sweep", default=None, help="Score a verify_runtime.ps1 -Variants output directory.")
-    ap.add_argument("--score-live", default=None, help="Score a single-launch liveSteps + liveStepDump folder.")
+    ap.add_argument(
+        "--score-live",
+        action="append",
+        default=[],
+        help="Score one single-launch liveSteps folder, or pass two or more folders for joint cross-spot scoring.",
+    )
     ap.add_argument("--reference", action="append", default=[], help="No-Remix reference run folder(s).")
     ap.add_argument("--spot", default=None, help="Optional spot name override for --score-sweep / --score-live.")
     ap.add_argument("--out", default=None, help="Optional path to write JSON output.")
@@ -1759,7 +2018,10 @@ def main() -> int:
     if args.score_live:
         if not args.reference:
             ap.error("--score-live requires at least one --reference <ref_dir>")
-        result = score_live_steps(args.score_live, args.reference, spot_override=args.spot)
+        if len(args.score_live) == 1:
+            result = score_live_steps(args.score_live[0], args.reference, spot_override=args.spot)
+        else:
+            result = score_cross_spot_live_steps(args.score_live, args.reference)
     elif args.score_sweep:
         if not args.reference:
             ap.error("--score-sweep requires at least one --reference <ref_dir>")
