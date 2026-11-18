@@ -1080,18 +1080,37 @@ class Spot:
         on Nov 16 (run 063147) Remix wrote none at con_bright_hall while not ray tracing, so 31 of its 32 pictures
         were con_custodial's, copied unchanged and scored as 2.63x brighter than the original."""
         names = [f"{tag}_final.pfm", f"{tag}_depth.pfm", f"{tag}_gamedepth.pfm"]
-        paths = [os.path.join(d, n) for d in self.dump_dirs for n in names]
+        # PresentGrabFrames N (X3, query_trace.h): the proxy also writes <tag>_composite_f0..N-1 and _present_f0..N-1
+        # over the N frames after the dump. Run 20261117-232827 kept none of them; the scorer reads them from gate\.
+        n = self.present_grab_frames()
+        grabs = [f"{tag}_{what}_f{i}.pfm" for what in ("composite", "present") for i in range(n)]
+        paths = [os.path.join(d, x) for d in self.dump_dirs for x in names + grabs]
         before = {p: os.stat(p).st_mtime_ns for p in paths if os.path.exists(p)}
         found = lambda: [p for p in paths if os.path.exists(p) and os.stat(p).st_mtime_ns != before.get(p)]
         set_ini(self.ini, "Proxy", "GateDump", tag)
-        self.hold(8.0, until=lambda: len(found()) >= len(names))
+        self.hold(8.0, until=lambda: len(found()) >= len(names) + len(grabs))
         time.sleep(0.3)   # let the last write finish
         fresh = found()
         for p in fresh:
             shutil.copy2(p, os.path.join(self.out, "gate", os.path.basename(p)))
-        missing = sorted(set(names) - {os.path.basename(p) for p in fresh})
+        got = {os.path.basename(p) for p in fresh}
+        missing = sorted(set(names) - got)
         if missing:
             print(f"DUMP MISSING {tag}: no new {', '.join(missing)} (old files with these names are not copied)")
+        missing = sorted(set(grabs) - got)
+        if missing:
+            print(f"GRAB MISSING {tag}: {len(missing)} of {len(grabs)} present grabs not new: {', '.join(missing)}")
+
+    def present_grab_frames(self) -> int:
+        """[Proxy] PresentGrabFrames in the game's d3d9_proxy.ini, clamped to 0..16 as the proxy's
+        ParsePresentGrabFrames does (the proxy reads it once at load; the ini keeps the launch's value)."""
+        if not os.path.exists(self.ini):
+            return 0
+        with open(self.ini, encoding="latin-1") as f:
+            text = f.read()
+        section = re.search(r"(?ms)^[ \t]*\[Proxy\][ \t]*$(.*?)(?=^[ \t]*\[|\Z)", text)
+        key = section and re.search(r"(?m)^[ \t]*PresentGrabFrames[ \t]*=[ \t]*(-?\d+)", section.group(1))
+        return min(max(int(key.group(1)), 0), 16) if key else 0
 
     def steady(self, fps: float = 10.0, span: float = 1.0, timeout: float = 15.0) -> float:
         """Waits until the game has drawn at least fps*span frames in the last `span` seconds; returns the seconds

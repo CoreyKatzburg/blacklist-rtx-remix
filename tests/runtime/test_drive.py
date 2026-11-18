@@ -1854,6 +1854,56 @@ class Reference(unittest.TestCase):
             with open(os.path.join(out, "gate", "y0_p0_gamedepth.pfm"), "rb") as fh:
                 self.assertEqual(fh.read(), b"bright_hall")
 
+    def test_present_grabs_of_the_dump_are_copied_and_old_ones_are_not(self):
+        # Run 20261117-232827 (X3, PresentGrabFrames=8): the proxy wrote 8 composite and 8 present grabs per step in
+        # the game's gate folder and the run folder kept none. Here the proxy writes 5 of each, so f5-f7 are old
+        # files from an earlier launch and must stay out; another tag's grabs must stay out too.
+        import io, os, tempfile, contextlib
+        with tempfile.TemporaryDirectory() as tmp:
+            game, out = os.path.join(tmp, "gate"), os.path.join(tmp, "out")
+            os.makedirs(game), os.makedirs(os.path.join(out, "gate"))
+            ini = os.path.join(tmp, "d3d9_proxy.ini")
+            with open(ini, "w") as fh:
+                fh.write("[Lights]\nPresentGrabFrames=2\n[Proxy]\nGateDump=\nPresentGrabFrames=8\n[RemixConfig]\n")
+            old = [f"switch_base_{w}_f{i}.pfm" for w in ("composite", "present") for i in range(8)] + \
+                  ["switch_off_composite_f0.pfm"]
+            for n in old:
+                with open(os.path.join(game, n), "wb") as fh:
+                    fh.write(b"old")
+                os.utime(os.path.join(game, n), (1, 1))
+            s = drive.Spot.__new__(drive.Spot)
+            s.dump_dirs, s.out, s.ini = [game], out, ini
+            self.assertEqual(s.present_grab_frames(), 8)   # the [Proxy] value, not the one in [Lights]
+
+            def proxy_answers(seconds, until=None):
+                for n in ("final", "depth", "gamedepth"):
+                    with open(os.path.join(game, f"switch_base_{n}.pfm"), "wb") as fh:
+                        fh.write(b"new")
+                for w in ("composite", "present"):
+                    for i in range(5):
+                        with open(os.path.join(game, f"switch_base_{w}_f{i}.pfm"), "wb") as fh:
+                            fh.write(b"new")
+            s.hold = proxy_answers
+            printed = io.StringIO()
+            with mock.patch.object(drive, "set_ini", lambda *a: None), mock.patch.object(drive.time, "sleep"), \
+                    contextlib.redirect_stdout(printed):
+                s.dump("switch_base")
+            kept = sorted(os.listdir(os.path.join(out, "gate")))
+            want = sorted([f"switch_base_{n}.pfm" for n in ("final", "depth", "gamedepth")] +
+                          [f"switch_base_{w}_f{i}.pfm" for w in ("composite", "present") for i in range(5)])
+            self.assertEqual(kept, want)
+            self.assertIn("GRAB MISSING switch_base: 6 of 16", printed.getvalue())
+            self.assertNotIn("DUMP MISSING", printed.getvalue())
+        # The proxy's clamp: above 16 reads 16, negative or absent reads 0.
+        for text, want in (("[Proxy]\nPresentGrabFrames=40\n", 16), ("[Proxy]\nPresentGrabFrames=-3\n", 0),
+                           ("[Proxy]\nGateDump=\n", 0)):
+            with tempfile.TemporaryDirectory() as tmp:
+                s = drive.Spot.__new__(drive.Spot)
+                s.ini = os.path.join(tmp, "d3d9_proxy.ini")
+                with open(s.ini, "w") as fh:
+                    fh.write(text)
+                self.assertEqual(s.present_grab_frames(), want, text)
+
     def test_a_dead_or_black_screen_read_is_an_error_not_an_empty_list(self):
         # No-Remix reference, Nov 16: every shot was black, so samples_ms was [] with noise 0 and no error.
         for name, chunk in (("black", lambda n: bytes(n)), ("dead", lambda n: b"")):
