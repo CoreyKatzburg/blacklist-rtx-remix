@@ -20,9 +20,9 @@ Part 1. The orbs at hidden flares (kind 1; 5 of them in 210750). Per balls-on st
     world   the flare lies inside the box grown by 30 units, or within 100 units of its centre
     camrel  the same with the box moved by the camera position
     ndc     the box lies within |x|,|y| <= 1.5 and its centre maps (320x180) within 3 px of the projected flare
-  For each space, n = traced queries of both balls-on windows that tie any flare, and c = the same with every flare
-  moved by 1000 units (ndc: 40 px). A space is usable when n >= 3 and n > 2c; the usable space with the largest n is
-  taken. None usable: Part 1 reads NOT MEASURED (no query can be tied to a flare).
+  For each space, n = traced queries of both balls-on windows that tie any flare that projects on screen, and c = the
+  same with every such flare moved by 1000 units (ndc: 40 px). A space is usable when n >= 3 and n > 2c; the usable
+  space with the largest n is taken. None usable: Part 1 reads NOT MEASURED (no query can be tied to a flare).
   Per kind-1 orb, its tied records (traced queries of the step's window tying its flare), then the first that applies:
     NOT MEASURED          no tied record.
     (a) GAME IGNORES      >= 80% of tied records were handed nothing (handed 0) or were handed 0 pixels: the game drew
@@ -187,7 +187,9 @@ def ties(r, f, mode, cam, proj):
 
 
 def choose_mode(steps):
-    """steps: list of (records, flares, cam, proj). Returns (mode or None, {mode: (n, c)})."""
+    """steps: list of (records, flares, cam, proj). Returns (mode or None, {mode: (n, c)}). Only flares that project
+    on screen count: 232827's dumps hold off-screen rows at 0,0,0 that tie every screen-space quad in world space."""
+    steps = [(recs, [f for f in fl if f["uv"] is not None], cam, proj) for recs, fl, cam, proj in steps]
     table = {}
     for mode in MODES:
         n = sum(any(ties(r, f, mode, cam, proj) for f in fl) for recs, fl, cam, proj in steps for r in recs)
@@ -528,6 +530,21 @@ def self_test() -> int:
                       1, 40) for f in (1, 2, 3)]
     mode, _ = choose_mode([(parse_trace(ndc)[0], fl, cam, proj)])
     expect(mode == "ndc", f"screen-space quads choose ndc ({mode})")
+    # The light dumps of 232827 hold 16 flare rows at 0,0,0 that are off screen; screen-space quads lie within 100
+    # units of the origin, so in world space they tie those rows. Only on-screen flares may choose the space.
+    origin = [{"pos": "0,0,0", "standin": "0"}] * 16
+    fl3 = make_flares([{"pos": "1400,460,70", "standin": "1"}, {"pos": "1900,800,-50", "standin": "1"}] + origin,
+                      cam2, proj, gd)
+    q = [project(cam2, proj, np.array(f["pos"])) for f in fl3[:2]]
+    ndc3 = [trace_line(f, 0x1000 + f + 16 * i, SCENE, 1, 4, [p_[3] - 0.01, p_[4] - 0.01, 1.0],
+                       [p_[3] + 0.01, p_[4] + 0.01, 1.0], 1, 40) for f in (1, 2, 3) for i, p_ in enumerate(q)]
+    mode, table = choose_mode([(parse_trace(ndc3)[0], fl3, cam2, proj)])
+    expect(all(f["uv"] is None for f in fl3[2:]) and mode == "ndc",
+           f"16 off-screen origin rows do not choose world for screen-space quads ({mode}, {table})")
+    world3 = [trace_line(f, 0x1100 + f + 16 * i, SCENE, 1, 4, *box(np.array(fl3[i]["pos"])), 1, 40)
+              for f in (1, 2, 3) for i in (0, 1)]
+    mode, table = choose_mode([(parse_trace(world3)[0], fl3, cam2, proj)])
+    expect(mode == "world", f"world-space quads at the flares still choose world beside origin rows ({mode}, {table})")
 
     # Part 2 on synthetic pictures: a dim gradient, noise, and a 3 px blob at site (191,97) where asked.
     rng = np.random.default_rng(7)
