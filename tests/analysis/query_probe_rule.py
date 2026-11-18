@@ -56,6 +56,30 @@ QueryProbe line inside its window, is NOT MEASURED.
    frame at switch_balls_off differ from the mean of switch_base and switch_base_again by more than
    3 max(1, |base - base_again|).
 
+Second launch, the rebuilt X2 (written Nov 17 before the run; used when spot.json has a switch_skip window). Same
+spot, ini and reading of the keys; every step at the switch_base pose, in this order:
+    switch_base                FlareStandIns 1, SkipBracketDraws 0
+    switch_skip                FlareStandIns 1, SkipBracketDraws 1 (the rebuilt X2: draws onto the scene HDR target
+                               after the hand-off and before the composite that do not read it)
+    switch_base_again          FlareStandIns 1, SkipBracketDraws 0
+    switch_balls_off           FlareStandIns 0
+    switch_balls_on_again      FlareStandIns 1
+
+4. X2 rebuilt (verdict). As 1 with the step switch_skip and its skipped scene-hdr count: NOT MEASURED when the skip
+   step skipped 0 draws, else ORBS GONE / ORBS RISE / NO CHANGE against base and base_again with the band 3 d.
+
+5. Balls on / off / on (verdict per measure, report only for the cause): orbs (glow_blobs) and X1 answers above 0
+   per frame. Noise d = |base - base_again| (floor 1 orb, 1.0 answer per frame), band 3 d, on = mean of base and
+   base_again.
+     NOT MEASURED        a step's keys are not as asked (balls_off must read stand-ins 0 and have no standin=1 row,
+                         the other three stand-ins 1 with standin=1 rows; SkipBracketDraws 0 and no skipped draw in
+                         all four), or a value is missing.
+     FOLLOWS THE BALLS   balls_off differs from on by more than the band, and balls_on_again is back inside the band
+                         of on and differs from balls_off by more than the band.
+     DRIFT NOT EXCLUDED  balls_off differs from on, but balls_on_again does not come back.
+     NO CHANGE           balls_off is inside the band of on.
+   The gate's still_flicker pulse per step is printed beside it, report only (no verdict; Sam's blocks are counted).
+
 Usage: query_probe_rule.py <spot dir of the launch> [--reference <no-Remix con_bright_hall folder>]
        query_probe_rule.py --self-test
 """
@@ -72,7 +96,12 @@ NEARER_PX, RISE, MIN_BALLS = 40, 0.2, 3
 CAVEAT = ("caveat: rtx.numFramesToKeepInstances 2 keeps every game object one extra frame, not only the balls; "
           "it tests the cause and is not a fix")
 
-X2_STEPS = {"switch_skip_hdr": (1, "skipped_hdr"), "switch_skip_other": (2, "skipped_other")}
+X2_STEPS = {"switch_skip_hdr": (1, "skipped_hdr"), "switch_skip_other": (2, "skipped_other"),
+            "switch_skip": (1, "skipped_hdr")}
+X2B_ASKED = {  # second launch, window: (stand-ins, keep, SkipBracketDraws)
+    "switch_base": (1, 1, 0), "switch_skip": (1, 1, 1), "switch_base_again": (1, 1, 0),
+    "switch_balls_off": (0, 1, 0), "switch_balls_on_again": (1, 1, 0)}
+ONOFFON = ("switch_base", "switch_base_again", "switch_balls_off", "switch_balls_on_again")
 BASES = ("switch_base", "switch_base_again")
 LAMPS = {"off": "switch_lampsA_off", "keep1": "switch_lampsA_keep1", "keep2": "switch_lampsA_keep2",
          "keep1_again": "switch_lampsA_keep1_again"}
@@ -230,6 +259,34 @@ def keep_verdict(rows: dict, state: dict) -> tuple[str, str]:
     return "NOT PROVEN", detail
 
 
+def balls_state_problem(state: dict, totals: dict, standin_rows: dict) -> str | None:
+    """Why the on / off / on steps of the second launch are not as asked, or None."""
+    for w in ONOFFON:
+        if state.get(w) is None:
+            return f"{w}: keys not read back"
+        want = X2B_ASKED[w][0]
+        if state[w][0] != want or bool(standin_rows.get(w)) != bool(want):
+            return f"{w}: stand-ins {state[w][0]} with {standin_rows.get(w, 0)} standin=1 rows, asked {want}"
+        if state[w][2] != 0 or totals[w]["skipped_hdr"] or totals[w]["skipped_other"]:
+            return f"{w}: SkipBracketDraws {state[w][2]}, skipped draws in it"
+    return None
+
+
+def on_off_on(b, ba, off, on2, floor: float) -> tuple[str, str]:
+    """Balls on (base, base_again) / off / on again for one measure."""
+    if any(v is None for v in (b, ba, off, on2)):
+        return "NOT MEASURED", "a step has no value"
+    band = 3 * max(floor, abs(b - ba))
+    on = (b + ba) / 2
+    detail = (f"base {b:.2f}, base_again {ba:.2f}, balls_off {off:.2f}, balls_on_again {on2:.2f}; "
+              f"band 3 d = {band:.2f}")
+    if abs(off - on) <= band:
+        return "NO CHANGE", detail
+    if abs(on2 - on) <= band and abs(off - on2) > band:
+        return "FOLLOWS THE BALLS", detail
+    return "DRIFT NOT EXCLUDED", detail
+
+
 def x1_report(rates: dict) -> str:
     """rates: {window: per-frame counts or None}."""
     w = (*BASES, "switch_balls_off")
@@ -287,8 +344,82 @@ def glow(spot: pathlib.Path, ref: pathlib.Path, still: str):
     return {"orbs": int(o[1]), "lost": int(l[1]), "puffs": int(pf[1]) if pf else None}
 
 
+def pulses(spot: pathlib.Path, names) -> dict:
+    """The gate's still_flicker pulse per window (None when the gate would not score it), read with gate.py."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("balls_off_rule", HERE / "balls_off_rule.py")
+    rule = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rule)
+    gate = rule.load_gate()
+    s = gate.load_json(str(spot / "spot.json"))
+    s["_dir"] = str(spot)
+    telemetry, _ = gate.read_telemetry(gate.spot_path(s, s.get("telemetry")))
+    s["_data"] = {"telemetry": telemetry, "proxy": gate.read_csv_frames(gate.spot_path(s, s.get("proxyFrames")), 7),
+                  "pgate": gate.read_csv_frames(gate.spot_path(s, s.get("proxyGate")), 6)}
+    out = {}
+    for w in s["windows"]:
+        if w["name"] not in names or not w.get("frames"):
+            continue
+        ok, _ = gate.stop_all_ray_traced(s, w)
+        frames, _ = gate.window_frames(s, w)
+        n = 0 if frames is None else len(gate.dedupe(frames))
+        out[w["name"]] = gate.still_flicker(frames)[2] if ok and n >= gate.THRESHOLDS["still_frames"] else None
+    return out
+
+
+def score_x2b(spot: pathlib.Path, ref: pathlib.Path, windows: dict, out=print):
+    """The second launch: rebuilt X2, then balls on / off / on (rules 4 and 5)."""
+    log = (spot / "proxy.log").read_text(errors="replace").splitlines()
+    if not any(LOAD_RE.search(line) for line in log):
+        out("query_probe_rule: proxy.log has no 'Proxy keys' load line (the log is not complete); keys before the "
+            "first change line are taken as SkipBracketDraws 0, keep 1, stand-ins 1")
+    qp = parse_log(log)
+    state, rates, totals, standin_rows = {}, {}, {}, {}
+    for w in X2B_ASKED:
+        state[w] = rates[w] = totals[w] = None
+        standin_rows[w] = 0
+        if w not in windows:
+            out(f"query_probe_rule: {w}: window missing")
+            continue
+        st, r, t = window_state(qp, *windows[w]["proxy"])
+        if st is None:
+            out(f"query_probe_rule: {w}: {r}")
+            continue
+        state[w], rates[w], totals[w] = st, r, t
+        standin_rows[w] = sum(f.get("standin") == "1" for f in flares_of(spot / "switch" / f"{w[7:]}_lights.tsv"))
+    try:
+        pulse = pulses(spot, set(X2B_ASKED))
+    except (OSError, KeyError, ValueError) as exc:
+        out(f"query_probe_rule: pulse not read: {exc}")
+        pulse = {}
+    counts = {w: glow(spot, ref, w) if w in windows else None for w in X2B_ASKED}
+    orbs = {w: (c or {}).get("orbs") for w, c in counts.items()}
+    for w in X2B_ASKED:
+        r, c, p = rates[w], counts[w], pulse.get(w)
+        out(f"  {w:23s} state (stand-ins, keep, skip) {state[w]}; standin rows {standin_rows[w]}; "
+            + ("no QueryProbe line" if r is None else
+               f"per frame: issued {r['issued']:.2f} answered {r['answered']:.2f} (>0 {r['answered_nz']:.2f}) "
+               f"skipped hdr {r['skipped_hdr']:.1f}")
+            + "; " + ("glow_blobs did not compare it" if c is None else
+                      f"orbs {c['orbs']}, lost glows {c['lost']}, puffs {c['puffs']}")
+            + "; pulse " + ("-" if p is None else f"{p:.1f}"))
+    v, detail = x2_verdict("switch_skip", orbs, state, totals, standin_rows)
+    out(f"query_probe_rule: x2 switch_skip: {v} ({detail})")
+    problem = balls_state_problem(state, totals, standin_rows)
+    for name, values, floor in (("orbs", [orbs.get(w) for w in ONOFFON], 1.0),
+                                ("x1 answers above 0 per frame",
+                                 [None if rates[w] is None else rates[w]["answered_nz"] for w in ONOFFON], 1.0)):
+        v, detail = ("NOT MEASURED", problem) if problem else on_off_on(*values, floor)
+        out(f"query_probe_rule: balls on/off/on {name}: {v} ({detail})")
+    out("query_probe_rule: pulse base / skip / base_again / balls_off / balls_on_again: "
+        + " / ".join("-" if pulse.get(w) is None else f"{pulse[w]:.1f}" for w in X2B_ASKED) + " (report only)")
+
+
 def score(spot: pathlib.Path, ref: pathlib.Path, out=print):
     windows = {w["name"]: w for w in json.loads((spot / "spot.json").read_text())["windows"] if w.get("proxy")}
+    if "switch_skip" in windows:
+        out("query_probe_rule: second launch (rebuilt X2, balls on / off / on)")
+        return score_x2b(spot, ref, windows, out)
     qp = parse_log((spot / "proxy.log").open(errors="replace"))
     state, rates, totals, standin_rows = {}, {}, {}, {}
     for w in ASKED:
@@ -316,7 +447,7 @@ def score(spot: pathlib.Path, ref: pathlib.Path, out=print):
         c = counts[w]
         out(f"  {w:27s} " + ("glow_blobs did not compare it" if c is None else
                              f"orbs {c['orbs']}, lost glows {c['lost']}, puffs {c['puffs']} (lost and puffs report only)"))
-    for step in X2_STEPS:
+    for step in ("switch_skip_hdr", "switch_skip_other"):
         v, detail = x2_verdict(step, orbs, state, totals, standin_rows)
         out(f"query_probe_rule: x2 {step}: {v} ({detail})")
 
@@ -477,6 +608,44 @@ def self_test() -> int:
     check("x1: a step without QueryProbe lines: NOT MEASURED",
           "NOT MEASURED" in x1_report({"switch_base": rr(20.0), "switch_base_again": None,
                                        "switch_balls_off": rr(5.0)}), True)
+    # Second launch: rebuilt X2 reads its own step and the scene-hdr count.
+    S2 = {"switch_base": (1, 1, 0), "switch_skip": (1, 1, 1), "switch_base_again": (1, 1, 0)}
+    T2 = {"switch_base": zero, "switch_base_again": zero, "switch_skip": {**zero, "skipped_hdr": 400}}
+    gone2 = {"switch_base": 13, "switch_skip": 0, "switch_base_again": 10}
+    R2 = {w: 94 for w in S2}
+    check("x2b 13 / 0 / 10 with 400 skipped: ORBS GONE", x2_verdict("switch_skip", gone2, S2, T2, R2)[0], "ORBS GONE")
+    check("x2b nothing skipped (the first X2's result): NOT MEASURED",
+          x2_verdict("switch_skip", gone2, S2, {**T2, "switch_skip": zero}, R2)[0], "NOT MEASURED")
+    check("x2b a skipped-other count does not count for the rebuilt step: NOT MEASURED",
+          x2_verdict("switch_skip", gone2, S2, {**T2, "switch_skip": {**zero, "skipped_other": 400}}, R2)[0],
+          "NOT MEASURED")
+
+    # Balls on / off / on. The 200741 X1 numbers with a balls_on_again that comes back, and one that does not.
+    check("x1 59.83 / 57.50 / off 20.94 / again 58.00: FOLLOWS THE BALLS",
+          on_off_on(59.83, 57.50, 20.94, 58.00, 1.0)[0], "FOLLOWS THE BALLS")
+    check("x1 off 20.94, again 22.00 (no return): DRIFT NOT EXCLUDED",
+          on_off_on(59.83, 57.50, 20.94, 22.00, 1.0)[0], "DRIFT NOT EXCLUDED")
+    check("x1 off 52.0 (inside band 6.99 of 58.67): NO CHANGE", on_off_on(59.83, 57.50, 52.0, 58.0, 1.0)[0],
+          "NO CHANGE")
+    check("orbs 13 / 10 / off 0 / again 12 (band 9): FOLLOWS THE BALLS", on_off_on(13, 10, 0, 12, 1.0)[0],
+          "FOLLOWS THE BALLS")
+    check("orbs off 0, again 3 (back by 8.5 only, band 9, but 3 from off): DRIFT NOT EXCLUDED",
+          on_off_on(13, 10, 0, 3, 1.0)[0], "DRIFT NOT EXCLUDED")
+    check("orbs base_again missing: NOT MEASURED", on_off_on(13, None, 0, 12, 1.0)[0], "NOT MEASURED")
+    S3 = {w: X2B_ASKED[w] for w in ONOFFON}
+    T3 = {w: zero for w in ONOFFON}
+    R3 = {"switch_base": 94, "switch_base_again": 94, "switch_balls_off": 0, "switch_balls_on_again": 94}
+    check("balls steps as asked: no problem", balls_state_problem(S3, T3, R3), None)
+    check("balls_off read stand-ins 1: problem", balls_state_problem({**S3, "switch_balls_off": (1, 1, 0)}, T3, R3)
+          is not None, True)
+    check("balls_off dump still has standin=1 rows: problem",
+          balls_state_problem(S3, T3, {**R3, "switch_balls_off": 94}) is not None, True)
+    check("balls_on_again dump has no standin=1 row: problem",
+          balls_state_problem(S3, T3, {**R3, "switch_balls_on_again": 0}) is not None, True)
+    check("skip left on in balls_off (skipped draws): problem",
+          balls_state_problem(S3, {**T3, "switch_balls_off": {**zero, "skipped_hdr": 3}}, R3) is not None, True)
+    check("balls_on_again keys not read back: problem",
+          balls_state_problem({**S3, "switch_balls_on_again": None}, T3, R3) is not None, True)
     check("caveat names keep 2 as no fix", "not a fix" in CAVEAT, True)
     print("self-test:", "all passed" if not fails else f"FAILED {fails}")
     return 1 if fails else 0
