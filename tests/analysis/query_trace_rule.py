@@ -5,8 +5,10 @@ Launch: con_bright_hall, the switch_base pose (spawn), three steps in this order
   SkipBracketDraws 0 and rtx.numFramesToKeepInstances 1 throughout. [Proxy] QueryStatsFrames=10, QueryTraceEvery=15,
   PresentGrabFrames=8 for the whole launch (read at load). One GateDump per step plus the light dump; whole proxy.log.
 
-Keys (else every part reads NOT MEASURED): proxy.log has "Proxy keys: QueryTraceEvery K, QueryTraceActive 1,
-PresentGrabFrames N" with K >= 1 and N >= 4; switch_base and switch_base_again light dumps have standin=1 rows and the
+Keys (else every part reads NOT MEASURED): proxy.log has "Proxy keys: QueryTraceEvery K, QueryTraceActive A,
+PresentGrabFrames N" with K >= 1, A > 0 (the proxy logs the active interval there, 0 when QueryStatsFrames is off;
+corrected Nov 17 after the 232827 launch, where the first version of this line wanted A == 1 and read the run NOT
+MEASURED although the trace ran; no reading below changed) and N >= 4; switch_base and switch_base_again light dumps have standin=1 rows and the
 balls_off dump has none.
 
 Part 1. The orbs at hidden flares (kind 1; 5 of them in 210750). Per balls-on step:
@@ -367,6 +369,11 @@ def still_of(spot, step):
     return raw.reshape(-1, GH, GW).mean(axis=0) / 255.0
 
 
+def keys_ok(load) -> bool:
+    """load: LOAD_RE match of the proxy's load line (d3d9_proxy.cpp logs QueryTraceActive as the active interval)."""
+    return bool(load) and int(load[1]) >= 1 and int(load[2]) > 0 and int(load[3]) >= 4
+
+
 def score(spot: pathlib.Path, ref: pathlib.Path, out=print):
     log = (spot / "proxy.log").read_text(errors="replace").splitlines()
     windows = {w["name"]: w for w in json.loads((spot / "spot.json").read_text())["windows"] if w.get("proxy")}
@@ -376,7 +383,7 @@ def score(spot: pathlib.Path, ref: pathlib.Path, out=print):
     stand = {s: sum(f.get("standin") == "1" for f in dumps[s]) for s in STEPS}
     out("standin=1 rows: " + ", ".join(f"{s} {stand[s]}" for s in STEPS))
     problems = []
-    if not load or int(load[1]) < 1 or load[2] != "1" or int(load[3]) < 4:
+    if not keys_ok(load):
         problems.append("trace or grab keys not loaded as asked")
     if any(s not in windows for s in STEPS):
         problems.append("a step window is missing")
@@ -436,6 +443,13 @@ def self_test() -> int:
             fails.append(what)
 
     quiet = lambda *_: None
+    real = "2026-11-17 23:28:40.000 [pid 39288] Proxy keys: QueryTraceEvery 15, QueryTraceActive 15, PresentGrabFrames 8"
+    expect(keys_ok(LOAD_RE.search(real)), "the load line as the proxy writes it (Active = the interval 15) reads loaded")
+    expect(not keys_ok(LOAD_RE.search(real.replace("QueryTraceActive 15", "QueryTraceActive 0"))),
+           "QueryTraceActive 0 (QueryStatsFrames off) reads not loaded")
+    expect(not keys_ok(LOAD_RE.search(real.replace("PresentGrabFrames 8", "PresentGrabFrames 2"))),
+           "PresentGrabFrames 2 reads not loaded")
+    expect(not keys_ok(None), "no load line reads not loaded")
     # A camera at the origin looking down +x; a wall 279 units away; a flare 400 units away behind it.
     cam, proj = (0.0, 0.0, 0.0, 0.0, 0.0), (1.0, 1.778)
     gd = np.full((90, 160), 279.0, np.float32)
