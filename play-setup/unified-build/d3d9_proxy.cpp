@@ -25,6 +25,7 @@
 #include "proxy_log.h"
 #include "proxy_types.h"
 #include "query_probe.h"
+#include "query_trace.h"
 #include "stage_texture_dump.h"
 #include "texture_fill.h"
 
@@ -338,6 +339,15 @@ bool LoadRealD3D9(HINSTANCE proxyInstance) {
         proxy::ParseSkipBracketDraws(static_cast<int>(GetPrivateProfileIntW(L"Proxy", L"SkipBracketDraws", 0, iniPath)));
     WriteLog("Proxy keys: QueryStatsFrames %u, SkipBracketDraws %u", proxy::g_queryProbe.Frames(),
              proxy::g_skipBracketDraws);
+    // X3 (query_trace.h): the trace rides on X1's Issue hook and gameRead marks, so it is active only with X1 on.
+    const uint32_t queryTraceEvery =
+        proxy::ParseQueryTraceEvery(static_cast<int>(GetPrivateProfileIntW(L"Proxy", L"QueryTraceEvery", 0, iniPath)));
+    proxy::g_queryTrace.SetEvery(proxy::g_queryProbe.Enabled() ? queryTraceEvery : 0);
+    proxy::g_queryTrace.BeginFrame(0);
+    proxy::g_presentGrab.SetFrames(
+        proxy::ParsePresentGrabFrames(static_cast<int>(GetPrivateProfileIntW(L"Proxy", L"PresentGrabFrames", 0, iniPath))));
+    WriteLog("Proxy keys: QueryTraceEvery %u, QueryTraceActive %u, PresentGrabFrames %u", queryTraceEvery,
+             proxy::g_queryTrace.Every(), proxy::g_presentGrab.Frames());
     g_formatGuard = GetPrivateProfileIntW(L"Proxy", L"FormatGuard", 1, iniPath) != 0;
     proxy::SetTextureFillCounts(GetPrivateProfileIntW(L"Proxy", L"TextureFillCounts", debuggingTelemetry, iniPath) != 0);
     WriteLog("Proxy keys: EnableDebuggingTelemetry %d, TextureFillCounts %d", debuggingTelemetry,
@@ -656,6 +666,13 @@ HRESULT WINAPI HookPresent(IDirect3DDevice9* self, const RECT* sourceRect,
                      "skipped scene-hdr %u other %u", first, g_presentCount, q.issued, q.answered, q.answeredNonZero,
                      q.polled, q.polledNonZero, q.skippedSceneHdr, q.skippedOther);
     }
+    if (proxy::g_queryTrace.Enabled()) {
+        std::vector<std::string> lines;
+        AcquireSRWLockExclusive(&proxy::g_queryTraceLock);
+        proxy::g_queryTrace.EndFrame(&lines);
+        ReleaseSRWLockExclusive(&proxy::g_queryTraceLock);
+        for (const std::string& line : lines) WriteLog("%s", line.c_str());
+    }
     proxy::DecalTagEndFrame();
     proxy::ParticleTagEndFrame();
     proxy::TexHashLogEndFrame(g_presentCount);
@@ -673,6 +690,11 @@ HRESULT WINAPI HookPresent(IDirect3DDevice9* self, const RECT* sourceRect,
     }
 
     const LONG presentCount = InterlockedIncrement(&g_presentCount);
+    if (proxy::g_queryTrace.Enabled()) {
+        AcquireSRWLockExclusive(&proxy::g_queryTraceLock);
+        proxy::g_queryTrace.BeginFrame(static_cast<uint32_t>(presentCount));
+        ReleaseSRWLockExclusive(&proxy::g_queryTraceLock);
+    }
     proxy::MaybeDumpTexStats(exit.QuadPart, presentCount);
 
     hook->publishedThisFrame = false;
@@ -691,6 +713,96 @@ HRESULT WINAPI HookPresent(IDirect3DDevice9* self, const RECT* sourceRect,
     return result;
 }
 
+// --- Query trace (query_trace.h, X3). Each call returns at once unless the trace is on. ---
+uintptr_t QueryTraceDepthSurface(IDirect3DDevice9* self, proxy::QueryDrawState* st) {
+    IDirect3DSurface9* ds = nullptr;
+    if (FAILED(self->GetDepthStencilSurface(&ds)) || !ds) return 0;
+    D3DSURFACE_DESC desc = {};
+    if (st && SUCCEEDED(ds->GetDesc(&desc))) {
+        st->dsW = desc.Width;
+        st->dsH = desc.Height;
+        st->dsFmt = static_cast<uint32_t>(desc.Format);
+    }
+    const uintptr_t pointer = reinterpret_cast<uintptr_t>(ds);
+    ds->Release();
+    return pointer;
+}
+
+// True when vertex element 0 is a FLOAT3 position at stream 0 offset 0 (declaration or FVF).
+bool QueryTracePositionAtZero(IDirect3DDevice9* self) {
+    IDirect3DVertexDeclaration9* decl = nullptr;
+    if (SUCCEEDED(self->GetVertexDeclaration(&decl)) && decl) {
+        D3DVERTEXELEMENT9 elements[MAXD3DDECLLENGTH + 1] = {};
+        UINT count = ARRAYSIZE(elements);
+        const bool ok = SUCCEEDED(decl->GetDeclaration(elements, &count)) && count > 1 && elements[0].Stream == 0 &&
+                        elements[0].Offset == 0 && elements[0].Type == D3DDECLTYPE_FLOAT3 &&
+                        elements[0].Usage == D3DDECLUSAGE_POSITION;
+        decl->Release();
+        return ok;
+    }
+    DWORD fvf = 0;
+    return SUCCEEDED(self->GetFVF(&fvf)) && (fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZ;
+}
+
+UINT QueryTraceVertexCount(D3DPRIMITIVETYPE type, UINT primitiveCount) {
+    switch (type) {
+        case D3DPT_TRIANGLELIST: return primitiveCount * 3;
+        case D3DPT_TRIANGLESTRIP: case D3DPT_TRIANGLEFAN: return primitiveCount + 2;
+        case D3DPT_LINELIST: return primitiveCount * 2;
+        case D3DPT_LINESTRIP: return primitiveCount + 1;
+        default: return primitiveCount;
+    }
+}
+
+// sent: the proxy passes the draw on. vertexData/first/count: an UP draw's vertices, else nullptr.
+void QueryTraceDraw(IDirect3DDevice9* self, bool sent, const char* kind, const void* vertexData, UINT stride,
+                    UINT first, UINT count) {
+    if (!proxy::g_queryTrace.TracingFrame()) return;
+    AcquireSRWLockExclusive(&proxy::g_queryTraceLock);
+    proxy::QueryDrawState state;
+    const bool wantState = proxy::g_queryTrace.WantsDrawState();
+    if (wantState) {
+        state.ds = QueryTraceDepthSurface(self, &state);
+        state.zen = static_cast<int>(proxy::TraceRenderState(self, D3DRS_ZENABLE));
+        state.zfn = static_cast<int>(proxy::TraceRenderState(self, D3DRS_ZFUNC));
+        state.zwr = static_cast<int>(proxy::TraceRenderState(self, D3DRS_ZWRITEENABLE));
+        state.cw = static_cast<int>(proxy::TraceRenderState(self, D3DRS_COLORWRITEENABLE));
+        IDirect3DSurface9* rt = nullptr;
+        if (SUCCEEDED(self->GetRenderTarget(0, &rt)) && rt) {
+            state.rt0 = reinterpret_cast<uintptr_t>(rt);
+            rt->Release();
+        }
+        if (vertexData && QueryTracePositionAtZero(self)) proxy::AddPositions(&state, vertexData, stride, first, count);
+    }
+    if (sent && proxy::g_queryTrace.WantsSceneDs() && proxy::LastDrawWasScene())
+        proxy::g_queryTrace.OnSceneDraw(QueryTraceDepthSurface(self, nullptr));
+    if (!sent && proxy::g_queryTrace.WantsDropState()) {
+        const bool zwrite = proxy::TraceRenderState(self, D3DRS_ZENABLE) != 0 &&
+                            proxy::TraceRenderState(self, D3DRS_ZWRITEENABLE) != 0;
+        proxy::g_queryTrace.OnDroppedDraw(QueryTraceDepthSurface(self, nullptr), zwrite);
+    }
+    proxy::g_queryTrace.OnDraw(sent, kind, wantState ? &state : nullptr);
+    ReleaseSRWLockExclusive(&proxy::g_queryTraceLock);
+}
+
+void QueryTraceIssue(IDirect3DQuery9* query, DWORD flags, bool gameQuery) {
+    if (!proxy::g_queryTrace.Enabled()) return;
+    std::vector<std::string> lines;
+    AcquireSRWLockExclusive(&proxy::g_queryTraceLock);
+    if (flags & D3DISSUE_BEGIN) proxy::g_queryTrace.OnBegin(query, gameQuery, &lines);
+    if (flags & D3DISSUE_END) proxy::g_queryTrace.OnEnd(query);
+    ReleaseSRWLockExclusive(&proxy::g_queryTraceLock);
+    for (const std::string& line : lines) WriteLog("%s", line.c_str());
+}
+
+void QueryTracePixels(IDirect3DQuery9* query, DWORD pixels, bool handed) {
+    if (!proxy::g_queryTrace.Enabled()) return;
+    AcquireSRWLockExclusive(&proxy::g_queryTraceLock);
+    if (handed) proxy::g_queryTrace.OnHanded(query, pixels);
+    else proxy::g_queryTrace.OnFresh(query, pixels);
+    ReleaseSRWLockExclusive(&proxy::g_queryTraceLock);
+}
+
 HRESULT WINAPI HookDrawPrimitive(IDirect3DDevice9* self, D3DPRIMITIVETYPE type,
                                  UINT startVertex, UINT primitiveCount) {
     DeviceHook* hook = FindDeviceHook(self);
@@ -699,8 +811,10 @@ HRESULT WINAPI HookDrawPrimitive(IDirect3DDevice9* self, D3DPRIMITIVETYPE type,
     const proxy::DrawGeometryKey geometry = proxy::MakeDrawGeometry(false, 0, 0, startVertex, primitiveCount, type);
     if (!proxy::PrepareDraw(self, hook, g_cameraTracker, &geometry, "draw", 0, primitiveCount,
                             _ReturnAddress(), g_presentCount)) {
+        QueryTraceDraw(self, false, "draw", nullptr, 0, 0, 0);
         return D3D_OK;
     }
+    QueryTraceDraw(self, true, "draw", nullptr, 0, 0, 0);
     proxy::AlphaTestHint alphaTestHint(self);
     CallTimer timer(proxy::kDraw);
     return hook->drawPrimitive(self, type, startVertex, primitiveCount);
@@ -716,10 +830,12 @@ HRESULT WINAPI HookDrawIndexedPrimitive(IDirect3DDevice9* self, D3DPRIMITIVETYPE
         proxy::MakeDrawGeometry(true, baseVertex, minIndex, startIndex, primitiveCount, type);
     if (!proxy::PrepareDraw(self, hook, g_cameraTracker, &geometry, "indexed", vertexCount, primitiveCount,
                             _ReturnAddress(), g_presentCount)) {
+        QueryTraceDraw(self, false, "indexed", nullptr, 0, 0, 0);
         return D3D_OK;
     }
     proxy::AlphaTestHint alphaTestHint(self);
     proxy::CloseCameraFadeGuard fadeGuard(self);
+    QueryTraceDraw(self, !fadeGuard.dropDraw, "indexed", nullptr, 0, 0, 0);
     if (fadeGuard.dropDraw) return D3D_OK;
     CallTimer timer(proxy::kDraw);
     return hook->drawIndexedPrimitive(self, type, baseVertex, minIndex, vertexCount, startIndex, primitiveCount);
@@ -732,8 +848,10 @@ HRESULT WINAPI HookDrawPrimitiveUP(IDirect3DDevice9* self, D3DPRIMITIVETYPE type
     InterlockedIncrement(&hook->frame.draws);
     if (!proxy::PrepareDraw(self, hook, g_cameraTracker, nullptr, "up", 0, primitiveCount,
                             _ReturnAddress(), g_presentCount)) {
+        QueryTraceDraw(self, false, "up", vertexData, vertexStride, 0, QueryTraceVertexCount(type, primitiveCount));
         return D3D_OK;
     }
+    QueryTraceDraw(self, true, "up", vertexData, vertexStride, 0, QueryTraceVertexCount(type, primitiveCount));
     proxy::AlphaTestHint alphaTestHint(self);
     CallTimer timer(proxy::kDraw);
     const HRESULT result = hook->drawPrimitiveUP(self, type, primitiveCount, vertexData, vertexStride);
@@ -750,8 +868,10 @@ HRESULT WINAPI HookDrawIndexedPrimitiveUP(IDirect3DDevice9* self, D3DPRIMITIVETY
     InterlockedIncrement(&hook->frame.draws);
     if (!proxy::PrepareDraw(self, hook, g_cameraTracker, nullptr, "indexed-up", vertexCount, primitiveCount,
                             _ReturnAddress(), g_presentCount)) {
+        QueryTraceDraw(self, false, "indexed-up", vertexData, vertexStride, minIndex, vertexCount);
         return D3D_OK;
     }
+    QueryTraceDraw(self, true, "indexed-up", vertexData, vertexStride, minIndex, vertexCount);
     proxy::AlphaTestHint alphaTestHint(self);
     CallTimer timer(proxy::kDraw);
     const HRESULT result = hook->drawIndexedPrimitiveUP(self, type, minIndex, vertexCount, primitiveCount,
@@ -1062,7 +1182,10 @@ HRESULT QueryGetDataCached(IDirect3DQuery9* self, void* data, DWORD size, DWORD 
             pixels = current->lastPixels;
         }
         ReleaseSRWLockExclusive(&g_occlusionLock);
-        if (result == S_OK) proxy::QueryProbePoll(fresh);
+        if (result == S_OK) {
+            proxy::QueryProbePoll(fresh);
+            QueryTracePixels(self, fresh, false);
+        }
     }
     *static_cast<DWORD*>(data) = pixels;
     return S_OK;
@@ -1084,19 +1207,24 @@ HRESULT WINAPI HookQueryGetData(IDirect3DQuery9* self, void* data, DWORD size, D
     ReleaseSRWLockExclusive(&g_occlusionLock);
     if (!occlusion) return result;
     proxy::QueryProbeAnswer(pixels);
-    if (!g_queryMode) proxy::QueryProbePoll(pixels);   // without QueryMode every answer is a real read
+    QueryTracePixels(self, pixels, true);
+    if (!g_queryMode) {   // without QueryMode every answer is a real read
+        proxy::QueryProbePoll(pixels);
+        QueryTracePixels(self, pixels, false);
+    }
     return result;
 }
 
 // Hooked only when QueryStatsFrames > 0 at load (HookCreateQuery). Counts D3DISSUE_END on occlusion queries the
 // game has read; the proxy's bracket query is issued but never read, so it stays out of the count.
 HRESULT WINAPI HookQueryIssue(IDirect3DQuery9* self, DWORD flags) {
-    if (flags & D3DISSUE_END) {
+    if ((flags & D3DISSUE_END) || ((flags & D3DISSUE_BEGIN) && proxy::g_queryTrace.Enabled())) {
         bool gameQuery = false;
         AcquireSRWLockExclusive(&g_occlusionLock);
         if (OcclusionQuery* entry = FindOcclusionQuery(self, false)) gameQuery = entry->gameRead;
         ReleaseSRWLockExclusive(&g_occlusionLock);
-        if (gameQuery) proxy::QueryProbeIssueEnd();
+        if ((flags & D3DISSUE_END) && gameQuery) proxy::QueryProbeIssueEnd();
+        QueryTraceIssue(self, flags, gameQuery);   // X3 (query_trace.h); returns at once while off
     }
     return g_queryIssue(self, flags);
 }

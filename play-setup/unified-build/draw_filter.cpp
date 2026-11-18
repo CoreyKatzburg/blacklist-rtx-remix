@@ -6,6 +6,7 @@
 #include "proxy_diagnostics.h"
 #include "proxy_log.h"
 #include "query_probe.h"
+#include "query_trace.h"
 #include "shader_traits.h"
 
 #include <psapi.h>
@@ -135,6 +136,19 @@ float HalfToFloat32(uint16_t h) {
     float out = 0.0f;
     std::memcpy(&out, &bits, sizeof(out));
     return out;
+}
+
+// PresentGrabFrames (query_trace.h, X3): this frame's 1/8-size grab of `surface` as gate\<tag>_<what>_f<i>.pfm.
+void GrabFrame(IDirect3DDevice9* device, IDirect3DSurface9* surface, const char* what) {
+    if (!g_presentGrab.Active()) return;
+    const std::string stem = g_presentGrab.Name(what);
+    wchar_t gateDir[MAX_PATH] = {}, path[MAX_PATH] = {}, wstem[200] = {};
+    DumpFolder(L"gate", gateDir, ARRAYSIZE(gateDir));
+    MultiByteToWideChar(CP_UTF8, 0, stem.c_str(), -1, wstem, ARRAYSIZE(wstem));
+    swprintf_s(path, L"%s\\%s.pfm", gateDir, wstem);
+    const int fail = WriteGrabPfm(device, surface, path);
+    WriteLog("PresentGrab: %s %s", stem.c_str(), fail ? "failed" : "written");
+    if (fail) WriteLog("PresentGrab: %s failed at step %d", stem.c_str(), fail);
 }
 
 void MaybeDumpGameDepthAfterGBuffer(IDirect3DDevice9* device) {
@@ -443,6 +457,7 @@ void PassFilterBeforeDraw(IDirect3DDevice9* device,
             if (pixel.composite && g_rt0) {
                 FlushCoalescedSetters(device);
                 PresentModernSceneToComposite(device, hook, g_rt0);
+                GrabFrame(device, g_rt0, "composite");
                 g_modernAwaitingComposite = false;
                 g_skipCurrentDrawForModern = true;
                 return;
@@ -518,6 +533,7 @@ void SetGateDumpTag(const char* tag) {
     if (next != g_lastGateDumpTag) {
         g_lastGateDumpTag = next;
         g_pendingGateDumpTag = next;
+        g_presentGrab.Start(next);
     }
 }
 
@@ -769,6 +785,17 @@ void FilterEndFrameBeforePresent(IDirect3DDevice9* device,
     if (g_gbufferDepthRt0) { g_gbufferDepthRt0->Release(); g_gbufferDepthRt0 = nullptr; }
     g_modernAwaitingComposite = false;
     g_gateDepthDumpedThisFrame = false;
+    GrabFrame(device, CurrentBackbuffer(device), "present");
+    g_presentGrab.EndFrame();
+}
+
+bool LastDrawWasScene() { return g_drawIsScene; }
+
+DWORD TraceRenderState(IDirect3DDevice9* device, D3DRENDERSTATETYPE state) {
+    DWORD value = 0;
+    if (g_setterCoalescer.PendingRenderState(state, &value)) return value;
+    if (FAILED(device->GetRenderState(state, &value))) return 0xFFFFFFFFu;
+    return value;
 }
 
 void FilterResetAfterPresent(IDirect3DDevice9* device) {

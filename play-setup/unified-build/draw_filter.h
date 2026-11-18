@@ -70,6 +70,11 @@ void OnPixelShaderSet(IDirect3DDevice9* device, IDirect3DPixelShader9* shader);
 void FlushCoalescedSetters(IDirect3DDevice9* device);
 void FilterOnDeviceReset();
 
+// Query trace (query_trace.h, X3): whether the last PrepareDraw classed its draw as a scene draw, and a render state as
+// the next sent draw will see it (a value SetterCoalescer still buffers, else the device's).
+bool LastDrawWasScene();
+DWORD TraceRenderState(IDirect3DDevice9* device, D3DRENDERSTATETYPE state);
+
 // Builds a DrawGeometryKey using the currently bound stream-0 VB and (optionally) index buffer.
 DrawGeometryKey MakeDrawGeometry(bool indexed,
                                  INT baseVertex,

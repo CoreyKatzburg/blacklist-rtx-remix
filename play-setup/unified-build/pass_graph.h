@@ -185,6 +185,13 @@ public:
     void RecordSetPixelShaderConstantF(UINT startReg, const float* data, UINT vec4Count);
 
     bool HasDirtyState() const { return dirtyAny_; }
+    // A render state set while suppressed and not yet replayed (query trace, X3); false when none is buffered.
+    bool PendingRenderState(D3DRENDERSTATETYPE state, DWORD* value) const {
+        const uint32_t idx = static_cast<uint32_t>(state);
+        if (idx >= kMaxRenderStates || !(dirtyRsMask_[idx / 64] & (1ull << (idx % 64)))) return false;
+        *value = renderStates_[idx];
+        return true;
+    }
     uint64_t TakeSuppressedCount() {
         const uint64_t n = suppressedCount_;
         suppressedCount_ = 0;
