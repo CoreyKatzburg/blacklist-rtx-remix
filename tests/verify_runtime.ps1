@@ -217,6 +217,14 @@ function Remove-RunPlayLock([string]$path, [string]$runDir) {
     if (-not $starts.Count) { return $false }
     Remove-OwnPlayLock $path ($starts | Sort-Object | Select-Object -Last 1)
 }
+# The values proxy.log prints for [Proxy] key $name: "Name=value", or the load line "Proxy keys: Name N, Other M"
+# (200741: QueryStatsFrames was printed only that way and read "not proven"). A number followed by a word, as in
+# "DumpStageTexturesPs 0 ids", is a count and not the key's value, so it is not read.
+function Get-ProxyKeySeen([string]$log, [string]$name) {
+    if (-not (Test-Path -LiteralPath $log)) { return }
+    Select-String -LiteralPath $log -Pattern "\b$([Regex]::Escape($name))(?:=(\S+)| (\d+)(?=,|\s*$))" | ForEach-Object {
+        $g = $_.Matches[0].Groups; if ($g[1].Success) { $g[1].Value } else { $g[2].Value } } | Select-Object -Unique
+}
 # Puts back what a run changed: each step on its own, so one failure cannot skip the rest. Returns the failures.
 function Restore-AfterRun([string]$runDir) {
     $failed = @()
@@ -688,6 +696,9 @@ $runs = @(if ($sweep) {
         $copy = ConvertTo-SpotJson $selected[0] | ConvertFrom-Json
         $bench = ConvertTo-SpotJson $sweep.bench | ConvertFrom-Json   # a variant's own bench keys win
         foreach ($p in @(if ($v.bench) { $v.bench.PSObject.Properties })) { $bench | Add-Member $p.Name $p.Value -Force }
+        # The proxy prints some keys only on its load line, before the spot starts (200741), so a variant's proxy.log
+        # keeps the whole game's lines unless the file says otherwise.
+        if (-not $bench.PSObject.Properties['proxyLogWhole']) { $bench | Add-Member proxyLogWhole $true }
         $copy | Add-Member bench $bench -Force
         [pscustomobject]@{ dir = $v.name; spot = $copy; variant = $v }
     }
@@ -922,8 +933,7 @@ try {
                 $proxyLog = Join-Path $spotDir 'proxy.log'
                 $proxySeen = [ordered]@{}
                 foreach ($p in @(if ($run.variant.proxy) { $run.variant.proxy.PSObject.Properties })) {
-                    $proxySeen[$p.Name] = @(if (Test-Path $proxyLog) { Select-String -LiteralPath $proxyLog -Pattern "\b$([Regex]::Escape($p.Name))=(\S+)" |
-                        ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -Unique })
+                    $proxySeen[$p.Name] = @(Get-ProxyKeySeen $proxyLog $p.Name)
                 }
                 $proxyOk = if (-not $proxySeen.Count) { $true }
                            elseif (@($proxySeen.Keys | Where-Object { -not $proxySeen[$_].Count }).Count) { 'not proven' }

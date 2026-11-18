@@ -542,6 +542,31 @@ class MouseLag(unittest.TestCase):
             s.spot = {}
             self.assertNotIn("telemetryLaunch", s.finish())
 
+    def test_proxy_log_whole_keeps_the_load_line_of_this_game_only(self):
+        # Run 200741: proxy.log began at frame 4510, after the load-time "Proxy keys" line, so the key read "not proven".
+        import os, tempfile, types
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "d3d9_proxy.log")
+            with open(src, "w") as fh:
+                fh.write("[pid 5716] Proxy keys: QueryStatsFrames 0, SkipBracketDraws 0\n"   # an older game, pid a prefix
+                         "[pid 57168] Proxy keys: QueryStatsFrames 10, SkipBracketDraws 0\n")
+            s = drive.Spot.__new__(drive.Spot)
+            s.log = drive.Tail([src], False)   # the spot starts after the load line
+            with open(src, "a") as fh:
+                fh.write("[pid 57168] QueryProbe: frames 4510-4519 issued 870\n")
+            s.telemetry = s.proxy = s.pgate = s.lptrace = drive.Tail([os.path.join(tmp, "absent")], False)
+            s.out, s.process, s.a = tmp, mock.Mock(), types.SimpleNamespace(pid=57168)
+            def text():
+                with open(os.path.join(tmp, "proxy.log")) as fh:
+                    return fh.read()
+            s.spot = {"bench": {"proxyLogWhole": True}}
+            self.assertEqual(s.finish()["proxyLog"], "proxy.log")
+            self.assertEqual(text(), "[pid 57168] Proxy keys: QueryStatsFrames 10, SkipBracketDraws 0\n"
+                                     "[pid 57168] QueryProbe: frames 4510-4519 issued 870\n")
+            s.spot = {"bench": {}}   # fake: without the key, proxy.log is the spot's part and has no load line
+            s.finish()
+            self.assertNotIn("Proxy keys", text())
+
     def test_a_trace_held_without_read_sharing_is_skipped_and_reported(self):
         # Nov 16 06:32: the proxy held lightpub_trace.csv via _wfopen_s and drive.py died at its start.
         import ctypes, os, tempfile

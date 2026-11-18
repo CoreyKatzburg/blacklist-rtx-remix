@@ -5,7 +5,7 @@ param([string]$Gate = (Join-Path (Split-Path $PSScriptRoot) 'verify_runtime.ps1'
       [string]$Common = (Join-Path $PSScriptRoot '..\..\play-setup\RemixPlayCommon.ps1'))
 $ErrorActionPreference = 'Stop'
 $ast = [Management.Automation.Language.Parser]::ParseFile($Gate, [ref]$null, [ref]$null)
-foreach ($n in 'Remove-OwnPlayLock', 'Remove-RunPlayLock', 'Wait-RestartedGame', 'Get-DisplayProblem', 'Test-LaunchDead', 'Get-CSpaceProblem', 'Get-MemoryProblem',
+foreach ($n in 'Remove-OwnPlayLock', 'Remove-RunPlayLock', 'Get-ProxyKeySeen', 'Wait-RestartedGame', 'Get-DisplayProblem', 'Test-LaunchDead', 'Get-CSpaceProblem', 'Get-MemoryProblem',
            'Get-DisplayAwakeProblem', 'Get-DisplayDuring', 'Test-SleepsDisplays', 'Invoke-UbiLogin', 'Get-SuiteRecord', 'Get-MonitorStateProblem', 'Test-MonitorsOff',
            'Get-RunSpots', 'Get-RunIniKeys', 'Select-Previous', 'Get-InstalledRemixCommit') {
     $f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true) | Select-Object -First 1
@@ -51,6 +51,20 @@ $naive = [datetime]'2026-11-17 00:01:30'
 Check 'fake: no midnight rule removes the older lock' ((Remove-OwnPlayLock $lock $naive) -and -not (Test-Path $lock))
 Write-LockAt ([datetime]'2026-11-18 00:01:40')
 Check 'midnight run: lock its last Play script wrote is removed' ((Remove-RunPlayLock $lock $r2) -and -not (Test-Path $lock))
+
+# Proxy key read-back (run 200741: QueryStatsFrames is printed only on the load line and read "not proven").
+$plog = Join-Path $dir 'proxy.log'
+Set-Content $plog @('2026-11-17 20:08:01.000 [pid 57168] Proxy keys: QueryStatsFrames 10, SkipBracketDraws 0',
+    '2026-11-17 20:08:01.000 [pid 57168] Proxy keys: DumpStageTexturesPs 0 ids, DumpStageTexturesStages mask 0000',
+    '2026-11-17 20:08:01.000 [pid 57168] diagnostics: EnableDebuggingTelemetry=0 CallTiming=0')
+Check 'proxy keys: the load line gives QueryStatsFrames 10' ("$(Get-ProxyKeySeen $plog 'QueryStatsFrames')" -eq '10')
+Check 'proxy keys: the last key on the load line is read' ("$(Get-ProxyKeySeen $plog 'SkipBracketDraws')" -eq '0')
+Check 'proxy keys: Name=value is still read' ("$(Get-ProxyKeySeen $plog 'CallTiming')" -eq '0')
+Check 'proxy keys: a count followed by a word is not read as the value' (-not @(Get-ProxyKeySeen $plog 'DumpStageTexturesPs').Count)
+Check 'proxy keys: no log, nothing read' (-not @(Get-ProxyKeySeen (Join-Path $dir 'absent.log') 'QueryStatsFrames').Count)
+# Fake: the old pattern (Name=value only) reads nothing from the load line, so the key stays "not proven".
+$oldRead = @(Select-String -LiteralPath $plog -Pattern '\bQueryStatsFrames=(\S+)')
+Check 'proxy keys: old pattern, case fails: the load line is not read' (-not $oldRead.Count)
 
 # Restart: a fake "game" (ping.exe) exits and a new one starts 3 s later.
 $old = Start-Process ping -ArgumentList '-n', '2', '127.0.0.1' -PassThru -WindowStyle Hidden

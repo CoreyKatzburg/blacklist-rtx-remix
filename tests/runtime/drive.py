@@ -51,6 +51,14 @@ def readable(path: str) -> bool:
         return False
 
 
+def pid_lines(src: str, pid: int, dest: str) -> str:
+    """d3d9_proxy.log is shared by every launch: copies the lines of game process `pid` only. Returns dest's name."""
+    tag = f"[pid {pid}]"
+    with open(src, encoding="latin-1") as f, open(dest, "w", encoding="latin-1") as out:
+        out.writelines(ln for ln in f if tag in ln)
+    return os.path.basename(dest)
+
+
 class Tail:
     """One growing file (telemetry JSONL, proxy CSV, proxy log): remembers where this spot started."""
 
@@ -2572,7 +2580,11 @@ class Spot:
         files = {"telemetry": self.telemetry.copy_to(os.path.join(self.out, "telemetry.jsonl")),
                  "proxyFrames": self.proxy.copy_to(os.path.join(self.out, "proxy_frames.csv")),
                  "proxyGate": self.pgate.copy_to(os.path.join(self.out, "proxy_gate.csv")),
-                 "proxyLog": self.log.copy_to(os.path.join(self.out, "proxy.log")),
+                 # bench "proxyLogWhole" (worker B, Nov 17): the load-time "Proxy keys" line comes before the spot
+                 # starts (200741's proxy.log began at frame 4510 without it), so proxy.log holds the whole game's lines.
+                 "proxyLog": (pid_lines(self.log.path, self.a.pid, os.path.join(self.out, "proxy.log"))
+                              if self.log.path and (self.spot.get("bench") or {}).get("proxyLogWhole")
+                              else self.log.copy_to(os.path.join(self.out, "proxy.log"))),
                  "lightpubTrace": self.lptrace.copy_to(os.path.join(self.out, "lightpub_trace.csv"))}
         held = self.lptrace.candidates[0]
         if not self.lptrace.path and os.path.exists(held):
@@ -2582,12 +2594,8 @@ class Spot:
             # and CreateDevice lines, which come long before this spot starts.
             files["telemetryLaunch"] = self.telemetry.copy_to(os.path.join(self.out, "telemetry_launch.jsonl"), whole=True)
             files["proxyFramesLaunch"] = self.proxy.copy_to(os.path.join(self.out, "proxy_frames_launch.csv"), whole=True)
-            if self.log.path:   # d3d9_proxy.log is shared by every launch: keep this game's lines only
-                tag = f"[pid {self.a.pid}]"
-                with open(self.log.path, encoding="latin-1") as f, \
-                        open(os.path.join(self.out, "proxy_launch.log"), "w", encoding="latin-1") as out:
-                    out.writelines(ln for ln in f if tag in ln)
-                files["proxyLogLaunch"] = "proxy_launch.log"
+            if self.log.path:
+                files["proxyLogLaunch"] = pid_lines(self.log.path, self.a.pid, os.path.join(self.out, "proxy_launch.log"))
         if self.spot.get("cinematic"):
             # The cutscene plays before drive.py starts, so the spot's part above misses it (run 20261115-214203:
             # telemetry from frame 5033, the cutscene ended at 4987). These copies cover the whole launch, so
