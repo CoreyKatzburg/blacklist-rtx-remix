@@ -51,11 +51,34 @@ def readable(path: str) -> bool:
         return False
 
 
-def pid_lines(src: str, pid: int, dest: str) -> str:
-    """d3d9_proxy.log is shared by every launch: copies the lines of game process `pid` only. Returns dest's name."""
+def process_start(pid: int) -> str | None:
+    """Local start time of process `pid` in the proxy log's timestamp form ('YYYY-MM-DD HH:MM:SS.fff', which sorts
+    as text); None when Windows does not give it."""
+    from ctypes import wintypes
+    from datetime import datetime, timedelta, timezone
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return None
+    try:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not k32.GetProcessTimes(wintypes.HANDLE(h), *(ctypes.byref(t) for t in times)):
+            return None
+    finally:
+        k32.CloseHandle(wintypes.HANDLE(h))
+    ticks = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+    utc = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=ticks // 10)
+    return utc.astimezone().strftime("%Y-%m-%d %H:%M:%S.%f")[:23]
+
+
+def pid_lines(src: str, pid: int, dest: str, since: str | None = None) -> str:
+    """d3d9_proxy.log is shared by every launch: copies the lines of game process `pid` only, and with `since` (its
+    process_start) only those logged from then on. Windows reuses pids: 213930's game was pid 50916 like the 18:31
+    game, whose lines are still in the log. Returns dest's name."""
     tag = f"[pid {pid}]"
     with open(src, encoding="latin-1") as f, open(dest, "w", encoding="latin-1") as out:
-        out.writelines(ln for ln in f if tag in ln)
+        out.writelines(ln for ln in f if tag in ln and (since is None or ln[:23] >= since))
     return os.path.basename(dest)
 
 
@@ -644,6 +667,7 @@ class Spot:
         self.dump_dirs = [os.path.join(d, "gate") for d in (s, os.path.join(s, ".trex"), r)]
         self.windows: list[dict] = []
         self.game, self.process = blmem.attach(a.pid, a.exe_hash)
+        self.game_start = process_start(a.pid)   # read now: a "quit" spot copies the launch's log after the exit
         self.relinks: list[dict] = []
         self._link_lock = threading.Lock()
         # spot "bits" (worker G's game_bits, Nov 17): set after the spawn and again after every relink (a checkpoint
@@ -2582,7 +2606,7 @@ class Spot:
                  "proxyGate": self.pgate.copy_to(os.path.join(self.out, "proxy_gate.csv")),
                  # bench "proxyLogWhole" (worker B, Nov 17): the load-time "Proxy keys" line comes before the spot
                  # starts (200741's proxy.log began at frame 4510 without it), so proxy.log holds the whole game's lines.
-                 "proxyLog": (pid_lines(self.log.path, self.a.pid, os.path.join(self.out, "proxy.log"))
+                 "proxyLog": (pid_lines(self.log.path, self.a.pid, os.path.join(self.out, "proxy.log"), self.game_start)
                               if self.log.path and (self.spot.get("bench") or {}).get("proxyLogWhole")
                               else self.log.copy_to(os.path.join(self.out, "proxy.log"))),
                  "lightpubTrace": self.lptrace.copy_to(os.path.join(self.out, "lightpub_trace.csv"))}
@@ -2595,7 +2619,8 @@ class Spot:
             files["telemetryLaunch"] = self.telemetry.copy_to(os.path.join(self.out, "telemetry_launch.jsonl"), whole=True)
             files["proxyFramesLaunch"] = self.proxy.copy_to(os.path.join(self.out, "proxy_frames_launch.csv"), whole=True)
             if self.log.path:
-                files["proxyLogLaunch"] = pid_lines(self.log.path, self.a.pid, os.path.join(self.out, "proxy_launch.log"))
+                files["proxyLogLaunch"] = pid_lines(self.log.path, self.a.pid, os.path.join(self.out, "proxy_launch.log"),
+                                                    self.game_start)
         if self.spot.get("cinematic"):
             # The cutscene plays before drive.py starts, so the spot's part above misses it (run 20261115-214203:
             # telemetry from frame 5033, the cutscene ended at 4987). These copies cover the whole launch, so

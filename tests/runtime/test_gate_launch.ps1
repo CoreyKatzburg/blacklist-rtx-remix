@@ -7,7 +7,7 @@ $ErrorActionPreference = 'Stop'
 $ast = [Management.Automation.Language.Parser]::ParseFile($Gate, [ref]$null, [ref]$null)
 foreach ($n in 'Remove-OwnPlayLock', 'Remove-RunPlayLock', 'Get-ProxyKeySeen', 'Wait-RestartedGame', 'Get-DisplayProblem', 'Test-LaunchDead', 'Get-CSpaceProblem', 'Get-MemoryProblem',
            'Get-DisplayAwakeProblem', 'Get-DisplayDuring', 'Test-SleepsDisplays', 'Invoke-UbiLogin', 'Get-SuiteRecord', 'Get-MonitorStateProblem', 'Test-MonitorsOff',
-           'Get-RunSpots', 'Get-RunIniKeys', 'Select-Previous', 'Get-InstalledRemixCommit') {
+           'Get-RunSpots', 'Get-RunIniKeys', 'Select-Previous', 'Get-InstalledRemixCommit', 'Test-GameLogLine') {
     $f = $ast.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true) | Select-Object -First 1
     if (-not $f) { throw "missing $n" }
     . ([scriptblock]::Create($f.Extent.Text))
@@ -65,6 +65,19 @@ Check 'proxy keys: no log, nothing read' (-not @(Get-ProxyKeySeen (Join-Path $di
 # Fake: the old pattern (Name=value only) reads nothing from the load line, so the key stays "not proven".
 $oldRead = @(Select-String -LiteralPath $plog -Pattern '\bQueryStatsFrames=(\S+)')
 Check 'proxy keys: old pattern, case fails: the load line is not read' (-not $oldRead.Count)
+
+# Pid reuse (run 213930): the game was pid 50916 like the 18:31 game, whose "AutoRaytracing -> on" line is still in
+# the shared log; the level read live 12 s after the start and drive.py waited at the menu.
+$slog = Join-Path $dir 'shared_proxy.log'
+$start = [datetime]'2026-11-17 21:40:02.950'
+Set-Content $slog @('2026-11-17 18:34:30.419 [pid 50916] lightpub: AutoRaytracing -> on, scene live (0 0)',
+    '2026-11-17 21:40:03.871 [pid 50916] Proxy keys: QueryStatsFrames 10, SkipBracketDraws 0',
+    '2026-11-17 21:40:05.000 [pid 509] lightpub: AutoRaytracing -> on, scene live (0 0)')
+Check 'game log: an older game with the same pid does not make the level live' (-not (Test-GameLogLine $slog 50916 $start 'lightpub: AutoRaytracing -> on'))
+Check 'game log: fake, the pid alone (any start) reads the old line as live' (Test-GameLogLine $slog 50916 ([datetime]::MinValue) 'lightpub: AutoRaytracing -> on')
+Add-Content $slog '2026-11-17 21:41:10.120 [pid 50916] lightpub: AutoRaytracing -> on, scene live (0 0)'
+Check 'game log: this game''s own line makes the level live' (Test-GameLogLine $slog 50916 $start 'lightpub: AutoRaytracing -> on')
+Check 'game log: no log, not live' (-not (Test-GameLogLine (Join-Path $dir 'absent.log') 50916 $start 'lightpub: AutoRaytracing -> on'))
 
 # Restart: a fake "game" (ping.exe) exits and a new one starts 3 s later.
 $old = Start-Process ping -ArgumentList '-n', '2', '127.0.0.1' -PassThru -WindowStyle Hidden

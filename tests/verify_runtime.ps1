@@ -459,12 +459,23 @@ function Wait-RestartedGame([int]$oldId, [datetime]$oldStart, [double]$seconds, 
     }
 }
 
+# d3d9_proxy.log is shared by every launch and Windows reuses pids: run 213930's game was pid 50916 like the 18:31
+# game, whose "AutoRaytracing -> on" line made the level read live 12 s after the start, so the menu keys stopped and
+# drive.py timed out at the menu. A line of game $id carries its pid and a time at or after the process start $since.
+function Test-GameLogLine($path, $id, [datetime]$since, [string]$pattern) {
+    $from = $since.ToString('yyyy-MM-dd HH:mm:ss.fff')
+    foreach ($m in @(Select-String -LiteralPath $path -Pattern "\[pid $id\] $pattern" -ErrorAction SilentlyContinue)) {
+        if ([string]::CompareOrdinal($m.Line, $from) -ge 0) { return $true }
+    }
+    $false
+}
+
 # A level is rendering in game process $id: with Remix, the proxy logged that ray tracing switched on in it; without
 # Remix (no such line), the proxy's frame log has a real camera, which the menus never publish (Benghazi, Nov 15:
 # 2527 menu frames without one). The frame log is new for each launch (the Play script moves the old one away).
-function Test-LevelLive($id) {
+function Test-LevelLive($id, [datetime]$since) {
     if (-not $NoRemix) {
-        return [bool](Select-String -LiteralPath "$S\d3d9_proxy.log" -Pattern "\[pid $id\] lightpub: AutoRaytracing -> on" -Quiet -ErrorAction SilentlyContinue)
+        return Test-GameLogLine "$S\d3d9_proxy.log" $id $since 'lightpub: AutoRaytracing -> on'
     }
     foreach ($line in @(Get-Content -LiteralPath "$S\d3d9_proxy_frames.csv" -Tail 40 -ErrorAction SilentlyContinue)) {
         $fields = $line -split ','
@@ -537,7 +548,7 @@ function Start-GameAtCheckpoint {
     }
     $gameStart = $game.StartTime
     Start-Sleep 12; $k = 0
-    while (-not (Test-LevelLive $game.Id)) {
+    while (-not (Test-LevelLive $game.Id $game.StartTime)) {
         if ($t.Elapsed.TotalSeconds -gt 480) { throw 'The game did not reach the level within 8 minutes.' }
         if ($game.HasExited) {
             $restarted = Wait-RestartedGame $game.Id $gameStart 120
@@ -552,14 +563,16 @@ function Start-GameAtCheckpoint {
             $keep = Join-Path $runDir "load-failure-$($game.Id)"
             New-Item -ItemType Directory -Force $keep | Out-Null
             Copy-Item "$S\rtx-remix\logs\*.log" $keep -ErrorAction SilentlyContinue
-            Get-Content $log -Tail 20000 -ErrorAction SilentlyContinue | Where-Object { $_ -match "\[pid $($game.Id)\]" } |
+            $from = $game.StartTime.ToString('yyyy-MM-dd HH:mm:ss.fff')
+            Get-Content $log -Tail 20000 -ErrorAction SilentlyContinue |
+                Where-Object { $_ -match "\[pid $($game.Id)\]" -and [string]::CompareOrdinal($_, $from) -ge 0 } |
                 Set-Content (Join-Path $keep 'd3d9_proxy.log')
             throw "The game exited while loading (logs in $keep)."
         }
         # Only a bridge started after this game counts: on Nov 16 a bridge from elsewhere stopped con_bright_hall
         # although the proxy log showed the game chained the Windows d3d9.
         $bridge = Get-Process NvRemixBridge -ErrorAction SilentlyContinue | Where-Object { $_.StartTime -ge $game.StartTime } | Select-Object -First 1
-        if ($NoRemix -and ((Select-String -LiteralPath $log -Pattern "\[pid $($game.Id)\] chained RTX Remix DLL" -Quiet -ErrorAction SilentlyContinue) -or $bridge)) {
+        if ($NoRemix -and ((Test-GameLogLine $log $game.Id $game.StartTime 'chained RTX Remix DLL') -or $bridge)) {
             throw "No-Remix run, but the game loaded Remix (proxy log, or NvRemixBridge $(if ($bridge) { "pid $($bridge.Id) $($bridge.Path) started $($bridge.StartTime)" }))."
         }
         $game.Refresh()

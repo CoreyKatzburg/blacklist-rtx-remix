@@ -547,25 +547,38 @@ class MouseLag(unittest.TestCase):
         import os, tempfile, types
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "d3d9_proxy.log")
+            # Run 213930: Windows gave the game pid 50916, which the 18:31 game had too, and both are in the log.
+            old = "2026-11-17 18:31:17.032 [pid 57168] Proxy keys: QueryStatsFrames 0, SkipBracketDraws 0\n"
+            load = "2026-11-17 21:40:03.871 [pid 57168] Proxy keys: QueryStatsFrames 10, SkipBracketDraws 0\n"
+            probe = "2026-11-17 21:41:55.521 [pid 57168] QueryProbe: frames 4510-4519 issued 870\n"
             with open(src, "w") as fh:
-                fh.write("[pid 5716] Proxy keys: QueryStatsFrames 0, SkipBracketDraws 0\n"   # an older game, pid a prefix
-                         "[pid 57168] Proxy keys: QueryStatsFrames 10, SkipBracketDraws 0\n")
+                fh.write(old + "2026-11-17 21:40:03.870 [pid 5716] Proxy keys: QueryStatsFrames 0\n" + load)   # pid 5716: a prefix
             s = drive.Spot.__new__(drive.Spot)
             s.log = drive.Tail([src], False)   # the spot starts after the load line
             with open(src, "a") as fh:
-                fh.write("[pid 57168] QueryProbe: frames 4510-4519 issued 870\n")
+                fh.write(probe)
             s.telemetry = s.proxy = s.pgate = s.lptrace = drive.Tail([os.path.join(tmp, "absent")], False)
             s.out, s.process, s.a = tmp, mock.Mock(), types.SimpleNamespace(pid=57168)
+            s.game_start = "2026-11-17 21:40:02.950"
             def text():
                 with open(os.path.join(tmp, "proxy.log")) as fh:
                     return fh.read()
             s.spot = {"bench": {"proxyLogWhole": True}}
             self.assertEqual(s.finish()["proxyLog"], "proxy.log")
-            self.assertEqual(text(), "[pid 57168] Proxy keys: QueryStatsFrames 10, SkipBracketDraws 0\n"
-                                     "[pid 57168] QueryProbe: frames 4510-4519 issued 870\n")
+            self.assertEqual(text(), load + probe)
+            s.game_start = None   # fake: the pid alone also copies the 18:31 game's lines
+            s.finish()
+            self.assertEqual(text(), old + load + probe)
             s.spot = {"bench": {}}   # fake: without the key, proxy.log is the spot's part and has no load line
             s.finish()
             self.assertNotIn("Proxy keys", text())
+
+    def test_process_start_is_this_process_start_in_local_log_time(self):
+        # The proxy stamps its log in local time; a start read as UTC would sit hours away from now.
+        import datetime, os
+        start = datetime.datetime.strptime(drive.process_start(os.getpid()), "%Y-%m-%d %H:%M:%S.%f")
+        self.assertTrue(0 <= (datetime.datetime.now() - start).total_seconds() < 3600)
+        self.assertIsNone(drive.process_start(0x7FFFFFF0))   # no such process
 
     def test_a_trace_held_without_read_sharing_is_skipped_and_reported(self):
         # Nov 16 06:32: the proxy held lightpub_trace.csv via _wfopen_s and drive.py died at its start.
