@@ -80,6 +80,28 @@ spot, ini and reading of the keys; every step at the switch_base pose, in this o
      NO CHANGE           balls_off is inside the band of on.
    The gate's still_flicker pulse per step is printed beside it, report only (no verdict; Sam's blocks are counted).
 
+Third launch, repeated bases (written Nov 17 before the run, after 20261117-210750 where both orb falls equalled the
+band; used when spot.json has a switch_base5 window). Same spot, ini and reading of the keys; every step at the
+switch_base pose, in this order:
+    switch_base1, switch_skip1, switch_base2, switch_skip2, switch_base3,
+    switch_off1, switch_base4, switch_off2, switch_base5
+  base*: FlareStandIns 1, SkipBracketDraws 0; skip*: FlareStandIns 1, SkipBracketDraws 1; off*: FlareStandIns 0,
+  SkipBracketDraws 0; rtx.numFramesToKeepInstances 1 throughout.
+
+6. Repeated treatment (verdict per treatment, skip and off, and per measure, orbs and X1 answers above 0 per frame).
+   The noise comes from all five base steps: sd = their sample standard deviation (floor 1 orb, 1.0 answer per
+   frame), band = 3 sd, change = mean of the two treatment steps minus the mean of the five bases.
+     NOT MEASURED  a step's keys are not as asked (stand-ins, standin=1 dump rows, SkipBracketDraws; a skip step that
+                   skipped 0 scene-hdr draws, any other step that skipped any), or a value is missing.
+     NO CHANGE     |change| <= band.
+     FALLS         change < -band and both treatment steps are below every base step (by rank alone, the chance of
+                   this with no effect is 1 in 21).
+     RISES         change > band and both treatment steps are above every base step.
+     NOT SETTLED   otherwise (the mean moves past the band but one treatment step sits inside the bases' range).
+   Report only: the base drift (base5 minus base1), and orb positions: the orbs found in at least 4 of the 5 base
+   steps (within 4 grid px), and for each treatment step how many of them are gone and how many orbs are new.
+   The 3 and the floors are the ones rules 1 and 5 use; nothing here is set from 210750's numbers.
+
 Usage: query_probe_rule.py <spot dir of the launch> [--reference <no-Remix con_bright_hall folder>]
        query_probe_rule.py --self-test
 """
@@ -102,6 +124,14 @@ X2B_ASKED = {  # second launch, window: (stand-ins, keep, SkipBracketDraws)
     "switch_base": (1, 1, 0), "switch_skip": (1, 1, 1), "switch_base_again": (1, 1, 0),
     "switch_balls_off": (0, 1, 0), "switch_balls_on_again": (1, 1, 0)}
 ONOFFON = ("switch_base", "switch_base_again", "switch_balls_off", "switch_balls_on_again")
+REP_BASES = tuple(f"switch_base{i}" for i in range(1, 6))
+REP_TREATS = {"skip": ("switch_skip1", "switch_skip2"), "off": ("switch_off1", "switch_off2")}
+REP_ASKED = {**{w: (1, 1, 0) for w in REP_BASES}, "switch_skip1": (1, 1, 1), "switch_skip2": (1, 1, 1),
+             "switch_off1": (0, 1, 0), "switch_off2": (0, 1, 0)}
+REP_ORDER = ("switch_base1", "switch_skip1", "switch_base2", "switch_skip2", "switch_base3", "switch_off1",
+             "switch_base4", "switch_off2", "switch_base5")
+ORB_AT_RE = re.compile(r"unmatched at x (\d+) y (\d+):")
+SAME_ORB_PX = 4
 BASES = ("switch_base", "switch_base_again")
 LAMPS = {"off": "switch_lampsA_off", "keep1": "switch_lampsA_keep1", "keep2": "switch_lampsA_keep2",
          "keep1_again": "switch_lampsA_keep1_again"}
@@ -287,6 +317,62 @@ def on_off_on(b, ba, off, on2, floor: float) -> tuple[str, str]:
     return "DRIFT NOT EXCLUDED", detail
 
 
+def rep_state_problem(state: dict, totals: dict, standin_rows: dict) -> str | None:
+    """Why the third launch's steps are not as asked, or None."""
+    for w in REP_ORDER:
+        if state.get(w) is None:
+            return f"{w}: keys not read back"
+        want = REP_ASKED[w]
+        if state[w][0] != want[0] or bool(standin_rows.get(w)) != bool(want[0]):
+            return f"{w}: stand-ins {state[w][0]} with {standin_rows.get(w, 0)} standin=1 rows, asked {want[0]}"
+        if state[w][2] != want[2]:
+            return f"{w}: SkipBracketDraws {state[w][2]}, asked {want[2]}"
+        if bool(totals[w]["skipped_hdr"]) != bool(want[2]) or totals[w]["skipped_other"]:
+            return f"{w}: skipped scene-hdr {totals[w]['skipped_hdr']} other {totals[w]['skipped_other']}"
+    return None
+
+
+def repeat_verdict(bases, treats, floor: float) -> tuple[str, str]:
+    """Rule 6 for one treatment and one measure: five base values, two treatment values."""
+    if len(bases) != 5 or len(treats) != 2 or any(v is None for v in (*bases, *treats)):
+        return "NOT MEASURED", "a step has no value"
+    mb = sum(bases) / 5
+    sd = max(floor, float(np.std(np.array(bases, float), ddof=1)))
+    band = 3 * sd
+    change = sum(treats) / 2 - mb
+    below = all(t < min(bases) for t in treats)
+    above = all(t > max(bases) for t in treats)
+    detail = (f"bases {' / '.join(f'{v:g}' for v in bases)} (mean {mb:.2f}, sd {sd:.2f}), treatment "
+              f"{' / '.join(f'{v:g}' for v in treats)}; change {change:+.2f}, band 3 sd = {band:.2f}; "
+              f"base drift {bases[-1] - bases[0]:+g} (report only)")
+    if abs(change) <= band:
+        return "NO CHANGE", detail
+    if change < 0 and below:
+        return "FALLS", detail
+    if change > 0 and above:
+        return "RISES", detail
+    return "NOT SETTLED", detail
+
+
+def stable_orbs(base_orbs: list[list[tuple]], need: int = 4, px: int = SAME_ORB_PX) -> list[tuple]:
+    """Orbs found in at least `need` of the base steps, each within px of the same spot (report only)."""
+    seen = []
+    for orbs in base_orbs:
+        for o in orbs:
+            if not any(math.hypot(o[0] - s[0], o[1] - s[1]) <= px for s in seen):
+                seen.append(o)
+    near = lambda o, orbs: any(math.hypot(o[0] - p[0], o[1] - p[1]) <= px for p in orbs)
+    return [s for s in seen if sum(near(s, orbs) for orbs in base_orbs) >= need]
+
+
+def orb_moves(stable: list[tuple], all_base: list[list[tuple]], orbs: list[tuple], px: int = SAME_ORB_PX):
+    """(stable orbs gone in a step, orbs in the step seen in no base step)."""
+    near = lambda o, pts: any(math.hypot(o[0] - p[0], o[1] - p[1]) <= px for p in pts)
+    gone = [s for s in stable if not near(s, orbs)]
+    new = [o for o in orbs if not any(near(o, b) for b in all_base)]
+    return gone, new
+
+
 def x1_report(rates: dict) -> str:
     """rates: {window: per-frame counts or None}."""
     w = (*BASES, "switch_balls_off")
@@ -341,7 +427,8 @@ def glow(spot: pathlib.Path, ref: pathlib.Path, still: str):
     o, l, pf = ORBS_RE.search(p.stdout), LOST_RE.search(p.stdout), PUFFS_RE.search(p.stdout)
     if p.returncode not in (0, 1) or not o or not l:
         return None
-    return {"orbs": int(o[1]), "lost": int(l[1]), "puffs": int(pf[1]) if pf else None}
+    return {"orbs": int(o[1]), "lost": int(l[1]), "puffs": int(pf[1]) if pf else None,
+            "at": [(int(m[1]), int(m[2])) for m in ORB_AT_RE.finditer(p.stdout)]}
 
 
 def pulses(spot: pathlib.Path, names) -> dict:
@@ -415,8 +502,63 @@ def score_x2b(spot: pathlib.Path, ref: pathlib.Path, windows: dict, out=print):
         + " / ".join("-" if pulse.get(w) is None else f"{pulse[w]:.1f}" for w in X2B_ASKED) + " (report only)")
 
 
+def score_rep(spot: pathlib.Path, ref: pathlib.Path, windows: dict, out=print):
+    """The third launch: five bases, two skip steps, two balls-off steps (rule 6)."""
+    log = (spot / "proxy.log").read_text(errors="replace").splitlines()
+    if not any(LOAD_RE.search(line) for line in log):
+        out("query_probe_rule: proxy.log has no 'Proxy keys' load line (the log is not complete)")
+    qp = parse_log(log)
+    state, rates, totals, standin_rows = {}, {}, {}, {}
+    for w in REP_ORDER:
+        state[w] = rates[w] = totals[w] = None
+        standin_rows[w] = 0
+        if w not in windows:
+            out(f"query_probe_rule: {w}: window missing")
+            continue
+        st, r, t = window_state(qp, *windows[w]["proxy"])
+        if st is None:
+            out(f"query_probe_rule: {w}: {r}")
+            continue
+        state[w], rates[w], totals[w] = st, r, t
+        standin_rows[w] = sum(f.get("standin") == "1" for f in flares_of(spot / "switch" / f"{w[7:]}_lights.tsv"))
+    try:
+        pulse = pulses(spot, set(REP_ORDER))
+    except (OSError, KeyError, ValueError) as exc:
+        out(f"query_probe_rule: pulse not read: {exc}")
+        pulse = {}
+    counts = {w: glow(spot, ref, w) if w in windows else None for w in REP_ORDER}
+    for w in REP_ORDER:
+        r, c, p = rates[w], counts[w], pulse.get(w)
+        out(f"  {w:14s} state (stand-ins, keep, skip) {state[w]}; standin rows {standin_rows[w]}; "
+            + ("no QueryProbe line" if r is None else
+               f"per frame: answered {r['answered']:.2f} (>0 {r['answered_nz']:.2f}) skipped hdr {r['skipped_hdr']:.1f}")
+            + "; " + ("glow_blobs did not compare it" if c is None else
+                      f"orbs {c['orbs']}, lost glows {c['lost']}, puffs {c['puffs']}")
+            + "; pulse " + ("-" if p is None else f"{p:.1f}"))
+    problem = rep_state_problem(state, totals, standin_rows)
+    measures = (("orbs", lambda w: (counts[w] or {}).get("orbs"), 1.0),
+                ("x1 answers above 0 per frame", lambda w: None if rates[w] is None else rates[w]["answered_nz"], 1.0))
+    for treat, steps in REP_TREATS.items():
+        for name, get, floor in measures:
+            v, detail = (("NOT MEASURED", problem) if problem else
+                         repeat_verdict([get(w) for w in REP_BASES], [get(w) for w in steps], floor))
+            out(f"query_probe_rule: {treat} {name}: {v} ({detail})")
+    if all(counts[w] for w in REP_ORDER):
+        base_at = [counts[w]["at"] for w in REP_BASES]
+        stable = stable_orbs(base_at)
+        out(f"query_probe_rule: orbs in at least 4 of 5 bases: {len(stable)} at {stable} (report only)")
+        for w in (*REP_TREATS["skip"], *REP_TREATS["off"]):
+            gone, new = orb_moves(stable, base_at, counts[w]["at"])
+            out(f"query_probe_rule: {w}: {len(gone)} of them gone {gone}; new orbs {len(new)} {new} (report only)")
+    out("query_probe_rule: pulse " + " / ".join(f"{w[7:]} " + ("-" if pulse.get(w) is None else f"{pulse[w]:.1f}")
+                                                for w in REP_ORDER) + " (report only)")
+
+
 def score(spot: pathlib.Path, ref: pathlib.Path, out=print):
     windows = {w["name"]: w for w in json.loads((spot / "spot.json").read_text())["windows"] if w.get("proxy")}
+    if "switch_base5" in windows:
+        out("query_probe_rule: third launch (repeated bases: skip twice, balls off twice)")
+        return score_rep(spot, ref, windows, out)
     if "switch_skip" in windows:
         out("query_probe_rule: second launch (rebuilt X2, balls on / off / on)")
         return score_x2b(spot, ref, windows, out)
@@ -646,6 +788,44 @@ def self_test() -> int:
           balls_state_problem(S3, {**T3, "switch_balls_off": {**zero, "skipped_hdr": 3}}, R3) is not None, True)
     check("balls_on_again keys not read back: problem",
           balls_state_problem({**S3, "switch_balls_on_again": None}, T3, R3) is not None, True)
+    # Third launch: repeated bases (rule 6). Base values are invented, not 210750's.
+    B5 = [15, 13, 14, 13, 15]                                          # sd 1.0, band 3
+    check("bases 15/13/14/13/15, skip 7 and 8: FALLS", repeat_verdict(B5, [7, 8], 1.0)[0], "FALLS")
+    check("skip 7 and 14 (mean past the band, 14 inside the bases): NOT SETTLED",
+          repeat_verdict(B5, [7, 14], 1.0)[0], "NOT SETTLED")
+    check("skip 12 and 12 (change -2, band 3): NO CHANGE", repeat_verdict(B5, [12, 12], 1.0)[0], "NO CHANGE")
+    check("one noisy base 15/9/14/13/15 (sd 2.49, band 7.5), treatment 7 and 7: NO CHANGE",
+          repeat_verdict([15, 9, 14, 13, 15], [7, 7], 1.0)[0], "NO CHANGE")
+    check("treatment 20 and 21: RISES", repeat_verdict(B5, [20, 21], 1.0)[0], "RISES")
+    check("bases agree only in the first pair, 14/14/8/15/9 (sd 3.24, band 9.7), treatment 4 and 5: NO CHANGE",
+          repeat_verdict([14, 14, 8, 15, 9], [4, 5], 1.0)[0], "NO CHANGE")
+    check("equal bases 13 x5 use the floor (band 3): 11 and 11 NO CHANGE, 9 and 9 FALLS",
+          (repeat_verdict([13] * 5, [11, 11], 1.0)[0], repeat_verdict([13] * 5, [9, 9], 1.0)[0]),
+          ("NO CHANGE", "FALLS"))
+    check("treatment equal to the lowest base does not count as below it: NOT SETTLED",
+          repeat_verdict(B5, [13, 3], 1.0)[0], "NOT SETTLED")
+    check("a missing base: NOT MEASURED", repeat_verdict([15, 13, None, 13, 15], [7, 8], 1.0)[0], "NOT MEASURED")
+    check("four bases only: NOT MEASURED", repeat_verdict([15, 13, 14, 13], [7, 8], 1.0)[0], "NOT MEASURED")
+    S6 = dict(REP_ASKED)
+    T6 = {w: ({**zero, "skipped_hdr": 400} if REP_ASKED[w][2] else zero) for w in REP_ORDER}
+    R6 = {w: 94 if REP_ASKED[w][0] else 0 for w in REP_ORDER}
+    check("third launch steps as asked: no problem", rep_state_problem(S6, T6, R6), None)
+    check("skip2 skipped nothing: problem",
+          rep_state_problem(S6, {**T6, "switch_skip2": zero}, R6) is not None, True)
+    check("base3 skipped draws: problem",
+          rep_state_problem(S6, {**T6, "switch_base3": {**zero, "skipped_hdr": 2}}, R6) is not None, True)
+    check("off2 read stand-ins 1: problem",
+          rep_state_problem({**S6, "switch_off2": (1, 1, 0)}, T6, R6) is not None, True)
+    check("off1 dump still has standin=1 rows: problem",
+          rep_state_problem(S6, T6, {**R6, "switch_off1": 94}) is not None, True)
+    check("skip1 read SkipBracketDraws 0: problem",
+          rep_state_problem({**S6, "switch_skip1": (1, 1, 0)}, T6, R6) is not None, True)
+    bases_at = [[(10, 10), (50, 50), (90, 20)], [(11, 10), (50, 52), (90, 20)], [(10, 11), (51, 50)],
+                [(10, 10), (50, 50), (90, 21), (200, 100)], [(12, 10), (49, 50), (90, 20)]]
+    st = stable_orbs(bases_at)
+    check("stable orbs: 3 found in 4+ of 5 bases, the one-off at 200,100 left out", len(st), 3)
+    check("a treatment without the 50,50 orb and with a new one at 150,150: 1 gone, 1 new",
+          tuple(len(x) for x in orb_moves(st, bases_at, [(10, 10), (90, 20), (150, 150)])), (1, 1))
     check("caveat names keep 2 as no fix", "not a fix" in CAVEAT, True)
     print("self-test:", "all passed" if not fails else f"FAILED {fails}")
     return 1 if fails else 0
