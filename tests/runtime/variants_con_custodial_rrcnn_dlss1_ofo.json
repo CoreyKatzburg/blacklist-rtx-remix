@@ -1,0 +1,10 @@
+{
+ "about": "Off / on / off launch for the sweep's best FASTER variant with no picture number worse (20261117-221001-settings: 06_rr_cnn_0_dlss_perf_1, 19.95 ms against bases 34.21 and 34.06 ms). Same bench as variants_con_custodial_sweep_cut.json at con_custodial y0_p0, on the same staged build. Scored by tests\\runtime\\sweep_score.py with the two bases. verify_runtime.ps1 -Variants <this file>.",
+ "spot": "con_custodial",
+ "bench": {"settle": 5, "frames": 150, "revisit": true, "mouseLag": true},
+ "variants": [
+  {"name": "01_base"},
+  {"name": "02_rr_cnn_0_dlss_perf_1", "rtx": {"rtx.rayreconstruction.model": "0", "rtx.qualityDLSS": "1"}},
+  {"name": "03_base"}
+ ]
+}
