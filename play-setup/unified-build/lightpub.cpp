@@ -584,10 +584,10 @@ FILE* g_traceFile = nullptr;
 void UpdateTraceFile() {
     static bool openedOnce = false;
     if (g_settings.trace && !g_traceFile) {
+        // The proxy's folder: the game's folder in the game, the run's stage folder in a replay (apitrace's replay
+        // program reports the game's exe path as its own, so the exe path would write into the game folder).
         wchar_t path[MAX_PATH];
-        const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
-        wchar_t* slash = n ? wcsrchr(path, L'\\') : nullptr;
-        if (!slash || wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"lightpub_trace.csv")) return;
+        if (!proxy::CombinePath(proxy::ExecutableDirectory(), L"lightpub_trace.csv", path)) return;
         if (!(g_traceFile = lightcal::OpenTraceFile(path, openedOnce))) return;
         if (!openedOnce) fputs("frame,node,id,change,old,new\n", g_traceFile);
         openedOnce = true;
@@ -1121,25 +1121,23 @@ GameRead ReadGame() {
     return GameRead::Ok;
 }
 
-void PublishSeen() {
+uint32_t PublishSeen() {
     const uint32_t count = SelectLights();
     g_flareCount = SelectFlares();
     UpdateAutoRaytracing(count > 0);
     SubmitLights(count);
     DrawFlareStandIns();
     UpdateStrayCounts();
+    return count;
 }
 
-// Replay mode without Remix (the proxy chained to Windows' Direct3D 9): nothing can be published, so what the proxy
-// would publish goes to d3d9_proxy_replay_lights_check.csv, one line each time the answer changes:
-// frame, lights seen, lights wanted, flares seen, flare stand-ins, wanted node ids.
-void ReplayDryRun(uint32_t frame) {
+// Replay mode: the lamp and flare answer for each recorded block goes to d3d9_proxy_replay_lights_check.csv, one
+// line each time the answer changes: frame, lights seen, lights wanted, flares seen, flare stand-ins, wanted node ids.
+// Without Remix (the proxy chained to Windows' Direct3D 9) it is what the proxy would publish; with Remix it is what
+// the proxy published to Remix that frame.
+void WriteReplayAnswer(uint32_t frame, uint32_t count, uint32_t flares) {
     static char line[64 + 9 * kMaxTracked], last[sizeof(line)], out[sizeof(line) + 16];
     static wchar_t path[MAX_PATH] = {};
-    ++g_frame;
-    if (!LoadReplaySeen(frame)) return;
-    const uint32_t count = SelectLights();
-    const uint32_t flares = SelectFlares();
     uint32_t standIns = 0;
     for (uint32_t i = 0; i < flares; ++i) standIns += g_flares[i].standIn;
     int length = _snprintf_s(line, _TRUNCATE, "%u,%u,%u,%u,", g_seenLightCount, count, flares, standIns);
@@ -1154,6 +1152,13 @@ void ReplayDryRun(uint32_t frame) {
     }
     size_t outLength = static_cast<size_t>(_snprintf_s(out, _TRUNCATE, "%u,%s\n", frame, line));
     proxy::AppendToFile(path, out, &outLength);
+}
+
+void ReplayDryRun(uint32_t frame) {
+    ++g_frame;
+    if (!LoadReplaySeen(frame)) return;
+    const uint32_t count = SelectLights();
+    WriteReplayAnswer(frame, count, SelectFlares());
 }
 
 void RecordGameFrame(uint32_t frame) {
@@ -1171,8 +1176,12 @@ void OnPresent(uint32_t frame) {
     UpdateTraceFile();
     if (!g_settings.enable) return;  // switched off live; ReloadIfChanged already removed the lights
     if (proxy::ReplayMode()) {
-        if (LoadReplaySeen(frame)) PublishSeen();
-        else UpdateAutoRaytracing(false);
+        if (LoadReplaySeen(frame)) {
+            const uint32_t count = PublishSeen();
+            WriteReplayAnswer(frame, count, g_flareCount);
+        } else {
+            UpdateAutoRaytracing(false);
+        }
         return;
     }
     switch (ReadGame()) {
