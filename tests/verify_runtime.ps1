@@ -66,7 +66,9 @@ $Py = 'D:\BlacklistOverhaul\tools\upscalers\py314\Scripts\python.exe'
 $Library = 'D:\BlacklistOverhaul\experiments\save-backups\gate-checkpoints'
 $SaveDir = 'D:\Ubisoft\Ubisoft Game Launcher\savegames\d36412d1-6246-4703-adbf-8fbd46c6da34\449'
 $InputIni = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Ubisoft\Blacklist\inputTranslations.ini'
-$GameLock = Join-Path (Split-Path $Tests) 'play-setup\AGENT_GAME_LOCK.txt'
+# One lock for every worktree, in the main tree. A lock beside this script is seen only by launches from the same
+# worktree (Nov 19 05:27: such a launch ran into another thread's replay). RemixPlayCommon.ps1 names the same file.
+$GameLock = 'D:\BlacklistOverhaul\tools\remix\play-setup\AGENT_GAME_LOCK.txt'
 $ResultsRoot = 'D:\BlacklistOverhaul\experiments\remix-gate'
 # run_all_offline.ps1 writes its last run and last pass here; the manifest compares them with this launch's tree.
 $SuiteRecord = Join-Path $ResultsRoot 'offline_suite_last.json'

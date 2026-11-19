@@ -135,7 +135,9 @@ function Test-OwnLock {
 # A test that holds the game (verify_runtime.ps1, worker G's runner) writes AGENT_GAME_LOCK.txt with a line
 # "pid <n> started <UTC start time, ISO>" naming its own process, so a lock whose test still runs can be told apart
 # from one left by a test that crashed (Corey, Nov 16: a crashed test must never lock him out).
-$AgentLock = Join-Path $Setup 'AGENT_GAME_LOCK.txt'
+# It is one file for every worktree, in the main tree: a lock beside this script would be seen only by launches from
+# the same worktree (Nov 19 05:27). tests\verify_runtime.ps1 names the same file.
+$AgentLock = 'D:\BlacklistOverhaul\tools\remix\play-setup\AGENT_GAME_LOCK.txt'
 . (Join-Path $RemixDir 'tests\runtime\run_files.ps1')
 
 # Sorts the test locks among $paths that exist (the Play script's own PLAY-SETUP lock is skipped). kind:

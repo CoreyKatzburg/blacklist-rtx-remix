@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $remixRoot = Split-Path -Parent (Split-Path -Parent $here)
 $unified = Join-Path $remixRoot 'play-setup\unified-build'
-$lock = Join-Path $remixRoot 'play-setup\AGENT_GAME_LOCK.txt'
+$lock = 'D:\BlacklistOverhaul\tools\remix\play-setup\AGENT_GAME_LOCK.txt'
 if (Test-Path -LiteralPath $lock) { throw "a game launch holds $lock; run this when it is gone" }
 $build = Join-Path $here '_build'
 New-Item -ItemType Directory -Force -Path (Join-Path $build 'bench') | Out-Null

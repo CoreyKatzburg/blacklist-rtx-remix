@@ -472,6 +472,13 @@ $whole = @(Get-ChildItem $PSScriptRoot -Filter 'variants_*.json' | ForEach-Objec
 $bad = @($whole | Where-Object { $j = ConvertTo-SpotJson $_; ($j | ConvertFrom-Json | ConvertTo-Json -Depth 100 -Compress) -ne ($_ | ConvertTo-Json -Depth 100 -Compress) })
 Check "spot json: every variants file and spots.json spot ($($whole.Count)) round-trips unchanged" ($bad.Count -eq 0)
 
+# One game lock for every worktree (Nov 19 05:27: a launch from a worktree took a lock in its own play-setup, which
+# no other thread saw, and ran into a replay). Both scripts must name the same file by its full path in the main tree.
+$sharedLock = 'D:\BlacklistOverhaul\tools\remix\play-setup\AGENT_GAME_LOCK.txt'
+function Get-LockLine($file, $name) { @(Select-String -LiteralPath $file -Pattern ('^\$' + $name + '\s*=\s*(.+)$') | ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() }) }
+Check 'game lock: verify_runtime.ps1 names the one shared lock, not a file beside itself' (((Get-LockLine $Gate 'GameLock') -join '|') -eq "'$sharedLock'")
+Check 'game lock: RemixPlayCommon.ps1 names the same shared lock' (((Get-LockLine $Common 'AgentLock') -join '|') -eq "'$sharedLock'")
+
 "failures $fail"
 exit [int]($fail -gt 0)
 
