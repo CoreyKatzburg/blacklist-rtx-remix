@@ -257,7 +257,7 @@ def monitor_is(m: dict, want: str) -> bool:
 
 SCAN = {"F9": 0x43, "F10": 0x44, "F11": 0x57, "F12": 0x58, "F": 0x21, "G": 0x22, "N": 0x31, "X": 0x2D, "SPACE": 0x39,
         "ESC": 0x01, "ENTER": 0x1C, "ALT": 0x38, "F4": 0x3E, "UP": 0x48, "DOWN": 0x50, "LEFT": 0x4B, "RIGHT": 0x4D,
-        "CTRL": 0x1D, "SHIFT": 0x2A, "Q": 0x10}
+        "CTRL": 0x1D, "SHIFT": 0x2A, "Q": 0x10, "W": 0x11}
 EXTENDED = {"UP", "DOWN", "LEFT", "RIGHT"}   # the arrow block, not the number pad's arrows
 
 # Switch test variants (spots.json "switches" overrides): each changes exactly one thing against "base".
@@ -416,6 +416,13 @@ def mouse_fire_burst(shots: int = 5, interval: float = 0.12) -> None:
         user32.SendInput(1, ctypes.byref(up), ctypes.sizeof(_INPUT))
         display.note_send()
         time.sleep(interval)
+def key(k: str, down: bool) -> None:
+    """One key held down or let go, for a step that keeps it held (walking) while other keys are tapped."""
+    i = _INPUT(type=1, u=_INPUT_UNION(ki=_KEYBDINPUT(0, SCAN[k], 0x8 | (0 if down else 2) | (1 if k in EXTENDED else 0), 0, None)))
+    user32.SendInput(1, ctypes.byref(i), ctypes.sizeof(_INPUT))
+    display.note_send()
+
+
 def mouse_right(down: bool) -> None:
     i = _INPUT(type=0, u=_INPUT_UNION(mi=_MOUSEINPUT(0, 0, 0, 0x0008 if down else 0x0010, 0, None)))
     user32.SendInput(1, ctypes.byref(i), ctypes.sizeof(_INPUT))
@@ -2382,6 +2389,51 @@ class Spot:
                 w = self.window(f"goggles_{state}_{i}", "goggles_cycle", lambda: (tap(key), self.hold(seconds)), key=key)
                 w["proxyLogSaid"] = f"Goggles: {state}" in self.log.new_text()[mark:]
 
+    def goggles_walk(self, cfg: dict) -> None:
+        """spot "gogglesWalk" {"cycles", "onWaitSeconds", "walkOnSeconds", "walkOffSeconds", "stillSeconds", "walkKey"}
+        (WKR-7, Nov 19, BLK-13, WKR-23's corridor order: walls vanish when night vision turns off while Sam walks):
+        goggles on, wait, walk with walkKey held, goggles off while still walking, keep walking, then stop and hold
+        still. Each step is its own window so the frame replay knows the frames of each goggles-off press. Cycles
+        after the first start with Sam teleported back to the spot's teleport. The walk key is always let go, even
+        when a step fails. samEnd: Sam's position read after each step (None when it cannot be read)."""
+        toggle = self.spot.get("goggleKeys", {"toggle": "F9"})["toggle"]
+        walk = cfg.get("walkKey", "W")
+        hwnd = game_window(self.a.pid)
+        if hwnd:
+            front(hwnd)
+
+        def sam():
+            try:
+                return [round(float(v), 1) for v in self.game.location(self.pawn)]
+            except Exception:   # noqa: BLE001
+                return None
+
+        def goggles_step(name, seconds, state):
+            mark = len(self.log.new_text())
+            w = self.window(name, "goggles_walk", lambda: (tap(toggle), self.hold(seconds)), key=toggle)
+            w["proxyLogSaid"] = f"Goggles: {state}" in self.log.new_text()[mark:]
+            w["samEnd"] = sam()
+
+        def back():
+            self.teleport(self.spot["teleport"])
+            settle = time.monotonic() + 3.0
+            while not self.pose(self.yaw, self.pitch) and time.monotonic() < settle:
+                time.sleep(0.008)
+
+        for i in range(1, int(cfg.get("cycles", 2)) + 1):
+            if i > 1 and self.spot.get("teleport"):
+                self.window(f"back_to_start_{i}", "walk_reset", back)["samEnd"] = sam()
+            goggles_step(f"goggles_on_{i}", float(cfg.get("onWaitSeconds", 1.0)), "on")
+            key(walk, True)
+            try:
+                w = self.window(f"walk_on_{i}", "goggles_walk", lambda: self.hold(float(cfg.get("walkOnSeconds", 2.0))))
+                w["samEnd"] = sam()
+                goggles_step(f"goggles_off_walking_{i}", float(cfg.get("walkOffSeconds", 3.0)), "off")
+            finally:
+                key(walk, False)
+            w = self.window(f"still_{i}", "goggles_walk", lambda: self.hold(float(cfg.get("stillSeconds", 3.0))))
+            w["samEnd"] = sam()
+
     def aim_record(self, cfg: dict) -> None:
         """spot "aimRecord" {"holdSeconds", "turnDeg", "turnSeconds", "shots", "afterSeconds"} (WKR-7, Nov 19, BLK-11:
         laser smears, spikes and a beam left hanging after aiming): hold right mouse to aim, turn left and right by
@@ -2867,6 +2919,8 @@ def main() -> int:
                 s.goggle_cycles(spot["gogglesRecord"])
             if spot.get("aimRecord"):
                 s.aim_record(spot["aimRecord"])
+            if spot.get("gogglesWalk"):
+                s.goggles_walk(spot["gogglesWalk"])
             if spot.get("lightSwitch"):
                 s.light_switch(spot["lightSwitch"])
             if spot.get("switchTest") and not a.no_remix and late:

@@ -735,6 +735,55 @@ class Reference(unittest.TestCase):
         self.assertLess(events.index(("fire", 3)), i)
         self.assertEqual(events[i + 1:], [("hold", 6.0)])
 
+    def _walk_spot(self, events, windows, teleport=None):
+        s = drive.Spot.__new__(drive.Spot)
+        s.a = mock.Mock(pid=1)
+        s.yaw, s.pitch = 0.0, 0.0
+        s.spot = {"goggleKeys": {"toggle": "F"}, **({"teleport": teleport} if teleport else {})}
+        s.log = mock.Mock(new_text=lambda: "")
+        s.game = mock.Mock(location=lambda pawn: (1.0, 2.0, 3.0))
+        s.pawn = 7
+        s.hold = lambda seconds, **k: events.append(("hold", seconds))
+        s.teleport = lambda tp: events.append(("teleport", tuple(tp["location"])))
+        s.pose = lambda y, p: True
+
+        def window(name, kind, body, **k):
+            windows.append(name)
+            body()
+            return {"name": name, "kind": kind}
+        s.window = window
+        return s
+
+    def test_goggles_walk_turns_goggles_off_while_the_walk_key_is_held_and_lets_it_go(self):
+        # BLK-13 corridor (WKR-23): the walls vanish when night vision turns off while Sam is moving.
+        events, windows = [], []
+        s = self._walk_spot(events, windows, teleport={"location": [-8100, -1470, 150], "yaw": -174})
+        with mock.patch.object(drive, "tap", lambda k: events.append(("tap", k))), \
+                mock.patch.object(drive, "key", lambda k, down: events.append(("key", k, down))), \
+                mock.patch.object(drive, "game_window", lambda pid: 0):
+            s.goggles_walk({"cycles": 2, "onWaitSeconds": 1, "walkOnSeconds": 2, "walkOffSeconds": 3, "stillSeconds": 3})
+        self.assertEqual(windows, ["goggles_on_1", "walk_on_1", "goggles_off_walking_1", "still_1", "back_to_start_2",
+                                   "goggles_on_2", "walk_on_2", "goggles_off_walking_2", "still_2"])
+        cycle = [("tap", "F"), ("hold", 1.0), ("key", "W", True), ("hold", 2.0), ("tap", "F"), ("hold", 3.0),
+                 ("key", "W", False), ("hold", 3.0)]
+        self.assertEqual(events, cycle + [("teleport", (-8100, -1470, 150))] + cycle)
+
+    def test_goggles_walk_lets_the_walk_key_go_when_a_step_fails(self):
+        events, windows = [], []
+        s = self._walk_spot(events, windows)
+
+        def fail(seconds, **k):
+            if seconds == 2.0:
+                raise RuntimeError("window lost")
+        s.hold = fail
+        keys = []
+        with mock.patch.object(drive, "tap", lambda k: None), \
+                mock.patch.object(drive, "key", lambda k, down: keys.append(down)), \
+                mock.patch.object(drive, "game_window", lambda pid: 0):
+            with self.assertRaises(RuntimeError):
+                s.goggles_walk({"cycles": 1})
+        self.assertEqual(keys, [True, False])
+
     def test_aim_record_releases_right_mouse_when_a_step_fails(self):
         s = drive.Spot.__new__(drive.Spot)
         s.a = mock.Mock(pid=1)
