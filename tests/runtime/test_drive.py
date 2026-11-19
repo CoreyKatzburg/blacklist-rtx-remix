@@ -710,6 +710,23 @@ class Reference(unittest.TestCase):
         self.assertEqual(windows[0]["proxyLogSaid"], True)
         self.assertEqual(windows[1]["proxyLogSaid"], False)
 
+    def test_light_dump_never_asks_the_proxy_for_a_dump_in_a_recording_run(self):
+        # The dump's device calls would land in the apitrace recording and break its stack replay (frame 4913).
+        s = drive.Spot.__new__(drive.Spot)
+        s.a = mock.Mock(recording=True, system="X:\\nowhere")
+        s.ini = "X:\\nowhere\\d3d9_proxy.ini"
+        with mock.patch.object(drive, "set_ini", side_effect=AssertionError("asked the proxy for a dump")):
+            self.assertIsNone(s.light_dump("X:\\nowhere\\out_lights.tsv"))
+        s.a = mock.Mock(recording=False, system="X:\\nowhere")
+        asked = []
+        s.hold = lambda *a, **k: None
+        with mock.patch.object(drive, "set_ini", lambda *a: asked.append(a[1:])), \
+                mock.patch.object(drive, "files_under", lambda folder: set()), \
+                mock.patch.object(drive, "written_since", lambda folder, before: []), \
+                mock.patch.object(drive.time, "sleep", lambda s: None):
+            self.assertIsNone(s.light_dump("X:\\nowhere\\out_lights.tsv"))
+        self.assertEqual(asked, [("Proxy", "CaptureDraws", "1"), ("Proxy", "CaptureDraws", "0")])
+
     def test_switch_pose_limits(self):
         # Worker B, Nov 17: a switch still counts only within 8 units, 1.5 deg yaw and 1.0 deg pitch of switch_base.
         base = [-10700.0, -560.0, -380.0, -67.0, 0.0]

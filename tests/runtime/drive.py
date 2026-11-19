@@ -1955,7 +1955,13 @@ class Spot:
     def light_dump(self, dest: str, draws: bool = False) -> str | None:
         """One frame of the proxy's light and flare dump (framedump\\f<frame>_lights.tsv, written when
         [Proxy] CaptureDraws goes from 0 to 1), copied to `dest`. With draws=True the same frame's draw dump
-        (f<frame>_draws.tsv, written beside it) is copied too, as `dest` with _draws.tsv for _lights.tsv."""
+        (f<frame>_draws.tsv, written beside it) is copied too, as `dest` with _draws.tsv for _lights.tsv.
+        Never in a recording run: the dump's own GetTexture and GetStreamSource calls land in the apitrace recording
+        below the proxy, and a stack replay of them under different device state releases live textures (Nov 19,
+        recording-20261119-074501 frame 4913: a stack replay crashed there; plain replay ran through). The recording's
+        side file already holds every frame's lamps and flares."""
+        if getattr(self.a, "recording", False):
+            return None
         folder = os.path.join(self.a.system, "framedump")
         before = files_under(folder)
         set_ini(self.ini, "Proxy", "CaptureDraws", "1")
