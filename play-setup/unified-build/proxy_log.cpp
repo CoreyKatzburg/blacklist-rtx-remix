@@ -244,9 +244,14 @@ bool CombinePath(const wchar_t* directory, const wchar_t* leaf, wchar_t output[M
     return true;
 }
 
-bool GetExecutableDirectory() {
+bool g_replayMode = false;
+bool ReplayMode() { return g_replayMode; }
+
+bool GetExecutableDirectory(HMODULE proxyModule) {
+    wchar_t replay[4];
+    g_replayMode = GetEnvironmentVariableW(L"BLPROXY_REPLAY", replay, ARRAYSIZE(replay)) == 1 && replay[0] == L'1';
     wchar_t executablePath[MAX_PATH];
-    const DWORD length = GetModuleFileNameW(nullptr, executablePath, ARRAYSIZE(executablePath));
+    const DWORD length = GetModuleFileNameW(g_replayMode ? proxyModule : nullptr, executablePath, ARRAYSIZE(executablePath));
     if (length == 0 || length >= ARRAYSIZE(executablePath)) {
         return false;
     }

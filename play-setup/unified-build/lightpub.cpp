@@ -345,6 +345,80 @@ uint32_t CollectLights(uintptr_t database) {
     return count;
 }
 
+// Replay mode (proxy::ReplayMode, no game process): the light list is a light dump recorded in the game (DumpLights),
+// saved as d3d9_proxy_replay_lights.tsv beside the proxy. The raw words of each "light" row rebuild that LightNode's
+// memory, so ReadNode, Wanted and SubmitLights run as they do in the game. Every replayed frame gets the lights of
+// that one recorded moment. Flares are not replayed yet.
+constexpr uint32_t kNodeWords = 0x470 / 4;
+uint32_t (*g_replayNodes)[kNodeWords] = nullptr;
+uint32_t g_replayNodeCount = 0;
+
+bool ParseRawWords(const char* line, const char* key, uint32_t from, uint32_t to, uint32_t* words) {
+    const char* found = strstr(line, key);
+    if (!found) return false;
+    char* cursor = const_cast<char*>(found + strlen(key));
+    for (uint32_t offset = from; offset < to; offset += 4) {
+        char* next = nullptr;
+        words[offset / 4] = strtoul(cursor, &next, 16);
+        if (next == cursor) return false;
+        cursor = next;
+    }
+    return true;
+}
+
+void LoadReplayLights() {
+    wchar_t path[MAX_PATH];
+    if (!proxy::CombinePath(proxy::ExecutableDirectory(), L"d3d9_proxy_replay_lights.tsv", path)) return;
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        if (g_log) g_log("lightpub: replay mode, no light recording at %ls; no lights are published", path);
+        return;
+    }
+    const DWORD size = GetFileSize(file, nullptr);
+    char* text = static_cast<char*>(malloc(static_cast<size_t>(size) + 1));
+    DWORD read = 0;
+    if (!text || !ReadFile(file, text, size, &read, nullptr)) read = 0;
+    CloseHandle(file);
+    g_replayNodes = static_cast<uint32_t (*)[kNodeWords]>(calloc(kMaxTracked, sizeof(*g_replayNodes)));
+    uint32_t rows = 0;
+    if (text && g_replayNodes) {
+        text[read] = '\0';
+        for (char* line = text; line && *line && g_replayNodeCount < kMaxTracked;) {
+            char* end = strchr(line, '\n');
+            if (end) *end = '\0';
+            if (strncmp(line, "light\t", 6) == 0) {
+                ++rows;
+                uint32_t* words = g_replayNodes[g_replayNodeCount];
+                if (ParseRawWords(line, "\traw20=", 0x20, 0x390, words) &&
+                    ParseRawWords(line, "\traw390=", 0x390, 0x460, words)) {
+                    words[0] = kLightNodeVtable;
+                    ++g_replayNodeCount;
+                }
+            }
+            line = end ? end + 1 : nullptr;
+        }
+    }
+    free(text);
+    if (g_log) g_log("lightpub: replay mode, %u of %u recorded lights loaded from %ls", g_replayNodeCount, rows, path);
+}
+
+uint32_t CollectReplayLights() {
+    g_presentCount = 0;
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < g_replayNodeCount && count < g_settings.maxLights; ++i) {
+        const uintptr_t node = reinterpret_cast<uintptr_t>(g_replayNodes[i]);
+        Snapshot& s = g_snapshot[count];
+        s.data = {};
+        if (!ReadNode(node, &s.data)) continue;
+        if (g_presentCount < kMaxPresent) g_present[g_presentCount++] = node;
+        if (Wanted(s.data, KeptTracked(node))) {
+            s.node = node;
+            ++count;
+        }
+    }
+    return count;
+}
+
 // Hash of the parameters Remix sees, quantised so flicker and sub-unit jitter do not force a
 // destroy/create every frame (position 1 unit, colour x intensity 1/64, direction/cone 1/256, probe values 1/1024).
 int32_t QuantizeFloat(float x) {
@@ -675,6 +749,7 @@ bool Initialize(HMODULE remixClient, const wchar_t* iniPath, LogFn log) {
         return false;
     }
     g_ready = true;
+    if (proxy::ReplayMode()) LoadReplayLights();
     wcsncpy_s(g_iniPath, iniPath, _TRUNCATE);
     g_iniWriteTime = IniWriteTime();
     ApplyRemixConfig();
@@ -908,6 +983,12 @@ void OnPresent() {
     ReloadIfChanged();
     UpdateTraceFile();
     if (!g_settings.enable) return;  // switched off live; ReloadIfChanged already removed the lights
+    if (proxy::ReplayMode()) {
+        const uint32_t count = CollectReplayLights();
+        UpdateAutoRaytracing(count > 0);
+        SubmitLights(count);
+        return;
+    }
     static uintptr_t lastDatabase = 0;
     static CRITICAL_SECTION* checkedLock = nullptr;
     uintptr_t database = 0;

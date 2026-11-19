@@ -305,7 +305,7 @@ void ReadStageTextureDumpKeys(const wchar_t* iniPath, bool log) {
 
 bool LoadRealD3D9(HINSTANCE proxyInstance) {
     const DWORD proxyLength = GetModuleFileNameW(proxyInstance, g_proxyPath, ARRAYSIZE(g_proxyPath));
-    if (proxyLength == 0 || proxyLength >= ARRAYSIZE(g_proxyPath) || !proxy::GetExecutableDirectory()) {
+    if (proxyLength == 0 || proxyLength >= ARRAYSIZE(g_proxyPath) || !proxy::GetExecutableDirectory(proxyInstance)) {
         return false;
     }
     g_executableBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
@@ -409,7 +409,9 @@ bool LoadRealD3D9(HINSTANCE proxyInstance) {
     WriteLog("features: FrameTiming=%u QueryMode=%u PresentHook=%d FormatGuard=%d TexStats=%d TexHashLog=%d "
              "HitchSampler=%d", diag.frameTiming, g_queryMode, g_presentHook ? 1 : 0, g_formatGuard ? 1 : 0,
              diag.texStats ? 1 : 0, texHashLog ? 1 : 0, diag.hitchSampler ? 1 : 0);
-    proxy::InstallLoopTimer(g_executableBase);
+    if (proxy::ReplayMode()) WriteLog("replay mode: files beside the proxy DLL (%ls), no game memory is read or patched",
+                                      proxy::ExecutableDirectory());
+    proxy::InstallLoopTimer(proxy::ReplayMode() ? 0 : g_executableBase);
 
     wchar_t configured[MAX_PATH] = {};
     GetPrivateProfileStringW(L"Proxy", L"ChainDll", L"", configured, ARRAYSIZE(configured), iniPath);

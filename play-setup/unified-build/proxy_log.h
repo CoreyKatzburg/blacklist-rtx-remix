@@ -11,7 +11,11 @@
 namespace proxy {
 
 // Resolves the game executable directory, d3d9_proxy.ini path, and d3d9_proxy.log path.
-bool GetExecutableDirectory();
+// Replay mode (environment BLPROXY_REPLAY=1): apitrace's d3dretrace replays a recording with no game process and
+// reports the recorded game's exe path as its own, so the directory is the proxy DLL's folder instead, and nothing
+// reads or patches game memory.
+bool GetExecutableDirectory(HMODULE proxyModule);
+bool ReplayMode();
 const wchar_t* ExecutableDirectory();
 const wchar_t* IniPath();
 const wchar_t* LogPath();

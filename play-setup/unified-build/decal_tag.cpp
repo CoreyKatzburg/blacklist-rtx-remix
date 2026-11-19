@@ -481,6 +481,7 @@ void TexHashLogEndFrame(LONG presentCount) {
 }
 
 void ApplyStreamBudget(LONG presentCount) {
+    if (ReplayMode()) return;
     static uint32_t lastLogged = 0;
     constexpr uint32_t kGameBudget = 40u << 20;
     const uint32_t wanted = g_streamBudgetMB > 0 ? static_cast<uint32_t>(g_streamBudgetMB) << 20 : kGameBudget;
