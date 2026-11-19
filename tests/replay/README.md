@@ -49,10 +49,10 @@ Arguments:
   (1.61 times the plain picture's brightness, against 3.42 with the installed file). Check `stage\rtx.conf` in your
   run folder against your file.
 - `-Materials <mod folder>` (stack mode): link this folder as `rtx-remix\mods\materials` instead of the main tree's
-  `toolsemix\materials` (the default, unchanged). It must hold a `mod.usda`, or the replay stops before it takes the
+  `tools\remix\materials` (the default, unchanged). It must hold a `mod.usda`, or the replay stops before it takes the
   lock. To test one changed file without copying 5 GB, make a folder with copies of the files you change and
   junctions for the rest (`deps`, `textures`); never hard-link a file you will edit. Check your run: `run.json` has
-  `materials`, and `stagetx-remix\mods\materials` is a junction to your folder. Proof: not yet run on a replay
+  `materials`, and `stage\rtx-remix\mods\materials` is a junction to your folder. Proof: not yet run on a replay
   (a folder with no `mod.usda` is refused, checked offline).
 - `-Reference <folder with f*.png>`: compare the pictures with apitrace's `snapdiff.py`; exit 1 on any difference
   above `-Fuzz` (0.05). Use it for plain against plain. For Remix pictures use the noise limit below.
