@@ -12,11 +12,13 @@
 #   -Lights <light dump .tsv>         instead of a lamp recording: one light dump (DumpLights) for every frame
 #   -Setup <play-setup folder>        proxy and stack mode: take d3d9_proxy.ini, rtx.conf and bridge.conf from this
 #                                     folder (a worktree's play-setup) instead of the installed ones in the main tree
+#   -Materials <mod folder>           stack mode: link this folder as rtx-remix\mods\materials instead of the main
+#                                     tree's materials folder (for testing a changed mod.usda or texture on replay)
 # Windows PowerShell 5.1 compatible.
 param([Parameter(Mandatory = $true)][string]$Trace, [ValidateSet('plain', 'proxy', 'stack')][string]$Mode = 'plain',
       [string]$Out = '', [string]$Proxy = 'D:\BlacklistOverhaul\experiments\replay-rig\build\d3d9.dll',
       [string]$Side = '', [string]$Lights = '', [string]$Reference = '', [int]$SnapshotInterval = 1, [double]$Fuzz = 0.05,
-      [string]$Setup = '')
+      [string]$Setup = '', [string]$Materials = '')
 $ErrorActionPreference = 'Stop'
 $Rig = 'D:\BlacklistOverhaul\experiments\replay-rig'
 $Apitrace = Join-Path $Rig 'tools\apitrace-14.0-win32'
@@ -25,6 +27,9 @@ $Py = 'D:\BlacklistOverhaul\tools\upscalers\py314\Scripts\python.exe'
 $GameLock = Join-Path $Remix 'play-setup\AGENT_GAME_LOCK.txt'
 if (-not $Setup) { $Setup = Join-Path $Remix 'play-setup' }
 $Setup = (Resolve-Path -LiteralPath $Setup).Path
+if (-not $Materials) { $Materials = Join-Path $Remix 'materials' }
+$Materials = (Resolve-Path -LiteralPath $Materials).Path
+if (-not (Test-Path -LiteralPath (Join-Path $Materials 'mod.usda'))) { throw "-Materials folder $Materials has no mod.usda" }
 # The same C: limit as verify_runtime.ps1: the Remix bridge holds about 8 GB and the page file on C: grows with it.
 $MinCFreeMB = 10500
 
@@ -69,7 +74,7 @@ try {
         Copy-Item -LiteralPath (Join-Path $Setup 'bridge.conf') -Destination (Join-Path $stage '.trex\bridge.conf')
         Copy-Item -LiteralPath (Join-Path $Setup 'rtx.conf') -Destination $stage
         New-Item -ItemType Directory -Force (Join-Path $stage 'rtx-remix\mods') | Out-Null
-        New-Item -ItemType Junction -Path (Join-Path $stage 'rtx-remix\mods\materials') -Target (Join-Path $Remix 'materials') | Out-Null
+        New-Item -ItemType Junction -Path (Join-Path $stage 'rtx-remix\mods\materials') -Target $Materials | Out-Null
     }
     $env:BLPROXY_REPLAY = $(if ($Mode -eq 'plain') { '' } else { '1' })
     $started = Get-Date
@@ -90,7 +95,7 @@ try {
     $rendered = Select-String -LiteralPath (Join-Path $Out 'retrace.log') -Pattern '^Rendered (\d+) frames in ([\d.]+) secs' | Select-Object -Last 1
     $result = [ordered]@{ trace = $Trace; mode = $Mode; started = $started.ToString('s'); exitCode = $exit; pictures = $pictures
                           framesRendered = $(if ($rendered) { [int]$rendered.Matches[0].Groups[1].Value }); seconds = $(if ($rendered) { [double]$rendered.Matches[0].Groups[2].Value })
-                          proxySha256 = $(if ($Mode -ne 'plain') { (Get-FileHash -LiteralPath $Proxy).Hash }); side = $Side; lights = $Lights; setup = $(if ($Mode -ne 'plain') { $Setup }); compare = $null }
+                          proxySha256 = $(if ($Mode -ne 'plain') { (Get-FileHash -LiteralPath $Proxy).Hash }); side = $Side; lights = $Lights; setup = $(if ($Mode -ne 'plain') { $Setup }); materials = $(if ($Mode -eq 'stack') { $Materials }); compare = $null }
     $failed = $exit -ne 0 -or -not $pictures
     if ($Reference -and $pictures) {
         $text = & $Py -I (Join-Path $Apitrace 'lib\scripts\snapdiff.py') -v -f $Fuzz -o (Join-Path $Out 'compare.html') ((Resolve-Path -LiteralPath $Reference).Path + '\f') ($frames + '\f') 2>&1 | ForEach-Object { "$_" }
