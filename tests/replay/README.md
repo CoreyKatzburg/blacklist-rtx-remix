@@ -43,9 +43,11 @@ Arguments:
 - `-Proxy <d3d9.dll>`: your proxy build. It must have replay mode (built from this branch or a branch that holds
   commits 6153aec and d3eeec4). Default: `experiments\replay-rig\build\d3d9.dll`.
 - `-Setup <play-setup folder>`: take `d3d9_proxy.ini`, `rtx.conf` and `bridge.conf` from your worktree's
-  `play-setup` instead of the installed ones. The Remix runtime always comes from `tools\remix\pkg`. Run once
-  with a worktree folder (`runs\cust2-stack-f2099-setup`): the replay works and `run.json` names the folder. That
-  folder's three files were byte-equal to the installed ones, so the run does not prove a changed file is picked up.
+  `play-setup` instead of the installed ones. The Remix runtime always comes from `tools\remix\pkg`. Proven to
+  pick up a changed file (WKR-16, BLK-7, run `experiments\blk7-scratch\replays\s-ae_off1`): its `stage\rtx.conf` is
+  byte-equal to the `rtx.conf` of its `-Setup` folder and differs from the installed one, and the picture changed
+  (1.61 times the plain picture's brightness, against 3.42 with the installed file). Check `stage\rtx.conf` in your
+  run folder against your file.
 - `-Reference <folder with f*.png>`: compare the pictures with apitrace's `snapdiff.py`; exit 1 on any difference
   above `-Fuzz` (0.05). Use it for plain against plain. For Remix pictures use the noise limit below.
 
