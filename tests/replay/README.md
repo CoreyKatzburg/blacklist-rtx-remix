@@ -5,8 +5,8 @@ Windows' own Direct3D 9 (the original game's picture) or through our proxy, the 
 
 ## State (Nov 19, 07:30 ET): which mode is proven on what
 
-- **stack (proxy + bridge + Remix): works on the 06:41 recording at 2560x1440.** Three runs: two of frames 0 to
-  2,099 and one of frames 0 to 6,419. Remix ray traced every level frame (280, 280 and 4,600), one Remix frame per
+- **stack (proxy + bridge + Remix): works on the 06:41 recording at 2560x1440.** Four runs: three of frames 0 to
+  2,099 and one of frames 0 to 6,419. Remix ray traced every level frame (280, 280, 280 and 4,600), one Remix frame per
   recorded frame, never fell behind, never ran out of video memory. The runs agree: see "Noise limit".
 - **The saved stack pictures are Remix's picture (one run).** Remix's own screenshot of frame 6,350 against the
   saved picture of that frame: 78,450 of 3,686,400 pixels differ by more than 5 percent (mean difference 1.5 of
@@ -43,8 +43,9 @@ Arguments:
 - `-Proxy <d3d9.dll>`: your proxy build. It must have replay mode (built from this branch or a branch that holds
   commits 6153aec and d3eeec4). Default: `experiments\replay-rig\build\d3d9.dll`.
 - `-Setup <play-setup folder>`: take `d3d9_proxy.ini`, `rtx.conf` and `bridge.conf` from your worktree's
-  `play-setup` instead of the installed ones. The Remix runtime always comes from `tools\remix\pkg`. Only the
-  default (the installed folder) has been run; a worktree folder has not been tried yet.
+  `play-setup` instead of the installed ones. The Remix runtime always comes from `tools\remix\pkg`. Run once
+  with a worktree folder (`runs\cust2-stack-f2099-setup`): the replay works and `run.json` names the folder. That
+  folder's three files were byte-equal to the installed ones, so the run does not prove a changed file is picked up.
 - `-Reference <folder with f*.png>`: compare the pictures with apitrace's `snapdiff.py`; exit 1 on any difference
   above `-Fuzz` (0.05). Use it for plain against plain. For Remix pictures use the noise limit below.
 
@@ -102,19 +103,20 @@ Checks (exit 0 pass, 1 fail, 2 cannot check):
 
 Each prints one JSON line. Only `game_vs_replay.py` decides pass or fail by itself.
 
-## Noise limit (three stack replays of the same frames, 0 to 2,099)
+## Noise limit (four stack replays of the same frames, 0 to 2,099)
 
-Runs `runs\cust2-stack-f2099`, `runs\cust2-stack-f2099-b` and the first 2,100 frames of `runs\cust2-stack-f6419`:
+Runs `runs\cust2-stack-f2099`, `runs\cust2-stack-f2099-b`, `runs\cust2-stack-f2099-setup` and the first 2,100 frames
+of `runs\cust2-stack-f6419`, each against the first:
 
 - Proxy per-frame counts and cameras: 0 of 2,099 frames differ. Remix instances per frame: 0 of 2,100 differ.
 - Loading and menu pictures: equal to the last bit (37 of 37).
-- Level pictures (5): at most 331 of 3,686,400 pixels differ by more than 5 percent (first pair 211, 84, 25, 11, 0;
-  second pair 197, 331, 116, 2, 1; falling as Remix settles after the level appears); snapdiff precision 16.1
-  bits or better.
+- Level pictures (5): at most 615 of 3,686,400 pixels differ by more than 5 percent (first pair 211, 84, 25, 11, 0;
+  second pair 197, 331, 116, 2, 1; third pair 61, 615, 566, 168, 1); snapdiff precision 16.1 bits or better.
+  The largest count grew with each added run (211, 331, 615), so the true limit is not known yet.
 - For scale: the same level frames in plain against stack differ in 659,599 to 827,844 pixels, precision 8.4 to 8.9.
 
-So a change that moves fewer than a few hundred pixels cannot be told from noise with whole-picture counts. The
-limit is measured on the first 280 level frames only, not at a camera stop.
+So a change that moves fewer than about a thousand pixels cannot be told from noise with whole-picture counts.
+The limit is measured on the first 280 level frames only, not at a camera stop.
 
 ## Remix's own screenshot
 
