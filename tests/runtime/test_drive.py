@@ -1,6 +1,7 @@
 """Camera steering of drive.py against a fake game that, like Blacklist at gate frame rates, applies mouse input once
 per frame and one frame late. Run from this folder: python -m unittest test_drive (about 15 s, no game)."""
 import os
+import subprocess
 import tempfile
 import threading
 import time
@@ -9,6 +10,22 @@ from unittest import mock
 
 import drive
 import gate
+
+
+def game_in_use():
+    """True while a thread or Corey has the game or a replay runs. Two tests here open a real window and minimize it,
+    which takes the foreground; a full-screen original game that loses the foreground minimizes itself (Nov 19
+    06:46:52: a run of this file opened Notepad over a recording launch and its last camera stop was lost)."""
+    locks = (r"D:\BlacklistOverhaul\tools\remix\play-setup\AGENT_GAME_LOCK.txt",
+             r"D:\BlacklistOverhaul\experiments\GAME_IN_USE.txt")
+    if any(os.path.exists(p) for p in locks):
+        return True
+    running = subprocess.run(["tasklist", "/fo", "csv", "/nh"], capture_output=True, text=True).stdout.lower()
+    return any(name in running for name in ("blacklist_game.exe", "blacklist_dx11_game.exe", "blacklist_launcher.exe",
+                                            "nvremixbridge.exe", "d3dretrace.exe"))
+
+
+WINDOW_TEST_SKIP = "the game is in use: the real window this test opens would take the foreground from it"
 
 
 class FakeGame:
@@ -1293,6 +1310,8 @@ class Reference(unittest.TestCase):
         with mock.patch.object(drive, "tap") as typed:
             drive.quit_step(0, "ENTER")
             self.assertEqual(typed.call_args.args, ("ENTER",))
+        if game_in_use():
+            self.skipTest(WINDOW_TEST_SKIP)
         n = subprocess.Popen(["notepad.exe"])
         try:
             hwnd, deadline = 0, time.monotonic() + 10
@@ -1314,6 +1333,8 @@ class Reference(unittest.TestCase):
         # stands in for the frozen game. The restore came 2 s after the loss, before Windows marks a window frozen
         # (5 s; after that it shows a stand-in window and even a plain ShowWindow returns), so the first call is made
         # at once: it must not wait. The second, once Windows has marked it, must say the window was frozen.
+        if game_in_use():
+            self.skipTest(WINDOW_TEST_SKIP)
         import ctypes, subprocess, sys
         child = ("import ctypes, sys, time\n"
                  "u = ctypes.WinDLL('user32')\n"
