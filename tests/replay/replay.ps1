@@ -45,16 +45,20 @@ try {
         }
         if ($Lights) { Copy-Item -LiteralPath $Lights -Destination (Join-Path $stage 'd3d9_proxy_replay_lights.tsv') }
     }
+    # Every mode holds the game lock for the whole replay: a replay is a graphics-card job, and a game launch or
+    # another replay beside it would spoil both runs' timing.
+    $busy = @(Get-Process Blacklist_game, Blacklist_DX11_game, NvRemixBridge, d3dretrace -ErrorAction SilentlyContinue)
+    if ($busy.Count) { throw "$($busy[0].Name) is running: the graphics card is in use." }
+    foreach ($lock in $GameLock, 'D:\BlacklistOverhaul\experiments\GAME_IN_USE.txt') {
+        if (Test-Path -LiteralPath $lock) { throw "Someone else has the game: $(Get-Content -LiteralPath $lock -Raw)" }
+    }
     if ($Mode -eq 'stack') {
-        $busy = @(Get-Process Blacklist_game, Blacklist_DX11_game, NvRemixBridge -ErrorAction SilentlyContinue)
-        if ($busy.Count) { throw "$($busy[0].Name) is running: the graphics card is in use." }
-        foreach ($lock in $GameLock, 'D:\BlacklistOverhaul\experiments\GAME_IN_USE.txt') {
-            if (Test-Path -LiteralPath $lock) { throw "Someone else has the game: $(Get-Content -LiteralPath $lock -Raw)" }
-        }
         $cFreeMB = [int]((Get-PSDrive C).Free / 1MB)
         if ($cFreeMB -lt $MinCFreeMB) { throw "C: has $cFreeMB MB free, below $MinCFreeMB MB: Remix cannot start safely." }
-        New-Item -ItemType File -Path $GameLock -Value "replay.ps1 stack replay of $Trace, started $(Get-Date -Format 'HH:mm:ss')" | Out-Null
-        $tookLock = $true
+    }
+    New-Item -ItemType File -Path $GameLock -Value "replay.ps1 $Mode replay of $Trace, started $(Get-Date -Format 'HH:mm:ss')" | Out-Null
+    $tookLock = $true
+    if ($Mode -eq 'stack') {
         Copy-Item -LiteralPath (Join-Path $Remix 'pkg\d3d9.dll') -Destination (Join-Path $stage 'd3d9_remix.dll')
         Copy-Item -LiteralPath (Join-Path $Remix 'pkg\.trex') -Destination (Join-Path $stage '.trex') -Recurse
         Copy-Item -LiteralPath (Join-Path $Remix 'play-setup\bridge.conf') -Destination (Join-Path $stage '.trex\bridge.conf')
