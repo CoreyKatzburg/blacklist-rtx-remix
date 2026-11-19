@@ -416,6 +416,12 @@ def mouse_fire_burst(shots: int = 5, interval: float = 0.12) -> None:
         user32.SendInput(1, ctypes.byref(up), ctypes.sizeof(_INPUT))
         display.note_send()
         time.sleep(interval)
+def mouse_right(down: bool) -> None:
+    i = _INPUT(type=0, u=_INPUT_UNION(mi=_MOUSEINPUT(0, 0, 0, 0x0008 if down else 0x0010, 0, None)))
+    user32.SendInput(1, ctypes.byref(i), ctypes.sizeof(_INPUT))
+    display.note_send()
+
+
 def start_capture(path: str, frames: int = 0, fps: int = 30, seconds: float = 0.0) -> subprocess.Popen:
     """Primary monitor, scaled to 320x180 gray, raw; stops after `frames` frames or `seconds` seconds.
     gdigrab keeps working while the monitors sleep (ddagrab hangs)."""
@@ -2376,6 +2382,27 @@ class Spot:
                 w = self.window(f"goggles_{state}_{i}", "goggles_cycle", lambda: (tap(key), self.hold(seconds)), key=key)
                 w["proxyLogSaid"] = f"Goggles: {state}" in self.log.new_text()[mark:]
 
+    def aim_record(self, cfg: dict) -> None:
+        """spot "aimRecord" {"holdSeconds", "turnDeg", "turnSeconds", "shots", "afterSeconds"} (WKR-7, Nov 19, BLK-11:
+        laser smears, spikes and a beam left hanging after aiming): hold right mouse to aim, turn left and right by
+        turnDeg while aiming, fire, release, then hold still so a beam that outlives the aim shows. Each step is its
+        own window for the frame replay. That right mouse aims is unproven: aimTelemetry is left to the replay."""
+        hwnd = game_window(self.a.pid)
+        if hwnd:
+            front(hwnd)
+        y0, p0, d = self.yaw, self.pitch, float(cfg.get("turnDeg", 20.0))
+        turn = float(cfg.get("turnSeconds", 2.0))
+        mouse_right(True)
+        try:
+            self.window("aim_hold", "aim", lambda: self.hold(float(cfg.get("holdSeconds", 3.0))))
+            self.move("aim_turn_left", y0 + d, p0, turn)
+            self.move("aim_turn_right", y0 - d, p0, 2 * turn)
+            self.move("aim_turn_back", y0, p0, turn)
+            self.window("aim_fire", "aim", lambda: (mouse_fire_burst(int(cfg.get("shots", 3)), 0.3), self.hold(0.5)))
+        finally:
+            mouse_right(False)
+        self.window("aim_released", "aim_after", lambda: self.hold(float(cfg.get("afterSeconds", 6.0))))
+
     def _mean_shot(self, rel: str):
         p = os.path.join(self.out, rel)
         if not os.path.exists(p) or os.path.getsize(p) < CAP_W * CAP_H:
@@ -2838,6 +2865,8 @@ def main() -> int:
             s.reference_stills()
             if spot.get("gogglesRecord"):
                 s.goggle_cycles(spot["gogglesRecord"])
+            if spot.get("aimRecord"):
+                s.aim_record(spot["aimRecord"])
             if spot.get("lightSwitch"):
                 s.light_switch(spot["lightSwitch"])
             if spot.get("switchTest") and not a.no_remix and late:

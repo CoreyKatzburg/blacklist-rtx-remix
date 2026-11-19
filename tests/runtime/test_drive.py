@@ -710,6 +710,47 @@ class Reference(unittest.TestCase):
         self.assertEqual(windows[0]["proxyLogSaid"], True)
         self.assertEqual(windows[1]["proxyLogSaid"], False)
 
+    def test_aim_record_holds_right_mouse_through_the_turns_and_shots_and_releases_it(self):
+        # BLK-11 recording: the laser exists only while Sam aims, and a beam left after release is the fault.
+        s = drive.Spot.__new__(drive.Spot)
+        s.a = mock.Mock(pid=1)
+        s.yaw, s.pitch = 170.0, 0.0
+        events, windows = [], []
+        s.hold = lambda seconds, **k: events.append(("hold", seconds))
+        s.move = lambda name, yaw, pitch, seconds: (events.append(("move", yaw)), windows.append(name))
+
+        def window(name, kind, body, **k):
+            windows.append(name)
+            body()
+            return {"name": name, "kind": kind}
+        s.window = window
+        with mock.patch.object(drive, "mouse_right", lambda down: events.append(("right", down))), \
+                mock.patch.object(drive, "mouse_fire_burst", lambda n, i: events.append(("fire", n))), \
+                mock.patch.object(drive, "game_window", lambda pid: 0):
+            s.aim_record({"holdSeconds": 3, "turnDeg": 20, "shots": 3, "afterSeconds": 6})
+        self.assertEqual(windows, ["aim_hold", "aim_turn_left", "aim_turn_right", "aim_turn_back", "aim_fire", "aim_released"])
+        self.assertEqual(events[0], ("right", True))
+        self.assertEqual([e for e in events if e[0] == "move"], [("move", 190.0), ("move", 150.0), ("move", 170.0)])
+        i = events.index(("right", False))
+        self.assertLess(events.index(("fire", 3)), i)
+        self.assertEqual(events[i + 1:], [("hold", 6.0)])
+
+    def test_aim_record_releases_right_mouse_when_a_step_fails(self):
+        s = drive.Spot.__new__(drive.Spot)
+        s.a = mock.Mock(pid=1)
+        s.yaw, s.pitch = 0.0, 0.0
+        s.hold = lambda seconds, **k: None
+        s.window = lambda name, kind, body, **k: body()
+
+        def move(*a):
+            raise RuntimeError("pose lost")
+        s.move = move
+        right = []
+        with mock.patch.object(drive, "mouse_right", right.append), mock.patch.object(drive, "game_window", lambda pid: 0):
+            with self.assertRaises(RuntimeError):
+                s.aim_record({})
+        self.assertEqual(right, [True, False])
+
     def test_light_dump_never_asks_the_proxy_for_a_dump_in_a_recording_run(self):
         # The dump's device calls would land in the apitrace recording and break its stack replay (frame 4913).
         s = drive.Spot.__new__(drive.Spot)
