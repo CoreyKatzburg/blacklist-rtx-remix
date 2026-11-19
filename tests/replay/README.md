@@ -60,7 +60,8 @@ Arguments:
 
 The frame numbers of every camera stop are in `recordings\recording-20261119-064135\con_custodial\spot.json`
 (`windows`, field `proxy`). The game's own picture of each stop is beside it in `gate\<stop>_raster.pfm`.
-The light switch step is not in any recording yet.
+The light switch step alone: `20261119-083109-con_custodial_switch_rec-f0-6919.trace` with side folder
+`recordings\recording-20261119-083109\con_custodial_switch_rec` (window `light_switch`, frames 5,207 to 6,191).
 
 ## How to read the result
 
@@ -88,8 +89,13 @@ Checks (exit 0 pass, 1 fail, 2 cannot check):
   (with nothing to compare it exits 1).
 - `counts`: draws per frame equal to the game run's log. Same frame limit. Caught a planted fault (one draw taken
   from frame 4,000 of a copy: fails, names the frame).
-- `lamps`: only in proxy mode, so not usable now. It catches a lamp that was not recorded and a wrong list size.
-  It does not catch a missing picked lamp or an answer one frame late.
+- `lamps <recording spot folder> <Out>\proxy [<reference run>\proxy]`: the lamps and flares the proxy published to
+  Remix (stack mode, proxy build from commit a9890fd on; the default `build\d3d9.dll` predates it) against the
+  lists recorded in the game: counts of the list in force at each frame, an answer on every frame where the recorded
+  counts change, a wanted count equal to the node ids listed, only recorded lamps. With a reference run of the same
+  trace, also the same answers line for line. Planted faults (`lamp-planted\`): unrecorded lamp, wrong count, lamp
+  removed, answer late at the last frame and in mid run all fail. A lamp removed together with its count fails only
+  against a reference run. It reads what the proxy sent, not what Remix drew.
 
 ## Scoring tools (in this folder, run with the same python as the checks, after the replay has ended)
 
@@ -151,6 +157,13 @@ From a worktree that holds this branch and the launch fixes (`affe770`, `b7a2c8e
 - Check the device size before using a recording:
   `apitrace dump --calls=0-400 <trace> | findstr CreateDevice` must show `BackBufferWidth = 2560`.
 - Nobody may run the full `test_drive.py` or a build during the launch (see CREW.md).
+- Nothing may call the game's device from our side during a recording: apitrace sits below the proxy and records
+  every call as the game's. The proxy's light and draw dump (`[Proxy] CaptureDraws`) did, and the stack replay of
+  that recording crashed on the dump frame while plain replay ran through. Since commit 5daebb2 a recording launch
+  takes no dump; the side file holds the lamps of every frame anyway. In a stack run's `retrace.log`, "unexpected
+  object destruction" warnings mean the trace holds such calls.
+- Short spots made for recording (switchOnly, no sweep): `con_custodial_switch_rec`, `con_custodial_goggles_rec`,
+  `con_bright_hall_rec`, `con_boiler_rec` in `tests\runtime\spots.json`.
 
 ## Replaying a short frame range
 
@@ -176,17 +189,16 @@ Set by the environment variable `BLPROXY_REPLAY=1` (`replay.ps1` sets it). The g
 | The game's loop timer patch (0x006FE4B7) and the texture stream budget write | not applied: no game memory is read or written |
 | The game's folder for its ini, log and the Remix DLL | the folder of the proxy DLL (apitrace's replay program reports the game's exe path as its own) |
 
-`BLPROXY_REPLAY_SIZE=<width>x<height>` (replay only, not committed, build in `experiments\replay-rig\build-size`)
-makes the device another size than recorded. Tried once on the 3840x2160 recording: the replay ran, but Remix did
-not ray trace. Do not use it for results.
+`BLPROXY_REPLAY_SIZE=<width>x<height>` (replay only, never committed; its build and patch were deleted on Nov 19)
+made the device another size than recorded. Tried once on the 3840x2160 recording: the replay ran, but Remix did
+not ray trace.
 
 ## What the rig cannot show
 
 - Frame times (see State).
 - Anything where the game reacts to our stack: which flares it draws after its occlusion queries, which formats it
   picks from device caps, streaming choices. Real input and mouse lag. Quitting.
-- Whether lamps and flares reach Remix as recorded: recorded and loaded, but no check reads them in stack mode yet.
-- The light switch step: not recorded yet.
+- Whether Remix drew the lamps the proxy published: `lamps` reads the proxy's side only.
 
 ## Test program
 
