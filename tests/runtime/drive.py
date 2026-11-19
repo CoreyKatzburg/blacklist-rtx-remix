@@ -201,6 +201,17 @@ def write_ini(path: str, text: str) -> None:
 user32 = ctypes.WinDLL("user32", use_last_error=True) if os.name == "nt" else None
 
 
+def pick_game_window(windows: list[tuple[int, str]]) -> int:
+    """The game's own window among its visible top-level windows, given as (handle, class name) in z order; 0 for
+    none. Windows' Direct3D 9 keeps a helper window of class D3DProxyWindow in a full-screen game's process, on
+    another thread. Bringing that one to the front takes the focus from the game's window, and a full-screen game
+    that loses the focus minimizes itself: it stops drawing the level and ignores the mouse (Nov 19, 01:49 and 04:55:
+    "mouse calibration on x is inconsistent: counts per degree []" in two launches of the original game). It is
+    taken only when the game shows no other window."""
+    own = [h for h, cls in windows if cls != "D3DProxyWindow"]
+    return own[0] if own else windows[0][0] if windows else 0
+
+
 def game_window(pid: int) -> int:
     found = []
     proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
@@ -209,10 +220,12 @@ def game_window(pid: int) -> int:
         owner = ctypes.c_ulong()
         user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(owner))
         if owner.value == pid and user32.IsWindowVisible(ctypes.c_void_p(hwnd)):
-            found.append(hwnd)
+            cls = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(ctypes.c_void_p(hwnd), cls, 64)
+            found.append((hwnd, cls.value))
         return True
     user32.EnumWindows(proc(cb), None)
-    return found[0] if found else 0
+    return pick_game_window(found)
 
 
 def front(hwnd: int) -> bool:

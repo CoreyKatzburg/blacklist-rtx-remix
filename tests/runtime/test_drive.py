@@ -74,6 +74,13 @@ def make_spot(game: FakeGame, counts_per_deg_x: float, counts_per_deg_y: float) 
 
 
 class Steering(unittest.TestCase):
+    def test_game_window_is_never_the_direct3d_helper(self):
+        game, helper = (0xD60FAA, "BlacklistUnrealWWindowsViewportWindow"), (0x3F0F66, "D3DProxyWindow")
+        self.assertEqual(drive.pick_game_window([game, helper]), game[0])
+        self.assertEqual(drive.pick_game_window([helper, game]), game[0])   # the helper first in z order (Nov 19)
+        self.assertEqual(drive.pick_game_window([helper]), helper[0])       # nothing else to take: as before
+        self.assertEqual(drive.pick_game_window([]), 0)
+
     def run_with(self, fps, true_x, true_y, believed_x, believed_y):
         self.game = FakeGame(fps, true_x, true_y)
         self.addCleanup(self.game.stop)
