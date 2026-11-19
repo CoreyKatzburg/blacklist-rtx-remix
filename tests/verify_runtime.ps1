@@ -48,8 +48,16 @@
 # keys need the game window in front, which this script does itself.
 param([string[]]$Spots = @(), [switch]$DryRun, [string]$CaptureCheckpoint = '', [switch]$Launch, [string]$Evaluate = '', [switch]$SkipInstall, [string]$SaveFrom = '',
       [string]$Previous = '', [string]$Reference = '', [switch]$NoRemix, [string]$Variants = '', [string]$RestoreFrom = '',
-      [string]$SuiteNote = '', [string[]]$IniKeys = @())
+      [string]$SuiteNote = '', [string[]]$IniKeys = @(), [switch]$Record)
 $ErrorActionPreference = 'Stop'
+# -Record -Spots <one spot>: a recording for the frame replay rig (tests\replay). The original game as in -NoRemix,
+# but the proxy chains the apitrace recorder ($RecorderDll, the one file drive.py accepts as a recorder), which
+# writes every Direct3D 9 call to $TraceDir\<stamp>-<spot>.trace, and the proxy writes its side recording (camera
+# uploads, decal draws, lamps, flares; [Replay] Record=1) into the spot folder. The run folder is recording-<stamp>
+# with recording.json, never reference-<stamp>, so no later run can take it for a reference; it is not gated.
+$RecorderDll = 'D:\BlacklistOverhaul\experiments\replay-rig\tools\apitrace-14.0-win32\lib\wrappers\d3d9.dll'
+$TraceDir = 'D:\BlacklistOverhaul\experiments\replay-rig\traces'
+if ($Record) { $NoRemix = $true }
 $Tests = $PSScriptRoot
 $Runtime = Join-Path $Tests 'runtime'
 $Py = 'D:\BlacklistOverhaul\tools\upscalers\py314\Scripts\python.exe'
@@ -209,7 +217,7 @@ function Remove-OwnPlayLock([string]$path, [datetime]$since) {
 # midnight); the lock is removed only by Remove-OwnPlayLock's rule against that time.
 function Remove-RunPlayLock([string]$path, [string]$runDir) {
     # No-Remix runs are named reference-<stamp> (Nov 18 00:04: 233607's lock stayed and was removed by hand).
-    if ((Split-Path -Leaf $runDir) -notmatch '^(?:reference-)?(\d{8})-(\d{6})') { return $false }
+    if ((Split-Path -Leaf $runDir) -notmatch '^(?:reference-|recording-)?(\d{8})-(\d{6})') { return $false }
     $day = $Matches[1]; $runStart = [datetime]::ParseExact("$day$($Matches[2])", 'yyyyMMddHHmmss', $null)
     $starts = @(Get-ChildItem -LiteralPath $runDir -Filter 'play-*.log' -File -ErrorAction SilentlyContinue |
         Where-Object Name -match '^play-(\d{6})\.log$' | ForEach-Object {
@@ -618,8 +626,16 @@ if ($Variants) {
     $sweep = Get-Content $Variants -Raw | ConvertFrom-Json
     $Spots = @($sweep.spot)
 }
-$runDir = Join-Path $ResultsRoot $(if ($NoRemix) { "reference-$Stamp" } elseif ($sweep) { "$Stamp-settings" } else { $Stamp })
+$runDir = Join-Path $ResultsRoot $(if ($Record) { "recording-$Stamp" } elseif ($NoRemix) { "reference-$Stamp" } elseif ($sweep) { "$Stamp-settings" } else { $Stamp })
 if ($NoRemix -and $CaptureCheckpoint) { throw '-NoRemix records the reference at existing spots; capture checkpoints with Remix.' }
+$modeNote = if ($Record) { 'recording.json' } else { 'reference.json' }
+if ($Record) {
+    if ($Spots.Count -ne 1) { throw '-Record records one spot per run: -Record -Spots <name>.' }
+    if (-not (Test-Path -LiteralPath $RecorderDll)) { throw "The apitrace recorder is missing: $RecorderDll" }
+    $RecordTrace = Join-Path $TraceDir "$Stamp-$($Spots[0]).trace"
+    New-Item -ItemType Directory -Force $TraceDir | Out-Null
+    $IniKeys = @("Proxy.ChainDll=$RecorderDll", 'Replay.Record=1', "Replay.TraceFile=$RecordTrace") + $IniKeys
+}
 # rtx.conf for one sweep variant: each key's line replaced, or appended when the baseline does not set it.
 function Set-RtxKeys($text, $keys) {
     foreach ($p in @(if ($keys) { $keys.PSObject.Properties })) {
@@ -780,7 +796,7 @@ $suite = [ordered]@{ note = $SuiteNote; record = $suiteRec; testsCommit = (git -
                      testsModified = $testsModified }
 $iniItems = @(ConvertFrom-IniKeyArg $IniKeys)
 @{ spots = @($selected | ForEach-Object name); started = $Stamp; noRemix = [bool]$NoRemix; build = $build; offlineSuite = $suite
-   variants = @(if ($sweep) { $runs | ForEach-Object dir }); iniKeys = @($IniKeys) } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $runDir 'manifest.json')
+   variants = @(if ($sweep) { $runs | ForEach-Object dir }); iniKeys = @($IniKeys); recording = [bool]$Record } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $runDir 'manifest.json')
 Write-Step "Builds: dxvk-remix installed $remixCommit (source checkout $remixSourceCommit), proxy $($build.proxySha256.Substring(0, 12))"
 Write-Step $suiteRec.line
 
@@ -811,9 +827,12 @@ try {
         $gateIni = Get-NoRemixIni $gateIni
         @{ how = 'proxy kept, chained to Windows d3d9 with every rewrite off; written to play-setup\d3d9_proxy.ini and the game folder copy for this run only'
            proxyKeys = $NoRemixProxyKeys; lights = @{ Enable = 0 }; ini = $gateIni
-           check = 'drive.py fails a spot unless the proxy log says this game process chained \Windows\SysWOW64\d3d9.dll (spot.json renderer); the load wait throws if Remix or NvRemixBridge loads'
+           check = $(if ($Record) { "drive.py fails the spot unless the proxy log says this game process chained $RecorderDll (spot.json renderer 'recorder')" }
+                     else { 'drive.py fails a spot unless the proxy log says this game process chained \Windows\SysWOW64\d3d9.dll (spot.json renderer); the load wait throws if Remix or NvRemixBridge loads' })
+           recording = $(if ($Record) { [ordered]@{ note = 'a recording for the frame replay rig, drawn through the apitrace recorder: not a reference'
+                                                    recorder = $RecorderDll; trace = $RecordTrace; iniKeys = @($IniKeys) } })
            restore = 'both ini copies are written back from the backups taken at the start; see restored below' } |
-            ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDir 'reference.json')
+            ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDir $modeNote)
     }
     $gateIni = Set-IniKeys $gateIni $IniKeys
     if ($iniItems.Count) {
@@ -921,7 +940,7 @@ try {
             ConvertTo-SpotJson $spot | Set-Content (Join-Path $spotDir 'spot_config.json')
             $driveArgs = @((Join-Path $Runtime 'drive.py'), 'spot', '--pid', $game.Id) + $hashArgs + @(
                 '--spot', (Join-Path $spotDir 'spot_config.json'), '--checkpoint', (Join-Path $cp 'checkpoint.json'),
-                '--system', $S, '--root', $Root, '--out', $spotDir) + @(if ($NoRemix) { '--no-remix' })
+                '--system', $S, '--root', $Root, '--out', $spotDir) + @(if ($NoRemix) { '--no-remix' }) + @(if ($Record) { '--recording' })
             $drive = Start-Process $Py -ArgumentList ($driveArgs | ForEach-Object { '"' + $_ + '"' }) -NoNewWindow -PassThru `
                 -RedirectStandardOutput (Join-Path $spotDir 'drive.log') -RedirectStandardError (Join-Path $spotDir 'drive.err')
             if (-not $drive.WaitForExit(40 * 60 * 1000)) { $drive.Kill(); Write-Step "$($spot.name): drive.py timed out (40 min)" }
@@ -992,22 +1011,36 @@ try {
     # lock goes last. Before the backups exist nothing was changed, so there is nothing to put back.
     try { Stop-Game } catch { $putBackFailed += "closing the game: $($_.Exception.Message)" }
     if (Test-Path (Join-Path $runDir 'file-backup\restore.json')) { $putBackFailed += @(Restore-AfterRun $runDir) }
-    if ($NoRemix -and (Test-Path (Join-Path $runDir 'reference.json'))) { try {
-        $note = Get-Content (Join-Path $runDir 'reference.json') -Raw | ConvertFrom-Json
+    if ($Record) { try {   # the game is closed: the proxy's side recording goes beside the spot's other files
+        foreach ($f in 'd3d9_proxy_replay_calls.csv', 'd3d9_proxy_replay_lights.bin') {
+            if (Test-Path -LiteralPath "$S\$f") { Move-Item -LiteralPath "$S\$f" (Join-Path (Join-Path $runDir $Spots[0]) $f) -Force }
+        }
+    } catch { $putBackFailed += "moving the side recording: $($_.Exception.Message)" } }
+    if ($NoRemix -and (Test-Path (Join-Path $runDir $modeNote))) { try {
+        $note = Get-Content (Join-Path $runDir $modeNote) -Raw | ConvertFrom-Json
         $note | Add-Member restored ([ordered]@{
             setupIniAsBefore = ([IO.File]::ReadAllText($setupIniPath) -eq $setupIniBackup)
             gameIniAsBefore  = ([IO.File]::ReadAllText("$S\d3d9_proxy.ini") -eq $(if ($SkipInstall) { $iniBackup } else { $setupIniBackup }))
             playMismatches   = @(Get-PlayMismatches); launcherApi = (Get-StartupApi) }) -Force
-        $note | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDir 'reference.json')
+        $note | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDir $modeNote)
         Write-Step "Remix settings put back: $(($note.restored | ConvertTo-Json -Compress))"
     } catch { Write-Step "Could not record the restore check: $($_.Exception.Message)" } }
     Show-PutBackFailures $putBackFailed
     if ($putBackFailed.Count) { Write-Step "Put the rest back with: verify_runtime.ps1 -RestoreFrom $runDir" }
     Remove-Item -LiteralPath $GameLock -ErrorAction SilentlyContinue
 }
-if ($putBackFailed.Count -and -not $sweep -and -not $CaptureCheckpoint) { [void](Gate $runDir); exit 3 }
+if ($putBackFailed.Count -and -not $sweep -and -not $CaptureCheckpoint -and -not $Record) { [void](Gate $runDir); exit 3 }
 if ($putBackFailed.Count) { exit 3 }
 if ($CaptureCheckpoint) { exit 0 }
+if ($Record) {   # a recording is not gated: the replay rig's own checks (tests\replay) decide what it is good for
+    $spotDir = Join-Path $runDir $Spots[0]
+    $have = [ordered]@{ trace = $RecordTrace; traceMB = $(if (Test-Path -LiteralPath $RecordTrace) { [int]((Get-Item -LiteralPath $RecordTrace).Length / 1MB) } else { 0 })
+                        calls = (Test-Path (Join-Path $spotDir 'd3d9_proxy_replay_calls.csv')); lights = (Test-Path (Join-Path $spotDir 'd3d9_proxy_replay_lights.bin'))
+                        renderer = $(try { (Get-Content (Join-Path $spotDir 'spot.json') -Raw | ConvertFrom-Json).renderer.kind } catch { $null }) }
+    "Recording: $($have | ConvertTo-Json -Compress)"
+    "Result: $runDir"
+    exit $(if ($have.traceMB -and $have.calls -and $have.renderer -eq 'recorder') { 0 } else { 1 })
+}
 if ($sweep) {   # numbers for the requester to weigh, not a pass/fail
     & $Py (Join-Path $Runtime 'settings_report.py') $runDir | Out-Host
     "Result: $(Join-Path $runDir 'settings.md')"

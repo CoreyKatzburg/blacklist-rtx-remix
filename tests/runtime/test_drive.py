@@ -2058,6 +2058,27 @@ class Reference(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no 'chained"):          # another process's line does not count
             drive.check_renderer(drive.chained_dll(log, 1234), no_remix=True)
 
+    def test_recorder_is_one_named_file(self):
+        def line(path):
+            return drive.chained_dll(f"2026-11-19 01:40:00.000 [pid 7] chained INI DLL: {path}\r\n", 7)
+        rec = drive.RECORDER_DLL
+        self.assertEqual(drive.check_renderer(line(rec), no_remix=True, recording=True), "recorder")
+        self.assertEqual(drive.check_renderer(line(rec.upper().replace("\\", "/")), no_remix=True, recording=True), "recorder")
+        with self.assertRaisesRegex(RuntimeError, "needs Windows d3d9"):   # a recording can never pass as a reference
+            drive.check_renderer(line(rec), no_remix=True)
+        with self.assertRaisesRegex(RuntimeError, "needs Remix"):
+            drive.check_renderer(line(rec), no_remix=False)
+        # planted faults: any other DLL in a folder named SysWOW64 is refused, as a recorder and as Windows' own
+        fake = r"D:\BlacklistOverhaul\experiments\replay-rig\tools\apitrace-chain\SysWOW64\d3d9.dll"
+        with self.assertRaisesRegex(RuntimeError, "needs the apitrace recorder"):
+            drive.check_renderer(line(fake), no_remix=True, recording=True)
+        with self.assertRaisesRegex(RuntimeError, "needs Windows d3d9"):
+            drive.check_renderer(line(fake), no_remix=True)
+        with self.assertRaisesRegex(RuntimeError, "needs the apitrace recorder"):   # Windows' own is not a recording
+            drive.check_renderer(line(r"C:\Windows\SysWOW64\d3d9.dll"), no_remix=True, recording=True)
+        with self.assertRaisesRegex(RuntimeError, "needs the apitrace recorder"):   # the 64-bit recorder, another file
+            drive.check_renderer(line(rec.replace("win32", "win64")), no_remix=True, recording=True)
+
     def test_calibration_spread_is_looser_only_without_remix(self):
         # Paladin, Nov 16, no Remix (~178 FPS): counts per degree 45 to 69 between moves. 1.6x must pass a reference
         # run and still fail a Remix run; 2.5x fails both.

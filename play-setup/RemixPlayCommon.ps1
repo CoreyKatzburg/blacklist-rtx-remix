@@ -23,7 +23,9 @@ $SteamGameUrl = 'steam://rungameid/235600'
 # Original exe, and the same exe with the Large Address Aware flag set (one header byte, 2026-10-26).
 $GameExeHashes = @('158EFC5D0940FCAF3E4B16952C8F8861E16061509D9EB8EB5FF4AE3249BB5A05', 'EF8088D6676310F4B1DA2958C76524EE748B0043DE4B795254ECBBCEB5B77540')
 # Camera proxy: verified d3d9.dll SHA-256 (2026-11-17, tools\remix cfc5090 per-query trace and present grabs off unless asked (worker B X3), built from cfc5090 with its sources clean).
-$ProxyHash = 'FB9BCD1C53CD9F8BAE2E9939C0ED2CB6E3E424D8ED3488B48FB7CA4EF7DB5343'
+# Branch wkr7-replay-rig only (WKR-7, Nov 19): the proxy built from this branch at d3eeec4 (side recording for the
+# frame replay rig), so a launch from this worktree installs it. The installed build on master is FB9BCD1C...5343.
+$ProxyHash = '76A68E8F64237D5F6F320CDF04770E54279CEFBCE1FAAB76A8BBA0D78276E70B'
 # Proxy build that sits disabled as d3d9.dll.off when Remix is off.
 $RestingProxyHash = '593F0D47E95DDB768EC087636FA78E07FADBB600BD6EBB617D7714D4ADD2C18E'
 

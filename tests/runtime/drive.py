@@ -534,17 +534,26 @@ def chained_dll(log_text: str, pid: int) -> tuple[str, str] | None:
     return (found[-1][0], found[-1][1].strip()) if found else None
 
 
-def check_renderer(chained: tuple[str, str] | None, no_remix: bool) -> str:
-    """'remix' or 'system' for the chained DLL; raises when it is not the one this run is meant to measure, so a
-    no-Remix reference can never be recorded through Remix (or a Remix run through the plain driver)."""
+# The apitrace recorder of the frame replay rig (tests\replay): a recording run chains this one file and no other.
+RECORDER_DLL = r"D:\BlacklistOverhaul\experiments\replay-rig\tools\apitrace-14.0-win32\lib\wrappers\d3d9.dll"
+
+
+def check_renderer(chained: tuple[str, str] | None, no_remix: bool, recording: bool = False) -> str:
+    """'remix', 'system' or 'recorder' for the chained DLL; raises when it is not the one this run is meant to
+    measure, so a no-Remix reference can never be recorded through Remix (or a Remix run through the plain driver).
+    'system' is Windows' own d3d9.dll by its full path, 'recorder' is RECORDER_DLL by its full path: a d3d9.dll in
+    some other folder named SysWOW64 is neither. A recording run (verify_runtime.ps1 -Record) needs the recorder,
+    and no other run may draw through it, so a recording can never pass as a reference."""
     if not chained:
         raise RuntimeError("the proxy log has no 'chained ... DLL' line for this game process")
     path = chained[1].replace("/", "\\").lower()
-    kind = "system" if path.endswith(("\\syswow64\\d3d9.dll", "\\system32\\d3d9.dll")) else \
+    windows = os.environ.get("SystemRoot", r"C:\Windows").lower()
+    kind = "recorder" if path == RECORDER_DLL.lower() else \
+        "system" if path in (windows + "\\syswow64\\d3d9.dll", windows + "\\system32\\d3d9.dll") else \
         "remix" if path.endswith("\\d3d9_remix.dll") else "unknown"
-    if kind != ("system" if no_remix else "remix"):
+    if kind != ("recorder" if recording else "system" if no_remix else "remix"):
         raise RuntimeError(f"the game drew through {chained[1]} ({chained[0]}); this run needs "
-                           f"{'Windows d3d9 (no Remix)' if no_remix else 'Remix'}")
+                           f"{'the apitrace recorder ' + RECORDER_DLL if recording else 'Windows d3d9 (no Remix)' if no_remix else 'Remix'}")
     return kind
 
 
@@ -2669,6 +2678,8 @@ def main() -> int:
     ap.add_argument("--exe-hash", action="append", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--spot"); ap.add_argument("--checkpoint"); ap.add_argument("--system"); ap.add_argument("--root")
+    ap.add_argument("--recording", action="store_true", help="recording run (with --no-remix): the proxy chains "
+                    "the apitrace recorder RECORDER_DLL, which writes the trace the frame replay rig replays")
     ap.add_argument("--no-remix", action="store_true", help="reference run: the proxy chains Windows' d3d9; each still "
                     "stop saves <tag>_raster.pfm instead of asking Remix for dumps; no switch test or goggle check")
     a = ap.parse_args()
@@ -2698,7 +2709,7 @@ def main() -> int:
             "error": f"drive.py did not finish: this record was written after window {len(s.windows)}"})
         with open(os.path.join(a.system, "d3d9_proxy.log"), encoding="latin-1") as f:
             chained = chained_dll(f.read(), a.pid)
-        result["renderer"] = {"chained": list(chained) if chained else None, "kind": check_renderer(chained, a.no_remix)}
+        result["renderer"] = {"chained": list(chained) if chained else None, "kind": check_renderer(chained, a.no_remix, getattr(a, "recording", False))}
         where = s.game.map_name(s.controller)
         if where != cp["map"]:
             raise RuntimeError(f"loaded map {where!r}, checkpoint was recorded in {cp['map']!r}")
