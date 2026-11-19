@@ -8,11 +8,15 @@
       (d3d9_proxy_frames.csv: source, draws before, skipped, position, forward) equal those of the recording run.
   check_replay.py lights <light dump .tsv> <replay run>\\proxy
       The proxy would publish the lamps the dump marks wanted=1 (d3d9_proxy_replay_lights_check.csv).
+  check_replay.py lamps <recording folder> <replay run>\\proxy
+      The proxy read the lamp recording in step: each answer in d3d9_proxy_replay_lights_check.csv has the lamp and
+      flare counts of the recorded list in force at that frame (d3d9_proxy_replay_lights.bin), and only lamps of it.
   check_replay.py counts <recording folder> <replay run>\\proxy
       Stack replay against the live recording run: draws per frame in both d3d9_proxy_frames.csv files are equal.
 """
 import json
 import os
+import struct
 import sys
 
 
@@ -98,8 +102,45 @@ def lights(dump, replay):
             "answersDiffering": bad, "first": first, "pass": lines > 0 and len(wanted) > 0 and bad == 0}
 
 
+def lamps(recording, replay):
+    blocks = []   # (frame, lamp count, flare count, lamp node ids), in file order
+    with open(find(recording, "d3d9_proxy_replay_lights.bin"), "rb") as f:
+        while True:
+            head = f.read(16)
+            if len(head) < 16:
+                break
+            magic, frame, light_count, flare_count = struct.unpack("<4I", head)
+            if magic != 0x4C524C42:
+                raise ValueError(f"bad block header at byte {f.tell() - 16}")
+            body = f.read(light_count * 224)
+            if len(body) < light_count * 224:
+                break
+            f.seek(flare_count * 56, 1)
+            blocks.append((frame, light_count, flare_count, {struct.unpack_from("<I", body, i * 224)[0] for i in range(light_count)}))
+    lines = bad = 0
+    first = []
+    at = 0
+    with open(find(replay, "d3d9_proxy_replay_lights_check.csv"), encoding="utf-8") as f:
+        for line in f:
+            frame, seen, count, flares, stand_ins, nodes = line.rstrip("\r\n").split(",")
+            frame = int(frame)
+            while at + 1 < len(blocks) and blocks[at + 1][0] <= frame:
+                at += 1
+            lines += 1
+            got = {int(n, 16) for n in nodes.split()}
+            block = blocks[at] if blocks and blocks[at][0] <= frame else (None, 0, 0, set())
+            if int(seen) != block[1] or int(flares) != block[2] or not got <= block[3]:
+                bad += 1
+                if len(first) < 5:
+                    first.append({"frame": frame, "seen": int(seen), "recordedLamps": block[1], "flares": int(flares),
+                                  "recordedFlares": block[2], "recordedAtFrame": block[0],
+                                  "notInRecording": sorted(f"{n:08X}" for n in got - block[3])[:8]})
+    return {"check": "lamps", "recordedLists": len(blocks), "replayAnswers": lines, "answersDiffering": bad, "first": first,
+            "pass": lines > 0 and len(blocks) > 0 and bad == 0}
+
+
 def main(argv):
-    checks = {"step": (step, 1), "camera": (camera, 2), "lights": (lights, 2), "counts": (counts, 2)}
+    checks = {"step": (step, 1), "camera": (camera, 2), "lights": (lights, 2), "lamps": (lamps, 2), "counts": (counts, 2)}
     if len(argv) < 2 or argv[1] not in checks or len(argv) != 2 + checks[argv[1]][1]:
         print(__doc__)
         return 2
