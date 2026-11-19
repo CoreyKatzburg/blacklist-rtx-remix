@@ -53,10 +53,12 @@ $ErrorActionPreference = 'Stop'
 # -Record -Spots <one spot>: a recording for the frame replay rig (tests\replay). The original game as in -NoRemix,
 # but the proxy chains the apitrace recorder ($RecorderDll, the one file drive.py accepts as a recorder), which
 # writes every Direct3D 9 call to $TraceDir\<stamp>-<spot>.trace, and the proxy writes its side recording (camera
-# uploads, decal draws, lamps, flares; [Replay] Record=1) into the spot folder. The run folder is recording-<stamp>
-# with recording.json, never reference-<stamp>, so no later run can take it for a reference; it is not gated.
+# uploads, decal draws, lamps, flares; [Replay] Record=1) into the spot folder. The run folder is
+# $RecordingDir\recording-<stamp> with recording.json: outside $ResultsRoot and never named reference-<stamp>, so no
+# later run can take it for a reference; it is not gated.
 $RecorderDll = 'D:\BlacklistOverhaul\experiments\replay-rig\tools\apitrace-14.0-win32\lib\wrappers\d3d9.dll'
 $TraceDir = 'D:\BlacklistOverhaul\experiments\replay-rig\traces'
+$RecordingDir = 'D:\BlacklistOverhaul\experiments\replay-rig\recordings'
 if ($Record) { $NoRemix = $true }
 $Tests = $PSScriptRoot
 $Runtime = Join-Path $Tests 'runtime'
@@ -626,7 +628,7 @@ if ($Variants) {
     $sweep = Get-Content $Variants -Raw | ConvertFrom-Json
     $Spots = @($sweep.spot)
 }
-$runDir = Join-Path $ResultsRoot $(if ($Record) { "recording-$Stamp" } elseif ($NoRemix) { "reference-$Stamp" } elseif ($sweep) { "$Stamp-settings" } else { $Stamp })
+$runDir = if ($Record) { Join-Path $RecordingDir "recording-$Stamp" } else { Join-Path $ResultsRoot $(if ($NoRemix) { "reference-$Stamp" } elseif ($sweep) { "$Stamp-settings" } else { $Stamp }) }
 if ($NoRemix -and $CaptureCheckpoint) { throw '-NoRemix records the reference at existing spots; capture checkpoints with Remix.' }
 $modeNote = if ($Record) { 'recording.json' } else { 'reference.json' }
 if ($Record) {
