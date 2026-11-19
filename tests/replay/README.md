@@ -1,86 +1,192 @@
 # Frame replay rig
 
-Record the game's Direct3D 9 calls once with apitrace. Play them back with no Steam and no game process.
+Record the game's Direct3D 9 calls once with apitrace. Play them back with no Steam and no game process, through
+Windows' own Direct3D 9 (the original game's picture) or through our proxy, the Remix bridge and Remix.
 
-State on Nov 19, 01:10 ET: the tools, the proxy replay mode and the picture compare work on a small test program.
-No game scene is recorded yet. Nothing has gone through Remix yet. Lines marked "not run yet" are untested.
+## State (Nov 19, 07:30 ET): which mode is proven on what
 
-## What is where
+- **stack (proxy + bridge + Remix): works on the 06:41 recording at 2560x1440.** Three runs: two of frames 0 to
+  2,099 and one of frames 0 to 6,419. Remix ray traced every level frame (280, 280 and 4,600), one Remix frame per
+  recorded frame, never fell behind, never ran out of video memory. The runs agree: see "Noise limit".
+- **The saved stack pictures are Remix's picture (one run).** Remix's own screenshot of frame 6,350 against the
+  saved picture of that frame: 78,450 of 3,686,400 pixels differ by more than 5 percent (mean difference 1.5 of
+  255). Against the plain picture of the same frame: 2,872,572 pixels. See "Remix's own screenshot".
+- **Faithful to the game on frames 2,282 to 6,419 (one run).** Cameras and draw counts equal the game run's log on
+  4,138 of 4,138 frames, in step on 6,420 of 6,420.
+- **plain (Windows' Direct3D 9): works, and shows the game's picture (one stop).** Plain frame 6,350 against the
+  game's own screen grab at the first camera stop: 31,201 of 3,686,400 pixels differ by more than 5 percent,
+  precision 11.97 bits, mean brightness 32.03 against 32.06 of 255 (no brightness curve difference shows). The
+  game's grabs of two other stops against the same frame fail (5.8 and 5.07 bits). Two plain runs of the same
+  frames are equal to the last bit (42 of 42 pictures).
+- **proxy (proxy chained to Windows' Direct3D 9): does not cover level frames. Do not spend replays on it.** The
+  pictures come out, but the proxy's own files stop at the first level frame (three runs, two proxy builds). Cause
+  not found. Stack mode walks the proxy through every frame, so use stack mode.
+- **Timing is not faithful.** A level frame takes 77 to 89 ms in replay (median of each run) against about 36 ms in
+  a live launch at the same spot and size (GPU time is close: 36 to 40 against 35 ms). Each saved picture also costs
+  about 0.3 s on the next frame. Use the rig for pictures and counts. Frame times stay on live launches.
+- **Record at 2560x1440.** The 01:45 recording made its device at 3840x2160 (cause unknown). Remix ran out of
+  video memory on it and fell far behind. It is retired for stack mode and for pictures.
 
-- Tools (not in git): `D:\BlacklistOverhaul\experiments\replay-rig\tools\apitrace-14.0-win32` (apitrace 14.0, MIT,
-  from github.com/apitrace/apitrace releases).
-- Recordings and run folders (not in git): `D:\BlacklistOverhaul\experiments\replay-rig\` (`runs\`, `smoke\`).
-- Proxy with replay mode: built from this branch into `experiments\replay-rig\build\d3d9.dll`. The installed proxy in
-  `play-setup\` has no replay mode.
-- `replay.ps1`: the one command. `smoke\tri.cpp`: the test program (a turning triangle).
+## One command
 
-## Record (needs one game launch, monitors on) - not run yet
+    powershell -NoProfile -ExecutionPolicy Bypass -File D:\BlacklistOverhaul\experiments\replay-rig\remix-wkr7\tests\replay\replay.ps1 -Mode stack -Trace D:\BlacklistOverhaul\experiments\replay-rig\traces\20261119-064135-con_custodial-f0-2099.trace -Side D:\BlacklistOverhaul\experiments\replay-rig\recordings\recording-20261119-064135\con_custodial -SnapshotInterval 50 -Out <your run folder>
 
-The game is recorded as the original game: our proxy stays loaded but passes every call on unchanged (the existing
-`-NoRemix` launch), and apitrace sits between the proxy and Windows' Direct3D 9.
+About 90 seconds. It takes the shared game lock by itself for the whole run and refuses while anyone has the game.
+Run the display check first (`experiments\wkr-9-scratch\overnight_display_check.py` must say OK): Remix opens a window.
 
-    powershell -NoProfile -ExecutionPolicy Bypass -File D:\BlacklistOverhaul\tools\remix\tests\verify_runtime.ps1 -NoRemix -Spots con_custodial -IniKeys "Proxy.ChainDll=D:\BlacklistOverhaul\experiments\replay-rig\tools\apitrace-chain\SysWOW64\d3d9.dll"
+Arguments:
 
-Things to know before running it:
+- `-Mode plain|proxy|stack`.
+- `-Trace`: the recording. `-Side`: the spot folder of the same recording (camera, decals, lamps, flares by frame).
+  Without `-Side` Remix gets no camera.
+- `-SnapshotInterval N`: save a picture every N frames (1 = every frame, slow).
+- `-Proxy <d3d9.dll>`: your proxy build. It must have replay mode (built from this branch or a branch that holds
+  commits 6153aec and d3eeec4). Default: `experiments\replay-rig\build\d3d9.dll`.
+- `-Setup <play-setup folder>`: take `d3d9_proxy.ini`, `rtx.conf` and `bridge.conf` from your worktree's
+  `play-setup` instead of the installed ones. The Remix runtime always comes from `tools\remix\pkg`. Only the
+  default (the installed folder) has been run; a worktree folder has not been tried yet.
+- `-Reference <folder with f*.png>`: compare the pictures with apitrace's `snapdiff.py`; exit 1 on any difference
+  above `-Fuzz` (0.05). Use it for plain against plain. For Remix pictures use the noise limit below.
 
-- The spot run already turns the camera (8 stops at 3 heights and a 30 second pan), so the recording covers movement.
-- The copy of apitrace's `d3d9.dll` sits in a folder named `SysWOW64` on purpose. `drive.py` only accepts a chained
-  DLL whose path ends in `\SysWOW64\d3d9.dll`. This is a workaround; the clean fix is one more accepted name in
-  `drive.py`.
-- The run folder lands in `experiments\remix-gate\reference-<stamp>`. It is a recording, not a reference. Move it to
-  `experiments\replay-rig\` afterwards so no gate run picks it as its reference.
-- apitrace writes `Blacklist_game.trace` into the game's working folder (expected from apitrace's rules, not seen
-  yet). Move it to `experiments\replay-rig\traces\`. Size is unknown; D: had 695 GB free.
-- The launch script refuses below 10.5 GB free on C: and 14.2 GB of memory room. On Nov 19 it refused for both.
+## Which trace
 
-## Replay
+| Trace (in `experiments\replay-rig\traces\`) | Frames | What is in it | Stack replay |
+| --- | --- | --- | --- |
+| `20261119-064135-con_custodial-f0-2099.trace` (0.96 GB) | 0 to 2,099 | loading, menu, then 280 level frames at the checkpoint, camera still | about 90 s |
+| `20261119-064135-con_custodial-f0-6419.trace` (3.6 GB) | 0 to 6,419 | the same, on to the first camera stop (frames 6,312 to 6,396) | 7.5 minutes (plain: 4.2 minutes) |
+| `20261119-064135-con_custodial.trace` (14.5 GB) | 0 to 70,063 | 24 camera stops (level frames 1,820 to 14,039); the rest is a minimized game | not run |
+| `20261119-014505-con_custodial*.trace` | | 3840x2160, no camera turns: retired | no |
 
-    powershell -NoProfile -ExecutionPolicy Bypass -File replay.ps1 -Trace <file.trace> -Mode plain
-    powershell -NoProfile -ExecutionPolicy Bypass -File replay.ps1 -Trace <file.trace> -Mode proxy -Reference <plain run>\frames
-    powershell -NoProfile -ExecutionPolicy Bypass -File replay.ps1 -Trace <file.trace> -Mode stack -Lights <light dump .tsv>
+The frame numbers of every camera stop are in `recordings\recording-20261119-064135\con_custodial\spot.json`
+(`windows`, field `proxy`). The game's own picture of each stop is beside it in `gate\<stop>_raster.pfm`.
+The light switch step is not in any recording yet.
 
-- `plain`: Windows' own Direct3D 9. This is the original game's picture.
-- `proxy`: our proxy in replay mode, chained to Windows' Direct3D 9. Shows the proxy changes nothing when its
-  rewrites are off.
-- `stack`: proxy, Remix bridge and Remix. Not run yet. It takes the game lock and refuses when the game runs or C:
-  is below 10.5 GB free.
+## How to read the result
 
-Each run folder gets `frames\f<frame>.png`, `retrace.log`, `run.json`, and in proxy and stack mode `proxy\` with the
-proxy log and `d3d9_proxy_frames.csv` (times per frame). `-Reference` compares the pictures with apitrace's own
-`snapdiff.py` and exits 1 on any mismatch or missing frame.
+In `<Out>`:
 
-## Proxy replay mode
+- `run.json`: `exitCode` 0, `framesRendered`, `pictures`, `seconds`.
+- `frames\f<frame>.png`: the saved pictures, named by frame number.
+- `proxy\rtx_telemetry.jsonl` (stack): one line per Remix frame. `rayTraced` must be true and `instances` above 0
+  on level frames. `vramFreeMB` at 0 means Remix ran out of video memory and the run is void.
+- `proxy\d3d9_proxy_replay_check.csv` and `proxy\d3d9_proxy_frames.csv`: what the proxy saw per frame.
+- `stage\rtx-remix\logs\`: Remix and bridge logs. "Still waiting on the Present semaphore" in `bridge32.log` means
+  Remix fell behind: void.
+
+Checks (exit 0 pass, 1 fail, 2 cannot check):
+
+    D:\BlacklistOverhaul\tools\upscalers\py314\Scripts\python.exe -I check_replay.py step   <Out>\proxy
+    D:\BlacklistOverhaul\tools\upscalers\py314\Scripts\python.exe -I check_replay.py camera <recording spot folder> <Out>\proxy
+    D:\BlacklistOverhaul\tools\upscalers\py314\Scripts\python.exe -I check_replay.py counts <recording spot folder> <Out>\proxy
+
+- `step`: every replayed frame has the recorded number of draws and shader constant uploads. Caught a planted
+  fault (one draw taken from frame 1,900 of a copy: fails, names the frame).
+- `camera`: the proxy sent Remix the same cameras as in the game run, frame by frame. Caught a planted fault on the
+  real recording (one camera moved by 0.1 unit on frame 4,000 of a copy: fails, names the frame). The game run's
+  own log starts at frame 2,282, so a trace must reach past that frame for this check to have anything to compare
+  (with nothing to compare it exits 1).
+- `counts`: draws per frame equal to the game run's log. Same frame limit. Caught a planted fault (one draw taken
+  from frame 4,000 of a copy: fails, names the frame).
+- `lamps`: only in proxy mode, so not usable now. It catches a lamp that was not recorded and a wrong list size.
+  It does not catch a missing picked lamp or an answer one frame late.
+
+## Scoring tools (in this folder, run with the same python as the checks, after the replay has ended)
+
+- `compare_runs.py <run A> <run B> [<first frame>]`: every picture both runs have, with apitrace's snapdiff
+  (precision in bits, pixels over 5 percent), plus the proxy's per-frame counts and Remix's instances per frame.
+- `score_stack.py <run> <first level frame>`: ray traced frames, frame and GPU time, free video memory, bridge waits.
+  For the 06:41 recording the first level frame is 1820.
+- `game_vs_replay.py <gate\<stop>_raster.pfm> <frames\f<frame>.png>`: the game's own screen grab against a replay
+  picture. Exit 0 at 6 bits or better.
+- `remix_shot_vs_saved.py <Remix .dds> <frames\f<frame>.png> ...`: Remix's own screenshot against saved pictures.
+
+Each prints one JSON line. Only `game_vs_replay.py` decides pass or fail by itself.
+
+## Noise limit (three stack replays of the same frames, 0 to 2,099)
+
+Runs `runs\cust2-stack-f2099`, `runs\cust2-stack-f2099-b` and the first 2,100 frames of `runs\cust2-stack-f6419`:
+
+- Proxy per-frame counts and cameras: 0 of 2,099 frames differ. Remix instances per frame: 0 of 2,100 differ.
+- Loading and menu pictures: equal to the last bit (37 of 37).
+- Level pictures (5): at most 331 of 3,686,400 pixels differ by more than 5 percent (first pair 211, 84, 25, 11, 0;
+  second pair 197, 331, 116, 2, 1; falling as Remix settles after the level appears); snapdiff precision 16.1
+  bits or better.
+- For scale: the same level frames in plain against stack differ in 659,599 to 827,844 pixels, precision 8.4 to 8.9.
+
+So a change that moves fewer than a few hundred pixels cannot be told from noise with whole-picture counts. The
+limit is measured on the first 280 level frames only, not at a camera stop.
+
+## Remix's own screenshot
+
+Set `DXVK_DUMP_SCREENSHOT_FRAME=<frame>` and `DXVK_SCREENSHOT_PATH=<folder>/` before a stack replay and Remix
+writes its finished picture of that frame as `rtxImagePostTonemapping_*.dds` (2560x1440, 16-bit float).
+
+- Remix leaves out its last brightness step (linear to sRGB) on that one frame (`rtx_context.cpp`,
+  `performSRGBConversion = !captureScreenImage`). So the saved picture of that frame comes out dark (mean 54 of 255
+  against 115 on the frames around it). Do not score that frame against other runs.
+- That dark frame is also the proof that the saved pictures come from Remix: the screenshot as stored matches the
+  saved picture of frame 6,350 (precision 8.54 bits, 78,450 pixels over 5 percent), and turned into sRGB it matches
+  the neighbours 6,300 and 6,400 (8.2 and 8.35 bits). A frame from another camera position does not match (5.04
+  bits, 3,024,073 pixels). What the 78,450 pixels are was not looked into. One run.
+- Remix's picture at the first camera stop, with the brightness step put back:
+  `experiments\replay-rig\remix-shots\cust2-stack-f6419\f0000006350_remix_srgb.png`.
+
+## Record (one game launch, about 7 minutes for the whole con_custodial spot)
+
+From a worktree that holds this branch and the launch fixes (`affe770`, `b7a2c8e`, `960bc93`):
+
+    set REMIX_TEST_PKG=D:\BlacklistOverhaul\tools\remix\pkg
+    powershell -NoProfile -ExecutionPolicy Bypass -File <worktree>\tests\verify_runtime.ps1 -Record -Spots con_custodial
+
+- The script takes the shared lock by itself. Do not take it by hand first.
+- The worktree's `play-setup` needs `d3d9.dll` (a proxy build with the side recorder, matching `$ProxyHash` in
+  `RemixPlayCommon.ps1`), `resting\d3d9.dll.off` and the three config files byte-equal to the installed ones.
+- It records the original game: our proxy passes every call on unchanged, and apitrace's `d3d9.dll` sits between
+  the proxy and Windows' Direct3D 9 (`drive.py` accepts it as the one named recorder).
+- Output: `experiments\replay-rig\traces\<stamp>-<spot>.trace` and
+  `experiments\replay-rig\recordings\recording-<stamp>\<spot>\` (side files, `spot.json`, the game's pictures).
+- Size: about 1.1 MB per level frame at about 46 level frames a second. The whole spot was 14.5 GB.
+- Check the device size before using a recording:
+  `apitrace dump --calls=0-400 <trace> | findstr CreateDevice` must show `BackBufferWidth = 2560`.
+- Nobody may run the full `test_drive.py` or a build during the launch (see CREW.md).
+
+## Replaying a short frame range
+
+A replay always starts at frame 0: the trace holds every texture and shader from the moment the device was made,
+and apitrace cannot start in the middle. So a short test is a trace cut after N frames:
+
+    D:\BlacklistOverhaul\experiments\replay-rig\tools\apitrace-14.0-win32\bin\apitrace.exe trim --frames=0-2099 -o <short.trace> <full.trace>
+
+Cutting reads the file up to frame N (23 s for 0 to 2,099, 2.5 minutes for 0 to 6,419). Cost of a replay: loading
+and menu frames 0 to 1,819 take about one minute in stack mode; each level frame then takes about 85 ms in stack
+mode and about 45 ms in plain mode (with a picture every 50 frames). A test of one moment costs the frames before it. To keep a problem's recording
+short, record a spot that goes to the problem right after the checkpoint loads.
+
+## Proxy replay mode: what the proxy took from the game, and where it comes from in replay
 
 Set by the environment variable `BLPROXY_REPLAY=1` (`replay.ps1` sets it). The game never has it.
 
-- The proxy looks for its ini, log and the Remix DLL beside its own DLL. Reason: apitrace's replay program reports
-  the recorded game's exe path as its own, so the proxy would otherwise use the files in the game folder.
-- No game memory is read or patched: no loop timer patch, no texture budget write, no light list walk.
-- Lights come from a light dump recorded in the game (`d3d9_proxy_replay_lights.tsv` beside the proxy). Each row's
-  raw words rebuild that light's memory, so the normal light code runs on it. One recorded moment serves every
-  frame. Not run yet (it needs Remix).
+| In the game the proxy uses | In replay |
+| --- | --- |
+| The game code address of the caller, to pick the camera upload (0x015D8E71, 0x0160A972) | `d3d9_proxy_replay_calls.csv`, `C` rows: frame and call position of each camera upload |
+| The caller's code range, to tag decal draws | the same file, `D` rows: frame and call position of each decal draw |
+| Lamp and flare lists read from game memory | `d3d9_proxy_replay_lights.bin`: one block per frame with the raw lamp and flare records |
+| The game's loop timer patch (0x006FE4B7) and the texture stream budget write | not applied: no game memory is read or written |
+| The game's folder for its ini, log and the Remix DLL | the folder of the proxy DLL (apitrace's replay program reports the game's exe path as its own) |
 
-## Known gaps
-
-- Camera: the proxy knows the camera upload by the game code address that made the call. In replay every call comes
-  from the replay program, so no camera reaches Remix. apitrace cannot record call addresses on Windows. Plan: the
-  installed proxy already writes, per frame, where in the draw order each camera upload came
-  (`d3d9_proxy_frames.csv`); replay mode should read that file from the recording run.
-- Flares are not replayed.
-- Lights do not change over the recording.
-- Final Remix pictures: untested whether d3dretrace's snapshots through the bridge show Remix's picture. Remix's own
-  hook `DXVK_DUMP_SCREENSHOT_FRAME` writes one chosen frame.
-- Frame times in plain mode: d3dretrace prints only the total. PresentMon is the outside clock to add.
-- Occlusion queries: the recording holds the answers the game received (`apitrace dump <trace> | findstr GetData`).
-  d3dretrace can compare them with a replay's answers (`--query-handling=check`). Not tried yet.
+`BLPROXY_REPLAY_SIZE=<width>x<height>` (replay only, not committed, build in `experiments\replay-rig\build-size`)
+makes the device another size than recorded. Tried once on the 3840x2160 recording: the replay ran, but Remix did
+not ray trace. Do not use it for results.
 
 ## What the rig cannot show
 
-Anything where the game reacts to our stack: which flares it draws after its occlusion queries, which formats it
-picks from device caps, streaming choices. Real input and mouse lag. Quitting.
+- Frame times (see State).
+- Anything where the game reacts to our stack: which flares it draws after its occlusion queries, which formats it
+  picks from device caps, streaming choices. Real input and mouse lag. Quitting.
+- Whether lamps and flares reach Remix as recorded: recorded and loaded, but no check reads them in stack mode yet.
+- The light switch step: not recorded yet.
 
-## Measured so far (test program only, 120 frames, 1280x720)
+## Test program
 
-- plain replay twice: 0 differing pixels in 120 frames.
-- plain replay against proxy replay: 0 differing pixels in 120 frames.
-- planted fault (pictures shifted by one frame): 119 of 119 frames flagged, exit code 1.
+`smoke\tri.cpp` (a turning triangle, 120 frames) and `traces\tri_rehearsal.trace` proved the tools first: plain
+replay twice 0 differing pixels, a planted one-frame shift flagged in 119 of 119 frames, camera check 96 of 96.
