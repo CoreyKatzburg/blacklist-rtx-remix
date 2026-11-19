@@ -6,11 +6,14 @@
 # <Out>\run.json and, in proxy and stack mode, the proxy's own files (d3d9_proxy.log, d3d9_proxy_frames.csv with
 # one line of times per frame) in <Out>\proxy.
 #   -Reference <folder with f*.png>   compares the pictures with apitrace's snapdiff.py; exit code 1 on a mismatch
-#   -Lights <light dump .tsv>         stack mode: the game's light list for lightpub (a DumpLights file)
+#   -Side <recording folder>          proxy and stack mode: the side recording the proxy wrote in the recording run
+#                                     (d3d9_proxy_replay_calls.csv: camera uploads and decal draws by frame and call
+#                                     position; d3d9_proxy_replay_lights.bin: lamps and flares by frame)
+#   -Lights <light dump .tsv>         instead of a lamp recording: one light dump (DumpLights) for every frame
 # Windows PowerShell 5.1 compatible.
 param([Parameter(Mandatory = $true)][string]$Trace, [ValidateSet('plain', 'proxy', 'stack')][string]$Mode = 'plain',
       [string]$Out = '', [string]$Proxy = 'D:\BlacklistOverhaul\experiments\replay-rig\build\d3d9.dll',
-      [string]$Lights = '', [string]$Reference = '', [int]$SnapshotInterval = 1, [double]$Fuzz = 0.05)
+      [string]$Side = '', [string]$Lights = '', [string]$Reference = '', [int]$SnapshotInterval = 1, [double]$Fuzz = 0.05)
 $ErrorActionPreference = 'Stop'
 $Rig = 'D:\BlacklistOverhaul\experiments\replay-rig'
 $Apitrace = Join-Path $Rig 'tools\apitrace-14.0-win32'
@@ -34,9 +37,13 @@ try {
         $exe = Join-Path $stage 'd3dretrace.exe'
         $ini = [IO.File]::ReadAllText((Join-Path $Remix 'play-setup\d3d9_proxy.ini'))
         if ($Mode -eq 'proxy') {
-            $ini = [Regex]::Replace($ini, '(?m)^\[Proxy\][ \t]*\r?\n', "[Proxy]`r`nChainDll=C:\Windows\SysWOW64\d3d9.dll`r`n", 1).TrimEnd() + "`r`n[Lights]`r`nEnable=0`r`n"
+            $ini = [Regex]::Replace($ini, '(?m)^\[Proxy\][ \t]*\r?\n', "[Proxy]`r`nChainDll=C:\Windows\SysWOW64\d3d9.dll`r`n", 1)
         }
         [IO.File]::WriteAllText((Join-Path $stage 'd3d9_proxy.ini'), $ini)
+        foreach ($name in 'd3d9_proxy_replay_calls.csv', 'd3d9_proxy_replay_lights.bin') {
+            if ($Side -and (Test-Path -LiteralPath (Join-Path $Side $name))) { Copy-Item -LiteralPath (Join-Path $Side $name) -Destination $stage }
+        }
+        if ($Lights) { Copy-Item -LiteralPath $Lights -Destination (Join-Path $stage 'd3d9_proxy_replay_lights.tsv') }
     }
     if ($Mode -eq 'stack') {
         $busy = @(Get-Process Blacklist_game, Blacklist_DX11_game, NvRemixBridge -ErrorAction SilentlyContinue)
@@ -54,7 +61,6 @@ try {
         Copy-Item -LiteralPath (Join-Path $Remix 'play-setup\rtx.conf') -Destination $stage
         New-Item -ItemType Directory -Force (Join-Path $stage 'rtx-remix\mods') | Out-Null
         New-Item -ItemType Junction -Path (Join-Path $stage 'rtx-remix\mods\materials') -Target (Join-Path $Remix 'materials') | Out-Null
-        if ($Lights) { Copy-Item -LiteralPath $Lights -Destination (Join-Path $stage 'd3d9_proxy_replay_lights.tsv') }
     }
     $env:BLPROXY_REPLAY = $(if ($Mode -eq 'plain') { '' } else { '1' })
     $started = Get-Date
@@ -67,14 +73,15 @@ try {
     } finally { Pop-Location }
     if ($Mode -ne 'plain') {
         New-Item -ItemType Directory -Force (Join-Path $Out 'proxy') | Out-Null
-        Get-ChildItem -LiteralPath $stage -File | Where-Object { $_.Name -like 'd3d9_proxy*' -or $_.Name -like 'lightpub*' -or $_.Name -like 'rtx_telemetry*' } |
+        Get-ChildItem -LiteralPath $stage -File | Where-Object { ($_.Name -like 'd3d9_proxy*' -or $_.Name -like 'lightpub*' -or $_.Name -like 'rtx_telemetry*') -and
+                $_.Name -notin 'd3d9_proxy_replay_calls.csv', 'd3d9_proxy_replay_lights.bin', 'd3d9_proxy_replay_lights.tsv' } |
             Copy-Item -Destination (Join-Path $Out 'proxy')
     }
     $pictures = @(Get-ChildItem -LiteralPath $frames -Filter 'f*.png').Count
     $rendered = Select-String -LiteralPath (Join-Path $Out 'retrace.log') -Pattern '^Rendered (\d+) frames in ([\d.]+) secs' | Select-Object -Last 1
     $result = [ordered]@{ trace = $Trace; mode = $Mode; started = $started.ToString('s'); exitCode = $exit; pictures = $pictures
                           framesRendered = $(if ($rendered) { [int]$rendered.Matches[0].Groups[1].Value }); seconds = $(if ($rendered) { [double]$rendered.Matches[0].Groups[2].Value })
-                          proxySha256 = $(if ($Mode -ne 'plain') { (Get-FileHash -LiteralPath $Proxy).Hash }); lights = $Lights; compare = $null }
+                          proxySha256 = $(if ($Mode -ne 'plain') { (Get-FileHash -LiteralPath $Proxy).Hash }); side = $Side; lights = $Lights; compare = $null }
     $failed = $exit -ne 0 -or -not $pictures
     if ($Reference -and $pictures) {
         $text = & $Py -I (Join-Path $Apitrace 'lib\scripts\snapdiff.py') -v -f $Fuzz -o (Join-Path $Out 'compare.html') ((Resolve-Path -LiteralPath $Reference).Path + '\f') ($frames + '\f') 2>&1 | ForEach-Object { "$_" }

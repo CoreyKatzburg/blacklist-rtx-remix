@@ -2,6 +2,7 @@
 
 #include "lightpub.h"
 #include "proxy_log.h"
+#include "replay_side.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -244,12 +245,14 @@ bool DecalTagBeforeDraw(void* returnAddress,
                         bool passFilterEnabled,
                         bool drawIsScene,
                         bool gogglesActive) {
-    if (!g_decalTag && !g_hideDecals) return false;
-    if (!g_decalScanStarted && !InterlockedExchange(&g_decalScanStarted, 1)) {
+    const bool wanted = g_decalTag || g_hideDecals;
+    const bool scan = !ReplayMode() && (wanted || ReplayRecording());
+    if (scan && !g_decalScanStarted && !InterlockedExchange(&g_decalScanStarted, 1)) {
         HANDLE thread = CreateThread(nullptr, 0, &FindDecalCode, nullptr, 0, nullptr);
         if (thread) { SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL); CloseHandle(thread); }
     }
-    const bool drawIsDecal = IsDecalCaller(returnAddress);
+    const bool drawIsDecal = ReplaySideDecalDraw(scan && IsDecalCaller(returnAddress));
+    if (!wanted) return false;
     const bool traced = g_decalTag && (!passFilterEnabled || drawIsScene) && stage0Texture && g_textureReleaseHooked &&
                         !gogglesActive;
     if (!drawIsDecal) {

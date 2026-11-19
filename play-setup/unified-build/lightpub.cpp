@@ -13,6 +13,7 @@
 #include "auto_raytracing.h"
 #include "light_calibration.h"
 #include "proxy_log.h"
+#include "replay_side.h"
 // The 32-bit bridge client implements this same API and forwards it to the 64-bit runtime.
 #define REMIX_ALLOW_X86
 #include "ref/remix_c.h"
@@ -299,37 +300,73 @@ bool Present(uintptr_t node) {
     return false;
 }
 
-// Copies qualifying lights while the game's database lock is held. No Remix calls here, so a
-// slow bridge can never stall game threads waiting on that lock.
+// What the proxy takes from the game each frame: every LightNode and FlareNode of the engine database, read while
+// the game's database lock is held. No Remix calls there, so a slow bridge can never stall game threads waiting on
+// that lock. A recording run ([Replay] Record=1) writes the two lists to d3d9_proxy_replay_lights.bin each time they
+// change; replay mode (proxy::ReplayMode) reads them back instead of game memory, so everything from SelectLights
+// and SelectFlares on runs the same in the game and in a replay.
+struct SeenLight {
+    uint32_t node;
+    NodeData data;
+};
+struct SeenFlare {
+    uint32_t node, nodeFlags, word34, elementCount;   // +0x2C, +0x34, +0x90
+    float pos[3], peakIntensity, peakSize, size0[2], color[3];
+};
+struct RecordHeader {
+    uint32_t magic, frame, lights, flares;
+};
+constexpr uint32_t kRecordMagic = 0x4C524C42;   // "BLRL"
+constexpr uint32_t kMaxSeenLights = 2048;
+constexpr uint32_t kMaxSeenFlares = 512;
+static_assert(sizeof(SeenLight) == 224 && sizeof(SeenFlare) == 56 && sizeof(RecordHeader) == 16, "recording layout");
+
+SeenLight g_seenLights[kMaxSeenLights];
+uint32_t g_seenLightCount = 0;
+SeenFlare g_seenFlares[kMaxSeenFlares];
+uint32_t g_seenFlareCount = 0;
+
+void ReadGameLights(uintptr_t database) {
+    g_seenLightCount = 0;
+    uintptr_t heads = 0;
+    uint32_t classIndex = 0, headCount = 0;
+    if (!Read(database + 0x2C, &heads) || !Read(database + 0x30, &headCount) ||
+        !Read(g_lightClass + 0x10, &classIndex) || !heads || classIndex >= headCount) return;
+    uintptr_t head = 0, node = 0;
+    if (!Read(heads + classIndex * 4, &head) || !head || !Read(head, &node)) return;
+    for (int guard = 0; node && guard < 8192 && g_seenLightCount < kMaxSeenLights; ++guard) {
+        uintptr_t cls = 0, next = 0;
+        if (!Read(node + 0x1C, &cls) || !Read(node + 0x28, &next)) break;
+        SeenLight& s = g_seenLights[g_seenLightCount];
+        s.data = {};
+        if (cls == g_lightClass && ReadNode(node, &s.data)) {
+            s.node = static_cast<uint32_t>(node);
+            ++g_seenLightCount;
+        }
+        node = next;
+    }
+}
+
+// The seen lights that qualify for publishing, in g_snapshot.
 struct Snapshot {
     uintptr_t node;
     NodeData data;
 };
 Snapshot g_snapshot[kMaxTracked];
 
-uint32_t CollectLights(uintptr_t database) {
+uint32_t SelectLights() {
     g_presentCount = 0;
-    uintptr_t heads = 0;
-    uint32_t classIndex = 0, headCount = 0;
-    if (!Read(database + 0x2C, &heads) || !Read(database + 0x30, &headCount) ||
-        !Read(g_lightClass + 0x10, &classIndex) || !heads || classIndex >= headCount) return 0;
-    uintptr_t head = 0, node = 0;
-    if (!Read(heads + classIndex * 4, &head) || !head || !Read(head, &node)) return 0;
     uint32_t count = 0, hidden = 0;
-    for (int guard = 0; node && guard < 8192 && count < g_settings.maxLights; ++guard) {
-        uintptr_t cls = 0, next = 0;
-        if (!Read(node + 0x1C, &cls) || !Read(node + 0x28, &next)) break;
+    for (uint32_t i = 0; i < g_seenLightCount && count < g_settings.maxLights; ++i) {
+        const uintptr_t node = g_seenLights[i].node;
         Snapshot& s = g_snapshot[count];
-        s.data = {};
-        if (cls == g_lightClass && ReadNode(node, &s.data)) {
-            if (g_presentCount < kMaxPresent) g_present[g_presentCount++] = node;
-            hidden += lightcal::Hidden(s.data, g_settings.hide) && lightcal::Qualifies(s.data, KeptTracked(node));
-            if (Wanted(s.data, KeptTracked(node))) {
-                s.node = node;
-                ++count;
-            }
+        s.data = g_seenLights[i].data;
+        if (g_presentCount < kMaxPresent) g_present[g_presentCount++] = node;
+        hidden += lightcal::Hidden(s.data, g_settings.hide) && lightcal::Qualifies(s.data, KeptTracked(node));
+        if (Wanted(s.data, KeptTracked(node))) {
+            s.node = node;
+            ++count;
         }
-        node = next;
     }
     // HideLightAt: one line whenever the number of lights it holds back changes, so a run shows what the key acted on.
     static uint32_t loggedHidden = 0;
@@ -345,13 +382,47 @@ uint32_t CollectLights(uintptr_t database) {
     return count;
 }
 
-// Replay mode (proxy::ReplayMode, no game process): the light list is a light dump recorded in the game (DumpLights),
-// saved as d3d9_proxy_replay_lights.tsv beside the proxy. The raw words of each "light" row rebuild that LightNode's
-// memory, so ReadNode, Wanted and SubmitLights run as they do in the game. Every replayed frame gets the lights of
-// that one recorded moment. Flares are not replayed yet.
-constexpr uint32_t kNodeWords = 0x470 / 4;
-uint32_t (*g_replayNodes)[kNodeWords] = nullptr;
-uint32_t g_replayNodeCount = 0;
+wchar_t g_recordPath[MAX_PATH] = {};
+constexpr size_t kRecordPayloadMax = sizeof(g_seenLights) + sizeof(g_seenFlares);
+char g_recordBlock[sizeof(RecordHeader) + kRecordPayloadMax];
+char g_recordLast[kRecordPayloadMax];
+RecordHeader g_recordLastHeader = {};
+
+const wchar_t* RecordPath() {
+    if (!g_recordPath[0]) proxy::CombinePath(proxy::ExecutableDirectory(), L"d3d9_proxy_replay_lights.bin", g_recordPath);
+    return g_recordPath;
+}
+
+// Appends the seen lists as one block (header, lights, flares) when they differ from the last block written.
+void WriteRecord(uint32_t frame) {
+    const size_t lightBytes = g_seenLightCount * sizeof(SeenLight), flareBytes = g_seenFlareCount * sizeof(SeenFlare);
+    char* payload = g_recordBlock + sizeof(RecordHeader);
+    memcpy(payload, g_seenLights, lightBytes);
+    memcpy(payload + lightBytes, g_seenFlares, flareBytes);
+    const bool first = g_recordLastHeader.magic == 0;
+    if (!first && g_recordLastHeader.lights == g_seenLightCount && g_recordLastHeader.flares == g_seenFlareCount &&
+        memcmp(payload, g_recordLast, lightBytes + flareBytes) == 0) return;
+    if (first) DeleteFileW(RecordPath());
+    g_recordLastHeader = {kRecordMagic, frame, g_seenLightCount, g_seenFlareCount};
+    memcpy(g_recordLast, payload, lightBytes + flareBytes);
+    memcpy(g_recordBlock, &g_recordLastHeader, sizeof(RecordHeader));
+    size_t length = sizeof(RecordHeader) + lightBytes + flareBytes;
+    proxy::AppendToFile(RecordPath(), g_recordBlock, &length);
+}
+
+HANDLE g_replayFile = INVALID_HANDLE_VALUE;
+RecordHeader g_replayNext = {};
+bool g_replayOpened = false, g_replayNextValid = false, g_replayLoaded = false;
+
+bool ReadReplay(void* out, size_t size) {
+    DWORD read = 0;
+    return ReadFile(g_replayFile, out, static_cast<DWORD>(size), &read, nullptr) && read == size;
+}
+
+void ReadReplayHeader() {
+    g_replayNextValid = ReadReplay(&g_replayNext, sizeof(g_replayNext)) && g_replayNext.magic == kRecordMagic &&
+                        g_replayNext.lights <= kMaxSeenLights && g_replayNext.flares <= kMaxSeenFlares;
+}
 
 bool ParseRawWords(const char* line, const char* key, uint32_t from, uint32_t to, uint32_t* words) {
     const char* found = strstr(line, key);
@@ -366,12 +437,14 @@ bool ParseRawWords(const char* line, const char* key, uint32_t from, uint32_t to
     return true;
 }
 
-void LoadReplayLights() {
+// With no recording, an older run's light dump (DumpLights, saved as d3d9_proxy_replay_lights.tsv) serves: the raw
+// words of each "light" row rebuild that LightNode's memory for ReadNode. One moment for every frame, no flares.
+void LoadReplayLightDump() {
     wchar_t path[MAX_PATH];
     if (!proxy::CombinePath(proxy::ExecutableDirectory(), L"d3d9_proxy_replay_lights.tsv", path)) return;
     HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
-        if (g_log) g_log("lightpub: replay mode, no light recording at %ls; no lights are published", path);
+        if (g_log) g_log("lightpub: replay mode, no light recording beside the proxy; no lights are published");
         return;
     }
     const DWORD size = GetFileSize(file, nullptr);
@@ -379,44 +452,62 @@ void LoadReplayLights() {
     DWORD read = 0;
     if (!text || !ReadFile(file, text, size, &read, nullptr)) read = 0;
     CloseHandle(file);
-    g_replayNodes = static_cast<uint32_t (*)[kNodeWords]>(calloc(kMaxTracked, sizeof(*g_replayNodes)));
     uint32_t rows = 0;
-    if (text && g_replayNodes) {
+    g_seenLightCount = g_seenFlareCount = 0;
+    if (text) {
         text[read] = '\0';
-        for (char* line = text; line && *line && g_replayNodeCount < kMaxTracked;) {
+        for (char* line = text; line && *line && g_seenLightCount < kMaxSeenLights;) {
             char* end = strchr(line, '\n');
             if (end) *end = '\0';
-            if (strncmp(line, "light\t", 6) == 0) {
+            const char* id = strstr(line, "\tnode=");
+            if (strncmp(line, "light\t", 6) == 0 && id) {
                 ++rows;
-                uint32_t* words = g_replayNodes[g_replayNodeCount];
+                uint32_t words[0x470 / 4] = {};
+                SeenLight& s = g_seenLights[g_seenLightCount];
+                s.data = {};
+                words[0] = kLightNodeVtable;
                 if (ParseRawWords(line, "\traw20=", 0x20, 0x390, words) &&
-                    ParseRawWords(line, "\traw390=", 0x390, 0x460, words)) {
-                    words[0] = kLightNodeVtable;
-                    ++g_replayNodeCount;
+                    ParseRawWords(line, "\traw390=", 0x390, 0x460, words) &&
+                    ReadNode(reinterpret_cast<uintptr_t>(words), &s.data)) {
+                    s.node = strtoul(id + 6, nullptr, 16);
+                    ++g_seenLightCount;
                 }
             }
             line = end ? end + 1 : nullptr;
         }
     }
     free(text);
-    if (g_log) g_log("lightpub: replay mode, %u of %u recorded lights loaded from %ls", g_replayNodeCount, rows, path);
+    g_replayLoaded = g_seenLightCount > 0;
+    if (g_log) g_log("lightpub: replay mode, %u of %u lights of the light dump loaded from %ls", g_seenLightCount, rows, path);
 }
 
-uint32_t CollectReplayLights() {
-    g_presentCount = 0;
-    uint32_t count = 0;
-    for (uint32_t i = 0; i < g_replayNodeCount && count < g_settings.maxLights; ++i) {
-        const uintptr_t node = reinterpret_cast<uintptr_t>(g_replayNodes[i]);
-        Snapshot& s = g_snapshot[count];
-        s.data = {};
-        if (!ReadNode(node, &s.data)) continue;
-        if (g_presentCount < kMaxPresent) g_present[g_presentCount++] = node;
-        if (Wanted(s.data, KeptTracked(node))) {
-            s.node = node;
-            ++count;
+// Replay mode: fills the seen lists with the recorded block in force at `frame`. False before the first block.
+bool LoadReplaySeen(uint32_t frame) {
+    if (!g_replayOpened) {
+        g_replayOpened = true;
+        g_replayFile = CreateFileW(RecordPath(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                   FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (g_replayFile == INVALID_HANDLE_VALUE) {
+            LoadReplayLightDump();
+        } else {
+            ReadReplayHeader();
+            if (g_log) g_log("lightpub: replay mode, lights and flares from %ls (first block %s)", RecordPath(),
+                             g_replayNextValid ? "read" : "missing");
         }
     }
-    return count;
+    while (g_replayNextValid && g_replayNext.frame <= frame) {
+        g_seenLightCount = g_replayNext.lights;
+        g_seenFlareCount = g_replayNext.flares;
+        if (!ReadReplay(g_seenLights, g_seenLightCount * sizeof(SeenLight)) ||
+            !ReadReplay(g_seenFlares, g_seenFlareCount * sizeof(SeenFlare))) {
+            g_seenLightCount = g_seenFlareCount = 0;
+            g_replayNextValid = false;
+            break;
+        }
+        g_replayLoaded = true;
+        ReadReplayHeader();
+    }
+    return g_replayLoaded;
 }
 
 // Hash of the parameters Remix sees, quantised so flicker and sub-unit jitter do not force a
@@ -749,7 +840,6 @@ bool Initialize(HMODULE remixClient, const wchar_t* iniPath, LogFn log) {
         return false;
     }
     g_ready = true;
-    if (proxy::ReplayMode()) LoadReplayLights();
     wcsncpy_s(g_iniPath, iniPath, _TRUNCATE);
     g_iniWriteTime = IniWriteTime();
     ApplyRemixConfig();
@@ -777,7 +867,8 @@ uintptr_t g_flareClass = 0;
 lightcal::FlareMotion<kMaxFlares> g_flareMotion;
 remixapi_MeshHandle g_standInMesh[64] = {};   // one sphere per quantised colour (4 levels per channel)
 
-uint32_t CollectFlares(uintptr_t database) {
+void ReadGameFlares(uintptr_t database) {
+    g_seenFlareCount = 0;
     if (!g_flareClass) {
         static uint32_t nameHash = 0;
         uintptr_t registry = 0;
@@ -785,34 +876,26 @@ uint32_t CollectFlares(uintptr_t database) {
             __try {
                 nameHash = reinterpret_cast<uint32_t(__cdecl*)(const char*)>(kNameHashFunction)("FlareNode");
             } __except (EXCEPTION_EXECUTE_HANDLER) {
-                return 0;
+                return;
             }
         }
-        if (!Read(database + 0x1C, &registry) || !registry || !(g_flareClass = FindClass(registry, nameHash))) return 0;
+        if (!Read(database + 0x1C, &registry) || !registry || !(g_flareClass = FindClass(registry, nameHash))) return;
     }
     uintptr_t heads = 0, head = 0, node = 0;
     uint32_t classIndex = 0, headCount = 0;
     if (!Read(database + 0x2C, &heads) || !Read(database + 0x30, &headCount) || !Read(g_flareClass + 0x10, &classIndex) ||
-        !heads || classIndex >= headCount || !Read(heads + classIndex * 4, &head) || !head || !Read(head, &node)) return 0;
-    lightcal::StandInOptions options;
-    options.enabled = g_settings.flareStandIns;
-    options.skipUnplaced = g_settings.standInSkipUnplaced;
-    options.skipMoving = g_settings.standInSkipMoving;
-    options.skipSamGear = g_settings.standInSkipSamGear;
-    uint32_t count = 0;
-    for (int guard = 0; node && guard < 8192 && count < kMaxFlares; ++guard) {
+        !heads || classIndex >= headCount || !Read(heads + classIndex * 4, &head) || !head || !Read(head, &node)) return;
+    for (int guard = 0; node && guard < 8192 && g_seenFlareCount < kMaxSeenFlares; ++guard) {
         uintptr_t cls = 0, next = 0, elements = 0;
         uint32_t elementCount = 0;
         if (!Read(node + 0x1C, &cls) || !Read(node + 0x28, &next)) break;
-        FlareSnap& f = g_flares[count];
-        lightcal::FlareData& d = f.data;
-        d = {};
-        if (cls == g_flareClass && Read(node + 0x2C, &d.nodeFlags) && Read(node + 0x34, &d.word34) &&
-            Read(node + 0xD4, &d.pos[0]) && Read(node + 0xD8, &d.pos[1]) && Read(node + 0xDC, &d.pos[2])) {
+        SeenFlare f = {};
+        f.peakSize = lightcal::FlareData{}.peakSize;
+        if (cls == g_flareClass && Read(node + 0x2C, &f.nodeFlags) && Read(node + 0x34, &f.word34) &&
+            Read(node + 0xD4, &f.pos[0]) && Read(node + 0xD8, &f.pos[1]) && Read(node + 0xDC, &f.pos[2])) {
             // Colour and size of the brightest element.
-            f.color[0] = f.color[1] = f.color[2] = 0.0f;
             if (Read(node + 0x8C, &elements) && Read(node + 0x90, &elementCount) && elements) {
-                d.elementCount = elementCount;
+                f.elementCount = elementCount;
                 for (uint32_t i = 0; i < elementCount && i < 8; ++i) {
                     const uintptr_t e = elements + i * 0x68;
                     float intensity = 0, sx = 0, sy = 0, rgb[3] = {};
@@ -820,28 +903,54 @@ uint32_t CollectFlares(uintptr_t database) {
                     Read(e + 0x18, &sx);
                     Read(e + 0x1C, &sy);
                     if (i == 0) {
-                        d.size0[0] = sx;
-                        d.size0[1] = sy;
+                        f.size0[0] = sx;
+                        f.size0[1] = sy;
                     }
                     for (int k = 0; k < 3; ++k) Read(e + 0x38 + k * 4, &rgb[k]);
-                    if (intensity > d.peakIntensity && isfinite(intensity)) {
-                        d.peakIntensity = intensity;
-                        if (isfinite(sx) && isfinite(sy) && sx > 0.0f && sy > 0.0f) d.peakSize = 0.5f * (sx + sy);
+                    if (intensity > f.peakIntensity && isfinite(intensity)) {
+                        f.peakIntensity = intensity;
+                        if (isfinite(sx) && isfinite(sy) && sx > 0.0f && sy > 0.0f) f.peakSize = 0.5f * (sx + sy);
                         for (int k = 0; k < 3; ++k) f.color[k] = rgb[k];
                     }
                 }
             }
-            d.moved = g_flareMotion.Update(node, d.pos, g_frame);
-            f.node = node;
-            // Scale bulb radius cleanly by flare sprite size: tight ~1.2-1.8 cm lens on gun-rail/gear flares
-            // (s=8..16), up to standInRadius (~2.5-3.5 cm) on ceiling fixtures; WantsStandIn skips giant sky/sun
-            // coronas (s >= 400).
-            f.radiusCm = std::clamp(d.peakSize * 0.08f, 1.2f, g_settings.standInRadius);
-            f.standIn = lightcal::WantsStandIn(d, options);
-            g_flareData[count] = d;
-            ++count;
+            f.node = static_cast<uint32_t>(node);
+            g_seenFlares[g_seenFlareCount++] = f;
         }
         node = next;
+    }
+}
+
+// The seen flares as g_flares, with what the proxy works out for each: moved, bulb radius, stand-in or not.
+uint32_t SelectFlares() {
+    lightcal::StandInOptions options;
+    options.enabled = g_settings.flareStandIns;
+    options.skipUnplaced = g_settings.standInSkipUnplaced;
+    options.skipMoving = g_settings.standInSkipMoving;
+    options.skipSamGear = g_settings.standInSkipSamGear;
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < g_seenFlareCount && count < kMaxFlares; ++i) {
+        const SeenFlare& s = g_seenFlares[i];
+        FlareSnap& f = g_flares[count];
+        lightcal::FlareData& d = f.data;
+        d = {};
+        memcpy(d.pos, s.pos, sizeof(d.pos));
+        d.nodeFlags = s.nodeFlags;
+        d.word34 = s.word34;
+        d.peakIntensity = s.peakIntensity;
+        d.peakSize = s.peakSize;
+        d.elementCount = s.elementCount;
+        memcpy(d.size0, s.size0, sizeof(d.size0));
+        memcpy(f.color, s.color, sizeof(f.color));
+        d.moved = g_flareMotion.Update(s.node, d.pos, g_frame);
+        f.node = s.node;
+        // Scale bulb radius cleanly by flare sprite size: tight ~1.2-1.8 cm lens on gun-rail/gear flares
+        // (s=8..16), up to standInRadius (~2.5-3.5 cm) on ceiling fixtures; WantsStandIn skips giant sky/sun
+        // coronas (s >= 400).
+        f.radiusCm = std::clamp(d.peakSize * 0.08f, 1.2f, g_settings.standInRadius);
+        f.standIn = lightcal::WantsStandIn(d, options);
+        g_flareData[count] = d;
+        ++count;
     }
     g_flareMotion.Sweep(g_frame);
     return count;
@@ -977,25 +1086,17 @@ void UpdateStrayCounts() {
     g_weaponFlipsWindow = g_recreatedWindow = 0;
 }
 
-void OnPresent() {
-    if (!g_ready) return;
-    ++g_frame;
-    ReloadIfChanged();
-    UpdateTraceFile();
-    if (!g_settings.enable) return;  // switched off live; ReloadIfChanged already removed the lights
-    if (proxy::ReplayMode()) {
-        const uint32_t count = CollectReplayLights();
-        UpdateAutoRaytracing(count > 0);
-        SubmitLights(count);
-        return;
-    }
+enum class GameRead { NoLevel, NotReady, BadLock, Busy, Ok };
+
+// Reads this frame's lights and flares from the game's database into the seen lists.
+GameRead ReadGame() {
     static uintptr_t lastDatabase = 0;
     static CRITICAL_SECTION* checkedLock = nullptr;
     uintptr_t database = 0;
-    if (!Read(kDatabaseGlobal, &database) || !database) { UpdateAutoRaytracing(false); return; }
+    if (!Read(kDatabaseGlobal, &database) || !database) return GameRead::NoLevel;
     if (database != lastDatabase) {
         // New database (level load): class record and lights from the old one are invalid.
-        DestroyAllTracked();
+        if (g_ready) DestroyAllTracked();
         g_lightClass = 0;
         g_flareClass = 0;
         g_flareCount = 0;
@@ -1003,32 +1104,96 @@ void OnPresent() {
         checkedLock = nullptr;
         lastDatabase = database;
     }
-    if (!ResolveLightClass(database)) return;
+    if (!ResolveLightClass(database)) return GameRead::NotReady;
     uintptr_t lockHolder = 0;
     CRITICAL_SECTION* lock = nullptr;
-    if (!Read(database + 0x78, &lockHolder) || !lockHolder || !Read(lockHolder, &lock) || !lock) return;
+    if (!Read(database + 0x78, &lockHolder) || !lockHolder || !Read(lockHolder, &lock) || !lock) return GameRead::NotReady;
     if (lock != checkedLock) {
-        if (!PlausibleLock(lock)) {
-            RedrawTracked();
-            return;
-        }
+        if (!PlausibleLock(lock)) return GameRead::BadLock;
         checkedLock = lock;
     }
-    // Never wait on the game's lock from inside Present. If it is busy, redraw last frame's
-    // lights unchanged so nothing flickers off for a frame.
-    if (!TryEnterCriticalSection(lock)) {
-        RedrawTracked();
-        DrawFlareStandIns();
-        return;
-    }
-    const uint32_t count = CollectLights(database);
+    // Never wait on the game's lock from inside Present.
+    if (!TryEnterCriticalSection(lock)) return GameRead::Busy;
+    ReadGameLights(database);
     // Every flare is collected; FlareStandIns=0 only stops the spheres (the stray line then shows stand-ins 0).
-    g_flareCount = CollectFlares(database);
+    ReadGameFlares(database);
     LeaveCriticalSection(lock);
+    return GameRead::Ok;
+}
+
+void PublishSeen() {
+    const uint32_t count = SelectLights();
+    g_flareCount = SelectFlares();
     UpdateAutoRaytracing(count > 0);
     SubmitLights(count);
     DrawFlareStandIns();
     UpdateStrayCounts();
+}
+
+// Replay mode without Remix (the proxy chained to Windows' Direct3D 9): nothing can be published, so what the proxy
+// would publish goes to d3d9_proxy_replay_lights_check.csv, one line each time the answer changes:
+// frame, lights seen, lights wanted, flares seen, flare stand-ins, wanted node ids.
+void ReplayDryRun(uint32_t frame) {
+    static char line[64 + 9 * kMaxTracked], last[sizeof(line)], out[sizeof(line) + 16];
+    static wchar_t path[MAX_PATH] = {};
+    ++g_frame;
+    if (!LoadReplaySeen(frame)) return;
+    const uint32_t count = SelectLights();
+    const uint32_t flares = SelectFlares();
+    uint32_t standIns = 0;
+    for (uint32_t i = 0; i < flares; ++i) standIns += g_flares[i].standIn;
+    int length = _snprintf_s(line, _TRUNCATE, "%u,%u,%u,%u,", g_seenLightCount, count, flares, standIns);
+    for (uint32_t i = 0; i < count; ++i)
+        length += _snprintf_s(line + length, sizeof(line) - length, _TRUNCATE, i ? " %08X" : "%08X",
+                              static_cast<unsigned>(g_snapshot[i].node));
+    if (strcmp(line, last) == 0) return;
+    strcpy_s(last, line);
+    if (!path[0]) {
+        proxy::CombinePath(proxy::ExecutableDirectory(), L"d3d9_proxy_replay_lights_check.csv", path);
+        DeleteFileW(path);
+    }
+    size_t outLength = static_cast<size_t>(_snprintf_s(out, _TRUNCATE, "%u,%s\n", frame, line));
+    proxy::AppendToFile(path, out, &outLength);
+}
+
+void RecordGameFrame(uint32_t frame) {
+    if (proxy::ReplayRecording() && ReadGame() == GameRead::Ok) WriteRecord(frame);
+}
+
+void OnPresent(uint32_t frame) {
+    if (!g_ready) {
+        if (proxy::ReplayMode()) ReplayDryRun(frame);
+        else RecordGameFrame(frame);
+        return;
+    }
+    ++g_frame;
+    ReloadIfChanged();
+    UpdateTraceFile();
+    if (!g_settings.enable) return;  // switched off live; ReloadIfChanged already removed the lights
+    if (proxy::ReplayMode()) {
+        if (LoadReplaySeen(frame)) PublishSeen();
+        else UpdateAutoRaytracing(false);
+        return;
+    }
+    switch (ReadGame()) {
+    case GameRead::NoLevel:
+        UpdateAutoRaytracing(false);
+        return;
+    case GameRead::NotReady:
+        return;
+    case GameRead::BadLock:
+        RedrawTracked();
+        return;
+    case GameRead::Busy:
+        // The lock is busy: redraw last frame's lights unchanged so nothing flickers off for a frame.
+        RedrawTracked();
+        DrawFlareStandIns();
+        return;
+    case GameRead::Ok:
+        break;
+    }
+    if (proxy::ReplayRecording()) WriteRecord(frame);
+    PublishSeen();
 }
 
 bool HidePostFx() { return g_ready && g_settings.hidePostFx; }

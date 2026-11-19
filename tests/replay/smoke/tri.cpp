@@ -8,6 +8,20 @@ struct Vertex {
     DWORD color;
 };
 
+// c8..c11 = the columns of view * projection for a camera at (x, y, z) looking down +z.
+static __forceinline void UploadCamera(IDirect3DDevice9* device, const D3DMATRIX& proj, float x, float y, float z) {
+    D3DMATRIX view = {};
+    view._11 = view._22 = view._33 = view._44 = 1.0f;
+    view._41 = -x; view._42 = -y; view._43 = -z;
+    float columns[4][4];
+    for (int column = 0; column < 4; ++column)
+        for (int row = 0; row < 4; ++row) {
+            columns[column][row] = 0.0f;
+            for (int k = 0; k < 4; ++k) columns[column][row] += view.m[row][k] * proj.m[k][column];
+        }
+    device->SetVertexShaderConstantF(8, &columns[0][0], 4);
+}
+
 static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM a, LPARAM b) {
     if (m == WM_DESTROY) { PostQuitMessage(0); return 0; }
     return DefWindowProcA(w, m, a, b);
@@ -70,6 +84,11 @@ int main(int argc, char** argv) {
         device->SetFVF(D3DFVF_XYZ | D3DFVF_DIFFUSE);
         device->SetTransform(D3DTS_WORLD, &identity);
         device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, floorQuad, sizeof(Vertex));
+        // Three c8..c11 uploads from three call sites, as the game uploads its view-projection: a decoy, the camera
+        // (it moves with the frame number so a check can tell the frames apart), a decoy.
+        UploadCamera(device, proj, 100.0f, 0.0f, 0.0f);
+        UploadCamera(device, proj, static_cast<float>(frame), 20.0f, -30.0f);
+        UploadCamera(device, proj, 0.0f, 500.0f, 0.0f);
         device->SetTransform(D3DTS_WORLD, &world);
         device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(Vertex));
         device->EndScene();

@@ -19,7 +19,8 @@ $sources = @(
     "$taskDirectory\lightpub.cpp",
     "$taskDirectory\shader_traits.cpp",
     "$taskDirectory\camera_solver.cpp",
-    "$taskDirectory\pass_graph.cpp"
+    "$taskDirectory\pass_graph.cpp",
+    "$taskDirectory\replay_side.cpp"
 ) | ForEach-Object { "`"$_`"" }
 
 $command = @"

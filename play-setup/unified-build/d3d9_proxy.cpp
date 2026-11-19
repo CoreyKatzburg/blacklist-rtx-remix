@@ -23,6 +23,7 @@
 #include "present_tag.h"
 #include "proxy_diagnostics.h"
 #include "proxy_log.h"
+#include "replay_side.h"
 #include "proxy_types.h"
 #include "query_probe.h"
 #include "query_trace.h"
@@ -411,6 +412,7 @@ bool LoadRealD3D9(HINSTANCE proxyInstance) {
              diag.texStats ? 1 : 0, texHashLog ? 1 : 0, diag.hitchSampler ? 1 : 0);
     if (proxy::ReplayMode()) WriteLog("replay mode: files beside the proxy DLL (%ls), no game memory is read or patched",
                                       proxy::ExecutableDirectory());
+    proxy::ReplaySideInit(iniPath);
     proxy::InstallLoopTimer(proxy::ReplayMode() ? 0 : g_executableBase);
 
     wchar_t configured[MAX_PATH] = {};
@@ -658,7 +660,9 @@ HRESULT WINAPI HookPresent(IDirect3DDevice9* self, const RECT* sourceRect,
         if (proxy::IsHandoffBeforePostEnabled() || proxy::IsModernFilterEnabled()) proxy::ApplyHandoffOverrides();
     }
     lightpub::SetShowGamePicture(proxy::ShouldShowGamePicture());
-    if (g_lightsEnabled) lightpub::OnPresent();
+    if (g_lightsEnabled) lightpub::OnPresent(proxy::ReplaySideFrame());
+    else lightpub::RecordGameFrame(proxy::ReplaySideFrame());
+    proxy::ReplaySideEndFrame();
     proxy::FilterEndFrameBeforePresent(self, hook, g_cameraTracker, g_presentCount);
     {
         proxy::QueryProbeCounts q;
@@ -887,12 +891,13 @@ HRESULT WINAPI HookSetVertexShaderConstantF(IDirect3DDevice9* self, UINT startRe
     DeviceHook* hook = FindDeviceHook(self);
     if (!hook) return D3DERR_INVALIDCALL;
     const HRESULT result = hook->setVertexShaderConstantF(self, startRegister, constantData, vector4Count);
+    const uintptr_t returnAddress = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const uintptr_t callerRva = proxy::ReplaySideCallerRva(
+        g_executableBase != 0 && returnAddress >= g_executableBase ? returnAddress - g_executableBase
+                                                                   : static_cast<uintptr_t>(-1),
+        startRegister, vector4Count);
     if (FAILED(result) || !constantData || vector4Count == 0 || !g_publishCamera) return result;
 
-    const uintptr_t returnAddress = reinterpret_cast<uintptr_t>(_ReturnAddress());
-    const uintptr_t callerRva = g_executableBase != 0 && returnAddress >= g_executableBase
-        ? returnAddress - g_executableBase
-        : static_cast<uintptr_t>(-1);
     const bool sourceAllowed =
         g_cameraSources == 0 ||
         (g_cameraSources == 1 && callerRva == proxy::kGameplayCameraUploadReturnRva) ||

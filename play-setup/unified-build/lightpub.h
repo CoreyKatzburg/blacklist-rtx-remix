@@ -9,6 +9,7 @@
 //   - in DLL_PROCESS_DETACH (optional):   lightpub::Shutdown();
 // Settings live in the [Lights] section of d3d9_proxy.ini (see lightpub.ini.example).
 #include <windows.h>
+#include <stdint.h>
 
 namespace lightpub {
 
@@ -16,8 +17,11 @@ using LogFn = void (*)(const char* format, ...);
 
 // Returns true when the Remix API answered and [Lights] Enable=1. Safe to call once.
 bool Initialize(HMODULE remixClient, const wchar_t* iniPath, LogFn log);
-// Publishes this frame's lights. Cheap no-op when disabled.
-void OnPresent();
+// Publishes this frame's lights. Cheap no-op when disabled. `frame` is proxy::ReplaySideFrame(): in replay mode the
+// lights and flares come from the recording's block for that frame instead of game memory.
+void OnPresent(uint32_t frame);
+// A recording run with lights switched off: reads the game's lights and flares only to record them.
+void RecordGameFrame(uint32_t frame);
 // True when [Proxy] HidePostFx=1: the proxy then drops the game's post-processing draws
 // onto the back buffer so they cannot paint over Remix's ray-traced image.
 bool HidePostFx();
