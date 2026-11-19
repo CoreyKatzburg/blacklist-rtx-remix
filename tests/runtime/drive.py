@@ -2355,6 +2355,21 @@ class Spot:
                 if w["kind"] == "goggles":
                     w["goggles"]["toggled"] = False
 
+    def goggle_cycles(self, cfg: dict) -> None:
+        """spot "gogglesRecord" {"cycles", "onSeconds", "offSeconds"} (WKR-7, Nov 19, BLK-13: walls vanish when night
+        vision turns off): night vision on, then off, `cycles` times at the current pose, each step its own window so
+        a frame replay of the recording knows its frames. Unlike goggles() it needs no Remix, so a no-Remix recording
+        launch can hold it. proxyLogSaid: the proxy logged the matching "Goggles: on/off" line during the step."""
+        key = self.spot.get("goggleKeys", {"toggle": "F9"})["toggle"]
+        hwnd = game_window(self.a.pid)
+        if hwnd:
+            front(hwnd)
+        for i in range(1, int(cfg.get("cycles", 2)) + 1):
+            for state, seconds in (("on", float(cfg.get("onSeconds", 3.0))), ("off", float(cfg.get("offSeconds", 5.0)))):
+                mark = len(self.log.new_text())
+                w = self.window(f"goggles_{state}_{i}", "goggles_cycle", lambda: (tap(key), self.hold(seconds)), key=key)
+                w["proxyLogSaid"] = f"Goggles: {state}" in self.log.new_text()[mark:]
+
     def _mean_shot(self, rel: str):
         p = os.path.join(self.out, rel)
         if not os.path.exists(p) or os.path.getsize(p) < CAP_W * CAP_H:
@@ -2815,6 +2830,8 @@ def main() -> int:
                 if int(spot.get("goggleModes", 3)) and not a.no_remix:   # the goggle check compares ray tracing on/off
                     s.goggles()
             s.reference_stills()
+            if spot.get("gogglesRecord"):
+                s.goggle_cycles(spot["gogglesRecord"])
             if spot.get("lightSwitch"):
                 s.light_switch(spot["lightSwitch"])
             if spot.get("switchTest") and not a.no_remix and late:

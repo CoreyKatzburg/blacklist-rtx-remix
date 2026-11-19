@@ -684,6 +684,32 @@ class Reference(unittest.TestCase):
         s.bench({"settle": 0, "frames": 1})
         self.assertNotIn("light_switch", [o[0] for o in order if isinstance(o, tuple)])
 
+    def test_goggle_cycles_press_the_toggle_key_on_then_off_each_in_its_own_window(self):
+        # BLK-13 recording: night vision on and off with no Remix, one window per step so the replay knows its frames.
+        s = drive.Spot.__new__(drive.Spot)
+        s.spot = {"goggleKeys": {"toggle": "F", "cycle": "X"}}
+        s.a = mock.Mock(pid=1)
+        held, names, log = [], [], ["", "Goggles: on (game view 0)", "", "x"]
+        s.hold = lambda seconds, **k: held.append(seconds)
+        s.log = mock.Mock(new_text=lambda: "".join(log[: len(names) + 1]))
+        windows = []
+
+        def window(name, kind, body, **k):
+            names.append(name)
+            body()
+            windows.append({"name": name, "kind": kind, **k})
+            return windows[-1]
+        s.window = window
+        taps = []
+        with mock.patch.object(drive, "tap", taps.append), mock.patch.object(drive, "game_window", lambda pid: 0):
+            s.goggle_cycles({"cycles": 2, "onSeconds": 3, "offSeconds": 5})
+        self.assertEqual(names, ["goggles_on_1", "goggles_off_1", "goggles_on_2", "goggles_off_2"])
+        self.assertEqual(taps, ["F"] * 4)
+        self.assertEqual(held, [3.0, 5.0, 3.0, 5.0])
+        self.assertEqual({w["kind"] for w in windows}, {"goggles_cycle"})
+        self.assertEqual(windows[0]["proxyLogSaid"], True)
+        self.assertEqual(windows[1]["proxyLogSaid"], False)
+
     def test_switch_pose_limits(self):
         # Worker B, Nov 17: a switch still counts only within 8 units, 1.5 deg yaw and 1.0 deg pitch of switch_base.
         base = [-10700.0, -560.0, -380.0, -67.0, 0.0]
