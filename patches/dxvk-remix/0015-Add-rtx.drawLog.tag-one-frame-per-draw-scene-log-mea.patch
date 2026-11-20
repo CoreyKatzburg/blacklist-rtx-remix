@@ -1,0 +1,451 @@
+From ee695ffff4a02007ac983dd35ed4859c17ffefb3 Mon Sep 17 00:00:00 2001
+From: CoreyKatzburg <64795827+CoreyKatzburg@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 20:34:07 -0500
+Subject: [PATCH 15/17] Add rtx.drawLog.tag: one-frame per-draw scene log
+ (measurement only)
+
+For the white tanks at con_boiler: when rtx.drawLog.tag changes to a new
+non-empty value, the next frame's draws that reach processDrawCallState are
+written to gate\<tag>_remix_draws.tsv with geometry, material and stage-0
+image hashes, the texcoord source (decl, vscapture, texgen, none), whether
+the albedo was tracked for the draw and for its instance's surface material,
+and whether a running USD capture holds the material and the mesh's material.
+This tells the no-texcoords branch apart from the material-hash and capture
+binding branches, which the proxy draw dump cannot.
+
+Off by default. With the tag empty the only cost is one bool test per draw
+(1.1 ns per draw offline) and one string test per frame; no behaviour changes.
+Format and tests: rtx_draw_log.h, tools/remix tests/remix_source/draw_log_test.cpp
+and tests/analysis/remix_draw_log.py.
+
+Amp-Thread-ID: https://ampcode.com/threads/T-01a1e070-32c4-730c-bdfc-76d09e1f79eb
+Co-authored-by: Amp <amp@ampcode.com>
+---
+ src/dxvk/meson.build                      |   1 +
+ src/dxvk/rtx_render/rtx_draw_log.h        | 198 ++++++++++++++++++++++
+ src/dxvk/rtx_render/rtx_game_capturer.cpp |  16 ++
+ src/dxvk/rtx_render/rtx_game_capturer.h   |  10 ++
+ src/dxvk/rtx_render/rtx_scene_manager.cpp |  87 ++++++++++
+ src/dxvk/rtx_render/rtx_scene_manager.h   |  11 ++
+ 6 files changed, 323 insertions(+)
+ create mode 100644 src/dxvk/rtx_render/rtx_draw_log.h
+
+diff --git a/src/dxvk/meson.build b/src/dxvk/meson.build
+index 6cbbdcd..d8239a5 100644
+--- a/src/dxvk/meson.build
++++ b/src/dxvk/meson.build
+@@ -217,6 +217,7 @@ dxvk_src = files([
+   'rtx_render/rtx_draw_call_cache.h',
+   'rtx_render/rtx_draw_call_tracker.cpp',
+   'rtx_render/rtx_draw_call_tracker.h',
++  'rtx_render/rtx_draw_log.h',
+   'rtx_render/rtx_dust_particles.cpp',
+   'rtx_render/rtx_dust_particles.h',
+   'rtx_render/rtx_env.cpp',
+diff --git a/src/dxvk/rtx_render/rtx_draw_log.h b/src/dxvk/rtx_render/rtx_draw_log.h
+new file mode 100644
+index 0000000..32dcb0a
+--- /dev/null
++++ b/src/dxvk/rtx_render/rtx_draw_log.h
+@@ -0,0 +1,198 @@
++#pragma once
++
++#include <cstdint>
++#include <cstdio>
++#include <filesystem>
++#include <string>
++#include <system_error>
++#include <vector>
++
++// NV-DXVK start: per-draw scene log (worker C, Nov 16)
++//
++// A measurement, not a fix: with rtx.drawLog.tag empty (the default) nothing is recorded and the only
++// cost is one bool test per draw. When the tag changes to a non-empty value, the next frame's draws are
++// recorded as they reach SceneManager::processDrawCallState, and at that frame's end one file is written:
++// gate\<tag>_remix_draws.tsv next to the game exe (the folder rtx.gateDumpTag writes to).
++//
++// Line format (tab separated key=value, so new keys can be appended without breaking readers):
++//   remixframe  frame=<Remix frame id, as telemetry "frame">  qpcMs=<telemetry qpcMs>  tag=<tag>  draws=<rows>
++//   remixdraw   one per draw, keys in this order:
++//     order      position among the draws that reached the scene this frame (0-based)
++//     dcid       D3D9 draw index this frame (DrawCallState::drawCallID; counts every draw Remix considered)
++//     ext        1 for a Remix API (external) draw, 0 for a game draw
++//     cam        CameraType (0 Main, 1 ViewModel, 2 Portal0, 3 Portal1, 4 Sky, 5 RenderToTexture, 6 Unknown)
++//     ignored    1 when the material is ignored (no instance is made)
++//     verts idx prims   vertex count, index count, triangles ((idx ? idx : verts) / 3)
++//     geom       geometry hash under rtx.geometryAssetHashRule (USD capture names meshes from this rule)
++//     mat        legacy material hash (the stage-0 image hash unless overridden)
++//     rmat       hash of the material Remix renders with (differs from mat when a replacement applies)
++//     rtype      0 opaque, 1 translucent, 2 ray portal
++//     t0 t0empty t0valid   stage-0 image hash, 1 when no image view is bound, 1 when the texture ref is valid
++//     t1         stage-1 image hash
++//     tc         DrawCallState::hasTextureCoordinates()
++//     tcsrc      where the texcoords came from: decl, vscapture (vertex shader output), texgen, none
++//     tcfmt tcstride tcoff   VkFormat, stride and offset-from-slice of the texcoord buffer (0 when none)
++//     ralbedo    1 when the rendered material's albedo texture is valid and has an image, 0 if not, -1 not opaque
++//     drawtrack  1 when this draw's albedo would be tracked (ralbedo 1 and tc 1), else 0
++//     inst       RtInstance id (0 when no instance)
++//     instmat    legacy material hash bound to that instance (the first draw of the instance this frame wins)
++//     instalbedo 1 when the instance's bound surface material has an albedo texture index, 0 if not, -1 not opaque
++//     blasmat    legacy material hash in the BLAS entry's input (what a USD capture keys the mesh with)
++//     capmesh    the USD capture's mesh hash for this draw (BLAS input hash under the asset rule)
++//     cap        1 while a USD capture is running, 0 otherwise
++//     capmat     1/0 whether mat is in the capture's materials, -1 when no capture
++//     capmeshmat 1/0 whether the capture's mesh entry for capmesh has its matHash in materials,
++//                -1 when no capture or the mesh is not captured yet
++//     capmeshmathash  that mesh entry's matHash (0 when none)
++
++namespace dxvk {
++
++  enum class DrawLogTexcoordSource : uint8_t { None = 0, Decl, VsCapture, Texgen };
++
++  inline const char* drawLogTexcoordSourceName(DrawLogTexcoordSource s) {
++    switch (s) {
++    case DrawLogTexcoordSource::Decl: return "decl";
++    case DrawLogTexcoordSource::VsCapture: return "vscapture";
++    case DrawLogTexcoordSource::Texgen: return "texgen";
++    default: return "none";
++    }
++  }
++
++  // Vertex capture writes positions and texcoord0 into one slice with one stride (d3d9_rtx.cpp prepareVertexCapture),
++  // so a texcoord buffer on the same buffer, at the same stride, as a captured position buffer came from the shader.
++  inline DrawLogTexcoordSource classifyDrawLogTexcoords(bool texcoordDefined, bool texgen, bool usesVertexShader,
++                                                        bool sameBufferAsPosition, bool sameStrideAsPosition,
++                                                        bool positionIsCaptured) {
++    if (texcoordDefined) {
++      if (usesVertexShader && positionIsCaptured && sameBufferAsPosition && sameStrideAsPosition) {
++        return DrawLogTexcoordSource::VsCapture;
++      }
++      return DrawLogTexcoordSource::Decl;
++    }
++    return texgen ? DrawLogTexcoordSource::Texgen : DrawLogTexcoordSource::None;
++  }
++
++  struct DrawLogRow {
++    uint32_t order = 0;
++    uint32_t dcid = 0;
++    bool ext = false;
++    int cam = 0;
++    bool ignored = false;
++    uint32_t verts = 0;
++    uint32_t idx = 0;
++    uint64_t geom = 0;
++    uint64_t mat = 0;
++    uint64_t rmat = 0;
++    int rtype = 0;
++    uint64_t t0 = 0;
++    bool t0empty = true;
++    bool t0valid = false;
++    uint64_t t1 = 0;
++    bool tc = false;
++    DrawLogTexcoordSource tcsrc = DrawLogTexcoordSource::None;
++    uint32_t tcfmt = 0;
++    uint32_t tcstride = 0;
++    uint32_t tcoff = 0;
++    int ralbedo = -1;
++    uint64_t inst = 0;
++    uint64_t instmat = 0;
++    int instalbedo = -1;
++    uint64_t blasmat = 0;
++    uint64_t capmesh = 0;
++    bool cap = false;
++    int capmat = -1;
++    int capmeshmat = -1;
++    uint64_t capmeshmathash = 0;
++  };
++
++  inline std::string formatDrawLogRow(const DrawLogRow& r) {
++    char buf[1024];
++    const uint32_t prims = (r.idx ? r.idx : r.verts) / 3;
++    const int drawtrack = (r.ralbedo == 1 && r.tc) ? 1 : 0;
++    std::snprintf(buf, sizeof(buf),
++      "remixdraw\torder=%u\tdcid=%u\text=%d\tcam=%d\tignored=%d\tverts=%u\tidx=%u\tprims=%u"
++      "\tgeom=%016llX\tmat=%016llX\trmat=%016llX\trtype=%d"
++      "\tt0=%016llX\tt0empty=%d\tt0valid=%d\tt1=%016llX"
++      "\ttc=%d\ttcsrc=%s\ttcfmt=%u\ttcstride=%u\ttcoff=%u"
++      "\tralbedo=%d\tdrawtrack=%d\tinst=%llu\tinstmat=%016llX\tinstalbedo=%d"
++      "\tblasmat=%016llX\tcapmesh=%016llX\tcap=%d\tcapmat=%d\tcapmeshmat=%d\tcapmeshmathash=%016llX\n",
++      r.order, r.dcid, r.ext ? 1 : 0, r.cam, r.ignored ? 1 : 0, r.verts, r.idx, prims,
++      (unsigned long long) r.geom, (unsigned long long) r.mat, (unsigned long long) r.rmat, r.rtype,
++      (unsigned long long) r.t0, r.t0empty ? 1 : 0, r.t0valid ? 1 : 0, (unsigned long long) r.t1,
++      r.tc ? 1 : 0, drawLogTexcoordSourceName(r.tcsrc), r.tcfmt, r.tcstride, r.tcoff,
++      r.ralbedo, drawtrack, (unsigned long long) r.inst, (unsigned long long) r.instmat, r.instalbedo,
++      (unsigned long long) r.blasmat, (unsigned long long) r.capmesh, r.cap ? 1 : 0, r.capmat, r.capmeshmat,
++      (unsigned long long) r.capmeshmathash);
++    return buf;
++  }
++
++  // Records one frame of rows on request. Not thread safe: every call comes from the render (CS) thread.
++  class DrawLog {
++  public:
++    bool active() const { return m_active; }
++
++    // Called once per frame end, after write(). Arms the next frame when tag is non-empty and differs from the last
++    // armed tag; an empty tag disarms and forgets the last tag, so the same tag can be asked for again later.
++    void armIfNewTag(const std::string& tag) {
++      if (tag.empty()) {
++        m_lastTag.clear();
++        return;
++      }
++      if (tag == m_lastTag) {
++        return;
++      }
++      m_lastTag = tag;
++      m_tag = tag;
++      m_rows.clear();
++      m_active = true;
++    }
++
++    void add(DrawLogRow row) {
++      row.order = static_cast<uint32_t>(m_rows.size());
++      m_rows.push_back(row);
++    }
++
++    // Writes the armed frame to <dir>\<tag>_remix_draws.tsv and disarms. Returns the path written, or "" when not
++    // armed or the write failed (the log is a measurement; a failed write changes nothing else).
++    std::string write(const std::filesystem::path& dir, uint64_t frameId, double qpcMs) {
++      if (!m_active) {
++        return {};
++      }
++      m_active = false;
++      std::string text;
++      char head[512];
++      std::snprintf(head, sizeof(head), "remixframe\tframe=%llu\tqpcMs=%.3f\ttag=%s\tdraws=%zu\n",
++                    (unsigned long long) frameId, qpcMs, m_tag.c_str(), m_rows.size());
++      text += head;
++      for (const DrawLogRow& r : m_rows) {
++        text += formatDrawLogRow(r);
++      }
++      m_rows.clear();
++      m_rows.shrink_to_fit();
++      std::error_code ec;
++      std::filesystem::create_directories(dir, ec);
++      const std::filesystem::path path = dir / (m_tag + "_remix_draws.tsv");
++      const std::filesystem::path tmp = dir / (m_tag + "_remix_draws.tsv.tmp");
++      FILE* f = nullptr;
++      if (_wfopen_s(&f, tmp.c_str(), L"wb") != 0 || f == nullptr) {
++        return {};
++      }
++      const bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size();
++      std::fclose(f);
++      if (!ok) {
++        std::filesystem::remove(tmp, ec);
++        return {};
++      }
++      std::filesystem::rename(tmp, path, ec);
++      return ec ? std::string() : path.string();
++    }
++
++  private:
++    bool m_active = false;
++    std::string m_tag;
++    std::string m_lastTag;
++    std::vector<DrawLogRow> m_rows;
++  };
++
++}
++// NV-DXVK end
+diff --git a/src/dxvk/rtx_render/rtx_game_capturer.cpp b/src/dxvk/rtx_render/rtx_game_capturer.cpp
+index 33d74ab..4f838b6 100644
+--- a/src/dxvk/rtx_render/rtx_game_capturer.cpp
++++ b/src/dxvk/rtx_render/rtx_game_capturer.cpp
+@@ -502,6 +502,22 @@ namespace dxvk {
+     Logger::debug("[GameCapturer][" + m_pCap->idStr + "][Inst:" + hashToString(instanceId) + "] New");
+   }
+ 
++  GameCapturer::DrawLogCaptureInfo GameCapturer::drawLogCaptureInfo(XXH64_hash_t meshHash, XXH64_hash_t matHash) {
++    DrawLogCaptureInfo info;
++    if (!m_state.has<State::Capturing>() || m_pCap == nullptr) {
++      return info;
++    }
++    info.capturing = true;
++    info.matCaptured = m_pCap->materials.count(matHash) > 0 ? 1 : 0;
++    std::lock_guard lock(m_meshMutex);
++    const auto it = m_pCap->meshes.find(meshHash);
++    if (it != m_pCap->meshes.end() && it->second != nullptr) {
++      info.meshMatHash = it->second->matHash;
++      info.meshMatCaptured = m_pCap->materials.count(info.meshMatHash) > 0 ? 1 : 0;
++    }
++    return info;
++  }
++
+   void GameCapturer::captureMaterial(const Rc<DxvkContext> ctx, const LegacyMaterialData& materialData, const bool bEnableOpacity) {
+     lss::Material lssMat; // to be populated
+ 
+diff --git a/src/dxvk/rtx_render/rtx_game_capturer.h b/src/dxvk/rtx_render/rtx_game_capturer.h
+index f057d63..962a18b 100644
+--- a/src/dxvk/rtx_render/rtx_game_capturer.h
++++ b/src/dxvk/rtx_render/rtx_game_capturer.h
+@@ -159,6 +159,16 @@ public:
+ 
+   static std::string getCaptureInstanceStageNameWithTimestamp();
+ 
++  // Per-draw scene log (rtx.drawLog.tag): whether a running capture holds this draw's material, and the material
++  // its mesh entry was keyed with (prepExportInstances binds an instance only when that one is in materials).
++  struct DrawLogCaptureInfo {
++    bool capturing = false;
++    int matCaptured = -1;      // -1 no capture
++    int meshMatCaptured = -1;  // -1 no capture, or the mesh is not captured yet
++    XXH64_hash_t meshMatHash = 0;
++  };
++  DrawLogCaptureInfo drawLogCaptureInfo(XXH64_hash_t meshHash, XXH64_hash_t matHash);
++
+ private:
+   GameCapturer() = delete;
+   GameCapturer(const GameCapturer& other) = delete;
+diff --git a/src/dxvk/rtx_render/rtx_scene_manager.cpp b/src/dxvk/rtx_render/rtx_scene_manager.cpp
+index 4d8d52d..b9d439c 100644
+--- a/src/dxvk/rtx_render/rtx_scene_manager.cpp
++++ b/src/dxvk/rtx_render/rtx_scene_manager.cpp
+@@ -657,6 +657,13 @@ namespace dxvk {
+     ScopedCpuProfileZone();
+ 
+     m_device->getCommon()->getTextureManager().retireDestroyedGameTextures();
++    if (m_drawLog.active()) {
++      const std::filesystem::path gateDir = std::filesystem::path(env::getExePath()).parent_path() / "gate";
++      const std::string written = m_drawLog.write(gateDir, m_device->getCurrentFrameId(), m_telemetry.qpcMs);
++      Logger::info(str::format("[DrawLog] frame ", m_device->getCurrentFrameId(), ": ",
++                               written.empty() ? std::string("write failed") : written));
++    }
++    m_drawLog.armIfNewTag(tag());
+     writeFrameTelemetry(ctx, raytracedThisFrame);
+ 
+     manageTextureVram();
+@@ -1264,6 +1271,9 @@ namespace dxvk {
+     ScopedCpuProfileZone();
+ 
+     if (renderMaterialData.getIgnored()) {
++      if (m_drawLog.active()) {
++        addDrawLogRow(drawCallState, renderMaterialData, nullptr);
++      }
+       return nullptr;
+     }
+ 
+@@ -1357,9 +1367,84 @@ namespace dxvk {
+       }
+     }
+ 
++    if (m_drawLog.active()) {
++      addDrawLogRow(drawCallState, renderMaterialData, instance);
++    }
++
+     return instance; 
+   }
+ 
++  void SceneManager::addDrawLogRow(const DrawCallState& drawCallState, const MaterialData& renderMaterialData,
++                                   const RtInstance* instance) {
++    const RasterGeometry& geo = drawCallState.getGeometryData();
++    const LegacyMaterialData& legacy = drawCallState.getMaterialData();
++    const HashRule& assetRule = RtxOptions::geometryAssetHashRule();
++
++    DrawLogRow r;
++    r.dcid = drawCallState.drawCallID;
++    r.ext = m_drawLogExternal;
++    r.cam = static_cast<int>(drawCallState.cameraType);
++    r.ignored = renderMaterialData.getIgnored();
++    r.verts = geo.vertexCount;
++    r.idx = geo.indexCount;
++    r.geom = geo.getHashForRule(assetRule);
++    r.mat = legacy.getHash();
++    r.rmat = renderMaterialData.getHash();
++    r.rtype = static_cast<int>(renderMaterialData.getType());
++    r.t0 = legacy.getColorTexture().getImageHash();
++    r.t0empty = legacy.getColorTexture().isImageEmpty();
++    r.t0valid = legacy.getColorTexture().isValid();
++    r.t1 = legacy.getColorTexture2().getImageHash();
++    r.tc = drawCallState.hasTextureCoordinates();
++
++    const RasterBuffer& tcBuf = geo.texcoordBuffer;
++    const RasterBuffer& posBuf = geo.positionBuffer;
++    const bool tcDefined = tcBuf.defined();
++    const bool posCaptured = posBuf.defined() && posBuf.stride() == sizeof(CapturedVertex) &&
++                             posBuf.vertexFormat() == VK_FORMAT_R32G32B32A32_SFLOAT;
++    r.tcsrc = classifyDrawLogTexcoords(tcDefined, drawCallState.getTransformData().texgenMode != TexGenMode::None,
++                                       drawCallState.usesVertexShader,
++                                       tcDefined && posBuf.defined() && tcBuf.buffer() == posBuf.buffer(),
++                                       tcDefined && tcBuf.stride() == posBuf.stride(), posCaptured);
++    if (tcDefined) {
++      r.tcfmt = static_cast<uint32_t>(tcBuf.vertexFormat());
++      r.tcstride = tcBuf.stride();
++      r.tcoff = tcBuf.offsetFromSlice();
++    }
++
++    if (renderMaterialData.getType() == MaterialDataType::Opaque) {
++      const TextureRef& albedo = renderMaterialData.getOpaqueMaterialData().getAlbedoOpacityTexture();
++      r.ralbedo = (albedo.isValid() && !albedo.isImageEmpty()) ? 1 : 0;
++    }
++
++    if (instance != nullptr) {
++      r.inst = instance->getId();
++      r.instmat = instance->getMaterialDataHash();
++      const uint32_t surfaceIdx = instance->surface.surfaceMaterialIndex;
++      if (surfaceIdx < m_surfaceMaterialCache.getTotalCount()) {
++        const RtSurfaceMaterial& surface = m_surfaceMaterialCache.getObjectTable()[surfaceIdx];
++        if (surface.getType() == RtSurfaceMaterialType::Opaque) {
++          r.instalbedo = surface.getOpaqueSurfaceMaterial().getAlbedoOpacityTextureIndex() !=
++                         kSurfaceMaterialInvalidTextureIndex ? 1 : 0;
++        }
++      }
++      if (const BlasEntry* pBlas = instance->getBlas()) {
++        r.blasmat = pBlas->input.getMaterialData().getHash();
++        r.capmesh = pBlas->input.getHash(assetRule);
++      }
++    }
++
++    if (auto capturer = m_device->getCommon()->capturer(); capturer != nullptr) {
++      const GameCapturer::DrawLogCaptureInfo info = capturer->drawLogCaptureInfo(r.capmesh, r.mat);
++      r.cap = info.capturing;
++      r.capmat = info.matCaptured;
++      r.capmeshmat = info.meshMatCaptured;
++      r.capmeshmathash = info.meshMatHash;
++    }
++
++    m_drawLog.add(r);
++  }
++
+   const RtSurfaceMaterial& SceneManager::createSurfaceMaterial(const MaterialData& renderMaterialData,
+                                                                const DrawCallState& drawCallState,
+                                                                uint32_t* out_indexInCache) {
+@@ -2210,9 +2295,11 @@ namespace dxvk {
+       RtInstance* existingInstance = (replacementInstance->prims.size() > i)
+           ? replacementInstance->prims[i].getInstance() : nullptr;
+ 
++      m_drawLogExternal = true;
+       RtInstance* instance = processDrawCallState(ctx, state.drawCall,
+           material != nullptr ? MaterialData(*material) : LegacyMaterialData().as<OpaqueMaterialData>(),
+           existingInstance, pParticles);
++      m_drawLogExternal = false;
+ 
+       if (instance != nullptr) {
+         if (replacementInstance->root.getUntyped() == nullptr) {
+diff --git a/src/dxvk/rtx_render/rtx_scene_manager.h b/src/dxvk/rtx_render/rtx_scene_manager.h
+index 8d35ce3..1655cbe 100644
+--- a/src/dxvk/rtx_render/rtx_scene_manager.h
++++ b/src/dxvk/rtx_render/rtx_scene_manager.h
+@@ -53,6 +53,7 @@
+ #include "graph/rtx_graph_manager.h"
+ #include "rtx_particle_system.h"
+ #include "rtx_telemetry.h"
++#include "rtx_draw_log.h"
+ #include <d3d9types.h>
+ 
+ namespace dxvk 
+@@ -262,7 +263,17 @@ public:
+   void addTelemetryCpuMs(double ms) { m_telemetry.telemetryCpuMs += ms; }
+   void setTelemetryQpcMs(double ms) { m_telemetry.qpcMs = ms; }
+ 
++  RTX_OPTION("rtx.drawLog", std::string, tag, "",
++             "Measurement only, off when empty. When changed to a non-empty tag, the next frame's draws that reach the "
++             "scene are written one line each to gate/<tag>_remix_draws.tsv next to the game exe (hashes, texcoord "
++             "source, whether an albedo texture was tracked, USD capture binding). See rtx_draw_log.h.");
++
+ private:
++  // Per-draw scene log (rtx.drawLog.tag); records nothing unless armed.
++  void addDrawLogRow(const DrawCallState& drawCallState, const MaterialData& renderMaterialData, const RtInstance* instance);
++  DrawLog m_drawLog;
++  bool m_drawLogExternal = false;
++
+   enum class ObjectCacheState
+   {
+     kUpdateInstance = 0,

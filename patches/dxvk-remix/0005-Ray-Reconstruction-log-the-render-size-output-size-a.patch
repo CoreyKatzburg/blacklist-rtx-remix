@@ -1,0 +1,35 @@
+From 8d580793ad6cacb555e867cee30993256a0deee8 Mon Sep 17 00:00:00 2001
+From: CoreyKatzburg <64795827+CoreyKatzburg@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 00:39:46 -0500
+Subject: [PATCH 05/17] Ray Reconstruction: log the render size, output size
+ and preset at creation
+
+Gate launches with identical settings (qualityDLSS 3, dlssPreset 2, model 1) run RR at either about 11.1 or 13.3 ms,
+and the size RR actually renders at was not recorded anywhere, so a settings sweep could not confirm it changed.
+One remix-dxvk.log line per (re)creation: [RTX Ray Reconstruction] created: render WxH, output WxH, preset A/D/E,
+perfQuality N.
+
+Amp-Thread-ID: https://ampcode.com/threads/T-01a1e070-32c4-730c-bdfc-76d09e1f79eb
+Co-authored-by: Amp <amp@ampcode.com>
+---
+ src/dxvk/rtx_render/rtx_ray_reconstruction.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/dxvk/rtx_render/rtx_ray_reconstruction.cpp b/src/dxvk/rtx_render/rtx_ray_reconstruction.cpp
+index 09c8322..189ffa9 100644
+--- a/src/dxvk/rtx_render/rtx_ray_reconstruction.cpp
++++ b/src/dxvk/rtx_render/rtx_ray_reconstruction.cpp
+@@ -446,6 +446,12 @@ namespace dxvk {
+       auto optimalSettings = m_rayReconstructionContext->queryOptimalSettings(mInputSize, perfQuality);
+ 
+       m_rayReconstructionContext->initialize(renderContext, mInputSize, mDLSSOutputSize, mIsHDR, mInverseDepth, mAutoExposure, false, dlssdModel, perfQuality);
++      // The render size Ray Reconstruction actually runs at is otherwise not recorded anywhere; settings sweeps change it.
++      const char presetLetter = dlssdModel == NVSDK_NGX_RayReconstruction_Hint_Render_Preset_A ? 'A'
++                              : dlssdModel == NVSDK_NGX_RayReconstruction_Hint_Render_Preset_D ? 'D' : 'E';
++      Logger::info(str::format("[RTX Ray Reconstruction] created: render ", mInputSize[0], "x", mInputSize[1],
++                               ", output ", mDLSSOutputSize[0], "x", mDLSSOutputSize[1],
++                               ", preset ", presetLetter, ", perfQuality ", uint32_t(perfQuality)));
+     }
+   }
+ } // namespace dxvk
+\ No newline at end of file

@@ -1,0 +1,382 @@
+From 0c1388145ae5a3e4c6591157440d7cae1b4b8101 Mon Sep 17 00:00:00 2001
+From: CoreyKatzburg <64795827+CoreyKatzburg@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 09:50:23 -0500
+Subject: [PATCH 11/17] Add rtx.captureAllInstances (default off): vertex
+ capture writes every instance of an instanced draw to its own slots
+
+The capture shader writes slot (VertexIndex - baseVertex) + InstanceIndex * instanceVertexStride (the former
+padding member). With the option on, a triangle-list draw with n > 1 instances gets an n-times buffer and
+indices repeated per copy (32-bit when they no longer fit 16), texcoord and colour come from the capture
+slice or are dropped, and the copy count is mixed into the geometry descriptor hash. Strips, fans and
+draws over 4M captured vertices keep one copy. Every instanced captured draw calls countInstancedCapture.
+
+Amp-Thread-ID: https://ampcode.com/threads/T-01a1e1fe-618a-70d3-af1b-fbcbdff96aa4
+Co-authored-by: Amp <amp@ampcode.com>
+---
+ src/d3d9/d3d9_rtx.cpp                 | 81 +++++++++++++++++++++++++--
+ src/d3d9/d3d9_rtx.h                   | 16 +++++-
+ src/d3d9/d3d9_rtx_geometry.cpp        |  8 ++-
+ src/d3d9/d3d9_rtx_instanced_capture.h | 32 ++++++++---
+ src/d3d9/d3d9_state.h                 |  8 ++-
+ src/dxso/dxso_compiler.cpp            | 25 +++++++--
+ 6 files changed, 146 insertions(+), 24 deletions(-)
+
+diff --git a/src/d3d9/d3d9_rtx.cpp b/src/d3d9/d3d9_rtx.cpp
+index 6d7c5ce..bd38811 100644
+--- a/src/d3d9/d3d9_rtx.cpp
++++ b/src/d3d9/d3d9_rtx.cpp
+@@ -160,7 +160,35 @@ namespace dxvk {
+     return DxvkBufferSlice(pDevice->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::AppBuffer, "Vertex Capture Buffer"));
+   }
+ 
+-  void D3D9Rtx::prepareVertexCapture(const int vertexIndexOffset) {
++  // NV-DXVK start: vertex capture for hardware-instanced draws
++  // Repeats the draw's (rebased) indices once per captured copy, each offset by the copy's first slot.
++  void D3D9Rtx::expandIndicesForInstances(const InstancedCaptureLayout& instancedLayout, RasterGeometry& geoData) {
++    ScopedCpuProfileZone();
++
++    const bool srcIs32 = geoData.indexBuffer.indexType() == VK_INDEX_TYPE_UINT32;
++    const bool dstIs32 = srcIs32 || instancedLayout.needs32BitIndices;
++    const uint32_t dstStride = dstIs32 ? 4 : 2;
++
++    DxvkBufferSlice dst = m_rtStagingData.alloc(CACHE_LINE_SIZE, size_t(instancedLayout.indexCount) * dstStride);
++    // Acquire prevents the staging allocator from re-using this memory
++    dst.buffer()->acquire(DxvkAccess::Read);
++
++    const void* pSrc = geoData.indexBuffer.mapPtr(0);
++    void* pDst = dst.mapPtr(0);
++    if (srcIs32) {
++      expandInstancedIndices((const uint32_t*) pSrc, geoData.indexCount, instancedLayout, (uint32_t*) pDst);
++    } else if (dstIs32) {
++      expandInstancedIndices((const uint16_t*) pSrc, geoData.indexCount, instancedLayout, (uint32_t*) pDst);
++    } else {
++      expandInstancedIndices((const uint16_t*) pSrc, geoData.indexCount, instancedLayout, (uint16_t*) pDst);
++    }
++
++    geoData.indexBuffer = RasterBuffer(dst, 0, dstStride, dstIs32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
++    geoData.indexCount = instancedLayout.indexCount;
++  }
++  // NV-DXVK end
++
++  void D3D9Rtx::prepareVertexCapture(const int vertexIndexOffset, const InstancedCaptureLayout& instancedLayout) {
+     ScopedCpuProfileZone();
+ 
+     static_assert(sizeof CapturedVertex == 48, "The injected shader code is expecting this exact structure size to work correctly, see emitVertexCaptureWrite in dxso_compiler.cpp");
+@@ -185,7 +213,12 @@ namespace dxvk {
+ 
+     // Known stride for vertex capture buffers
+     const uint32_t stride = sizeof(CapturedVertex);
+-    const size_t vertexCaptureDataSize = align(geoData.vertexCount * stride, CACHE_LINE_SIZE);
++    // NV-DXVK start: vertex capture for hardware-instanced draws
++    // With several copies, every per-vertex buffer must hold capturedVertexCount entries: only buffers in
++    // the capture slice do, the input streams hold one instance.
++    const bool allCopies = instancedLayout.copies > 1;
++    const size_t vertexCaptureDataSize = align(size_t(instancedLayout.capturedVertexCount) * stride, CACHE_LINE_SIZE);
++    // NV-DXVK end
+ 
+     DxvkBufferSlice slice = allocVertexCaptureBuffer(m_parent->GetDXVKDevice().ptr(), vertexCaptureDataSize);
+ 
+@@ -195,12 +228,16 @@ namespace dxvk {
+     const bool isParticleDraw = lookupHash(RtxOptions::particleTextures(), m_activeDrawCallState.materialData.colorTextures[0].getImageHash());
+     // Did we have a texcoord buffer bound for this draw?  Note, we currently get texcoord from the vertex shader output.
+     // Particle shaders compute corner UVs + sprite-sheet frames in OUT TEXCOORD0, so always prefer captured texcoord0 for particles.
+-    if (BoundShaderHas(vertexShader, DxsoUsage::Texcoord, false) && (isParticleDraw || !geoData.texcoordBuffer.defined() || !RtxGeometryUtils::isTexcoordFormatValid(geoData.texcoordBuffer.vertexFormat()))) {
++    // NV-DXVK start: vertex capture for hardware-instanced draws (allCopies)
++    if (BoundShaderHas(vertexShader, DxsoUsage::Texcoord, false) && (allCopies || isParticleDraw || !geoData.texcoordBuffer.defined() || !RtxGeometryUtils::isTexcoordFormatValid(geoData.texcoordBuffer.vertexFormat()))) {
+       // Known offset for vertex capture buffers
+       const uint32_t texcoordOffset = offsetof(CapturedVertex, texcoord0);
+       geoData.texcoordBuffer = RasterBuffer(slice, texcoordOffset, stride, VK_FORMAT_R32G32_SFLOAT);
+       assert(geoData.texcoordBuffer.offset() % 4 == 0);
++    } else if (allCopies) {
++      geoData.texcoordBuffer = RasterBuffer();
+     }
++    // NV-DXVK end
+ 
+     // Capture normals only from the shader output that holds the transformed (skinned, world-space)
+     // normal, found by analysing the shader bytecode. The raw input normal is not usable: games pack
+@@ -225,8 +262,21 @@ namespace dxvk {
+       const uint32_t colorOffset = offsetof(CapturedVertex, color0);
+       geoData.color0Buffer = RasterBuffer(slice, colorOffset, stride, VK_FORMAT_B8G8R8A8_UNORM);
+       assert(geoData.color0Buffer.offset() % 4 == 0);
++    // NV-DXVK start: vertex capture for hardware-instanced draws
++    } else if (allCopies) {
++      geoData.color0Buffer = RasterBuffer();
+     }
+ 
++    if (allCopies) {
++      geoData.blendWeightBuffer = RasterBuffer();
++      geoData.blendIndicesBuffer = RasterBuffer();
++      if (geoData.indexCount > 0) {
++        expandIndicesForInstances(instancedLayout, geoData);
++      }
++      geoData.vertexCount = instancedLayout.capturedVertexCount;
++    }
++    // NV-DXVK end
++
+     auto constants = m_vsVertexCaptureData->allocSlice();
+ 
+     // Upload
+@@ -236,6 +286,9 @@ namespace dxvk {
+     data.worldToObject = inverseAffine(m_activeDrawCallState.transformData.objectToWorld);
+     data.normalTransform = m_activeDrawCallState.transformData.objectToWorld;
+     data.baseVertex = (uint32_t)std::max(0, vertexIndexOffset);
++    // NV-DXVK start: vertex capture for hardware-instanced draws
++    data.instanceVertexStride = instancedLayout.instanceVertexStride;
++    // NV-DXVK end
+ 
+     m_parent->EmitCs([cVertexDataSlice = slice,
+                       cConstantBuffer = m_vsVertexCaptureData,
+@@ -704,7 +757,19 @@ namespace dxvk {
+ 
+     // Copy all the vertices into a staging buffer.  Assign fields of the geoData structure.
+     processVertices(vertexContext, vertexIndexOffset, geoData);
+-    geoData.futureGeometryHashes = computeHash(geoData, maxOffsetedIndex);
++    // NV-DXVK start: vertex capture for hardware-instanced draws
++    // The hash and bounding box below describe one instance (the input streams); the layout says how many
++    // copies the capture buffer will hold.
++    const bool needVertexCapture = m_parent->UseProgrammableVS() && useVertexCapture();
++    InstancedCaptureLayout instancedLayout;
++    if (needVertexCapture) {
++      const uint32_t drawInstanceCount =
++        m_parent->GenerateDrawInfo(drawContext.PrimitiveType, drawContext.PrimitiveCount, m_parent->GetInstanceCount()).instanceCount;
++      instancedLayout = planInstancedCapture(geoData.vertexCount, geoData.indexCount, drawInstanceCount,
++                                             geoData.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, captureAllInstances());
++    }
++    geoData.futureGeometryHashes = computeHash(geoData, maxOffsetedIndex, instancedLayout.copies);
++    // NV-DXVK end
+     geoData.futureBoundingBox = computeAxisAlignedBoundingBox(geoData);
+     
+     // Process skinning data
+@@ -723,10 +788,14 @@ namespace dxvk {
+     // Hash material data
+     m_activeDrawCallState.materialData.updateCachedHash();
+     // For shader based drawcalls we also want to capture the vertex shader output
+-    const bool needVertexCapture = m_parent->UseProgrammableVS() && useVertexCapture();
++    // NV-DXVK start: vertex capture for hardware-instanced draws
+     if (needVertexCapture) {
+-      prepareVertexCapture(vertexIndexOffset);
++      prepareVertexCapture(vertexIndexOffset, instancedLayout);
++      if (instancedLayout.copies > 1 || instancedLayout.sharedSlots) {
++        countInstancedCapture(instancedLayout.sharedSlots);
++      }
+     }
++    // NV-DXVK end
+ 
+     m_activeDrawCallState.usesVertexShader = m_parent->UseProgrammableVS();
+     m_activeDrawCallState.usesPixelShader = m_parent->UseProgrammablePS();
+diff --git a/src/d3d9/d3d9_rtx.h b/src/d3d9/d3d9_rtx.h
+index 61f25c9..ef87bbe 100644
+--- a/src/d3d9/d3d9_rtx.h
++++ b/src/d3d9/d3d9_rtx.h
+@@ -1,6 +1,9 @@
+ #pragma once
+ 
+ #include "d3d9_state.h"
++// NV-DXVK start: vertex capture for hardware-instanced draws
++#include "d3d9_rtx_instanced_capture.h"
++// NV-DXVK end
+ #include "../dxvk/dxvk_buffer.h"
+ #include "../util/util_threadpool.h"
+ 
+@@ -44,6 +47,9 @@ namespace dxvk {
+     // NV-DXVK start: opt-in use of synthesized vertex capture normals
+     RTX_OPTION("rtx", bool, useSynthesizedCaptureNormals, false, "When enabled, vertex shaders that consume NORMAL0 without writing a normal output use the smooth normal synthesized during vertex capture (skinned, world or object space) instead of geometric triangle normals. Off keeps the stock rule: only a detected normal output is used.");
+     // NV-DXVK end
++    // NV-DXVK start: vertex capture for hardware-instanced draws
++    RTX_OPTION("rtx", bool, captureAllInstances, false, "When enabled, vertex capture of a hardware-instanced triangle-list draw writes every instance to its own slots, so every copy is ray traced. Off keeps the stock behaviour: all instances write the same slots and only one copy survives.");
++    // NV-DXVK end
+     RTX_OPTION("rtx", bool, useWorldMatricesForShaders, true, "When enabled, Remix will utilize the world matrices being passed from the game via D3D9 fixed function API, even when running with shaders.  Sometimes games pass these matrices and they are useful, however for some games they are very unreliable, and should be filtered out.  If you're seeing precision related issues with shader vertex capture, try disabling this setting.");
+     RTX_OPTION("rtx", bool, enableIndexBufferMemoization, true, "CPU performance optimization, should generally be enabled.  Will reduce main thread time by caching processIndexBuffer operations and reusing when possible, this will come at the expense of some CPU RAM.");
+     RTX_OPTION("rtx", uint32_t, numGeometryProcessingThreads, 2, "The desired number of CPU threads to dedicate to geometry processing  Will be limited by the number of CPU cores.  There may be some advantage to lowering this number in games which are fairly simple and use a low number of draw calls per frame.  The default was determined by looking at a game with around 2000 draw calls per frame, and with a reasonably high average triangle count per draw.");
+@@ -260,7 +266,11 @@ namespace dxvk {
+     template<typename T>
+     DxvkBufferSlice processIndexBuffer(const uint32_t indexCount, const uint32_t startIndex, const IndexContext& indexCtx, uint32_t& minIndex, uint32_t& maxIndex);
+ 
+-    void prepareVertexCapture(const int vertexIndexOffset);
++    // NV-DXVK start: vertex capture for hardware-instanced draws
++    void prepareVertexCapture(const int vertexIndexOffset, const InstancedCaptureLayout& instancedLayout);
++
++    void expandIndicesForInstances(const InstancedCaptureLayout& instancedLayout, RasterGeometry& geoData);
++    // NV-DXVK end
+ 
+     void processVertices(const VertexContext vertexContext[caps::MaxStreams], int vertexIndexOffset, RasterGeometry& geoData);
+ 
+@@ -288,7 +298,9 @@ namespace dxvk {
+ 
+     Future<AxisAlignedBoundingBox> computeAxisAlignedBoundingBox(const RasterGeometry& geoData);
+ 
+-    Future<GeometryHashes> computeHash(const RasterGeometry& geoData, const uint32_t maxIndexValue);
++    // NV-DXVK start: instanceCopies > 1 marks a draw captured with every instance in its own slots
++    Future<GeometryHashes> computeHash(const RasterGeometry& geoData, const uint32_t maxIndexValue, const uint32_t instanceCopies);
++    // NV-DXVK end
+ 
+     void submitActiveDrawCallState();
+   };
+diff --git a/src/d3d9/d3d9_rtx_geometry.cpp b/src/d3d9/d3d9_rtx_geometry.cpp
+index 3e3ccb8..4815d6b 100644
+--- a/src/d3d9/d3d9_rtx_geometry.cpp
++++ b/src/d3d9/d3d9_rtx_geometry.cpp
+@@ -124,7 +124,7 @@ namespace dxvk {
+     }
+   }
+ 
+-  Future<GeometryHashes> D3D9Rtx::computeHash(const RasterGeometry& geoData, const uint32_t maxIndexValue) {
++  Future<GeometryHashes> D3D9Rtx::computeHash(const RasterGeometry& geoData, const uint32_t maxIndexValue, const uint32_t instanceCopies) {
+     ScopedCpuProfileZone();
+ 
+     const uint32_t indexCount = geoData.indexCount;
+@@ -185,6 +185,12 @@ namespace dxvk {
+                                                       geoData.vertexCount, 
+                                                       geoData.indexBuffer.indexType(), 
+                                                       geoData.topology);
++      // NV-DXVK start: vertex capture for hardware-instanced draws
++      // The hashed buffers describe one instance; a draw captured with all its copies is different geometry.
++      if (instanceCopies > 1) {
++        geometryDescriptorHash = XXH3_64bits_withSeed(&instanceCopies, sizeof(instanceCopies), geometryDescriptorHash);
++      }
++      // NV-DXVK end
+     }
+ 
+     // Calculate this based on the RasterGeometry input data
+diff --git a/src/d3d9/d3d9_rtx_instanced_capture.h b/src/d3d9/d3d9_rtx_instanced_capture.h
+index 947495f..2433ce6 100644
+--- a/src/d3d9/d3d9_rtx_instanced_capture.h
++++ b/src/d3d9/d3d9_rtx_instanced_capture.h
+@@ -10,6 +10,9 @@
+ 
+ namespace dxvk {
+ 
++  // Above this many captured vertices an instanced draw keeps one copy (bounds the buffer per draw).
++  constexpr uint64_t kMaxInstancedCaptureVertices = 1u << 22;
++
+   struct InstancedCaptureLayout {
+     // Copies of the mesh written to the capture buffer.
+     uint32_t copies = 1;
+@@ -28,29 +31,40 @@ namespace dxvk {
+   inline InstancedCaptureLayout planInstancedCapture(uint32_t vertexCount, uint32_t indexCount,
+                                                      uint32_t drawInstanceCount, bool isTriangleList,
+                                                      bool captureAllInstances) {
+-    (void) isTriangleList;
+-    (void) captureAllInstances;
+     InstancedCaptureLayout layout;
+     layout.capturedVertexCount = vertexCount;
+     layout.indexCount = indexCount;
+-    layout.sharedSlots = drawInstanceCount > 1;
++    if (drawInstanceCount <= 1) {
++      return layout;
++    }
++    const uint64_t total = uint64_t(vertexCount) * drawInstanceCount;
++    if (!captureAllInstances || !isTriangleList || total > kMaxInstancedCaptureVertices) {
++      layout.sharedSlots = true;
++      return layout;
++    }
++    layout.copies = drawInstanceCount;
++    layout.instanceVertexStride = vertexCount;
++    layout.capturedVertexCount = uint32_t(total);
++    layout.indexCount = indexCount * drawInstanceCount;
++    // The largest repeated index is total - 1; 0xFFFF stays free (primitive restart value).
++    layout.needs32BitIndices = indexCount > 0 && total > 0xFFFFu;
+     return layout;
+   }
+ 
+   // Slot written by the capture shader for one vertex of one instance (gl_VertexIndex, gl_InstanceIndex).
+   inline uint32_t vertexCaptureSlot(uint32_t vertexId, uint32_t baseVertex, uint32_t instanceId,
+                                     uint32_t instanceVertexStride) {
+-    (void) instanceId;
+-    (void) instanceVertexStride;
+-    return vertexId - baseVertex;
++    return (vertexId - baseVertex) + instanceId * instanceVertexStride;
+   }
+ 
+   // Writes layout.indexCount indices: the draw's indices once per copy, offset by the copy's slots.
+   template<typename In, typename Out>
+   void expandInstancedIndices(const In* src, uint32_t drawIndexCount, const InstancedCaptureLayout& layout, Out* dst) {
+-    (void) layout;
+-    for (uint32_t i = 0; i < drawIndexCount; i++) {
+-      dst[i] = Out(src[i]);
++    for (uint32_t c = 0; c < layout.copies; c++) {
++      const uint32_t offset = c * layout.instanceVertexStride;
++      for (uint32_t i = 0; i < drawIndexCount; i++) {
++        dst[c * drawIndexCount + i] = Out(uint32_t(src[i]) + offset);
++      }
+     }
+   }
+ 
+diff --git a/src/d3d9/d3d9_state.h b/src/d3d9/d3d9_state.h
+index d3e114c..421ace6 100644
+--- a/src/d3d9/d3d9_state.h
++++ b/src/d3d9/d3d9_state.h
+@@ -60,7 +60,10 @@ namespace dxvk {
+     uint32_t baseVertex = 0;
+     float jitterX;
+     float jitterY;
+-    uint32_t padding;
++    // NV-DXVK start: vertex capture for hardware-instanced draws (was padding)
++    // Slot distance between instances (d3d9_rtx_instanced_capture.h); 0 = all instances share slots.
++    uint32_t instanceVertexStride = 0;
++    // NV-DXVK end
+   };
+ 
+   enum class D3D9RtxVertexCaptureMembers {
+@@ -72,6 +75,9 @@ namespace dxvk {
+     BaseVertex,
+     JitterX,
+     JitterY,
++    // NV-DXVK start: vertex capture for hardware-instanced draws
++    InstanceVertexStride,
++    // NV-DXVK end
+ 
+     MemberCount
+   };
+diff --git a/src/dxso/dxso_compiler.cpp b/src/dxso/dxso_compiler.cpp
+index de54ad8..25ac1df 100644
+--- a/src/dxso/dxso_compiler.cpp
++++ b/src/dxso/dxso_compiler.cpp
+@@ -498,11 +498,12 @@ namespace dxvk {
+         uintType, // baseVertex
+         floatType,// jitterX
+         floatType,// jitterY
+-        uintType  // padding
++        // NV-DXVK start: vertex capture for hardware-instanced draws (was padding)
++        uintType  // instanceVertexStride
+       };
+ 
+-      // NOTE: enum doesn't include 'padding', so +1 here
+-      static_assert(uint32_t(D3D9RtxVertexCaptureMembers::MemberCount) + 1 == std::size(members), "Member count mismatch with D3D9RtxVertexCaptureData");
++      static_assert(uint32_t(D3D9RtxVertexCaptureMembers::MemberCount) == std::size(members), "Member count mismatch with D3D9RtxVertexCaptureData");
++      // NV-DXVK end
+ 
+       const uint32_t structType = m_module.defStructType(std::size(members), members);
+ 
+@@ -529,7 +530,9 @@ namespace dxvk {
+       SetMemberName("baseVertex", offsetof(D3D9RtxVertexCaptureData, baseVertex));
+       SetMemberName("jitterX",  offsetof(D3D9RtxVertexCaptureData, jitterX));
+       SetMemberName("jitterY", offsetof(D3D9RtxVertexCaptureData, jitterY));
+-      SetMemberName("padding", offsetof(D3D9RtxVertexCaptureData, padding));
++      // NV-DXVK start: vertex capture for hardware-instanced draws
++      SetMemberName("instanceVertexStride", offsetof(D3D9RtxVertexCaptureData, instanceVertexStride));
++      // NV-DXVK end
+ 
+       m_vs.vertexCaptureConstants = m_module.newVar(
+         m_module.defPointerType(structType, spv::StorageClassUniform),
+@@ -3762,7 +3765,19 @@ void DxsoCompiler::emitControlFlowGenericLoop(
+     const uint32_t baseVertex = LoadConstant(uintType, (uint32_t) D3D9RtxVertexCaptureMembers::BaseVertex);
+ 
+     // Compute vertex index in the CapturedVertex array
+-    const uint32_t vertexIndex = m_module.opISub(uintType, uVertexId, baseVertex);
++    // NV-DXVK start: vertex capture for hardware-instanced draws
++    // slot = (VertexIndex - baseVertex) + InstanceIndex * instanceVertexStride, as vertexCaptureSlot() in
++    // d3d9_rtx_instanced_capture.h. Stride 0 (option off, or one instance) keeps the stock slot.
++    DxsoRegisterInfo instanceIdReg;
++    instanceIdReg.type = { DxsoScalarType::Uint32, 1, 0 };
++    instanceIdReg.sclass = spv::StorageClassInput;
++    const uint32_t instanceIdVar = emitNewBuiltinVariable(instanceIdReg, spv::BuiltInInstanceIndex, "uInstanceId", 0);
++    const uint32_t uInstanceId = m_module.opLoad(uintType, instanceIdVar);
++    const uint32_t instanceStride = LoadConstant(uintType, (uint32_t) D3D9RtxVertexCaptureMembers::InstanceVertexStride);
++    const uint32_t vertexIndex = m_module.opIAdd(uintType,
++      m_module.opISub(uintType, uVertexId, baseVertex),
++      m_module.opIMul(uintType, uInstanceId, instanceStride));
++    // NV-DXVK end
+ 
+     // Load matrices we actually use for capture
+     const uint32_t invProj = LoadConstant(mat4TypeId, (uint32_t) D3D9RtxVertexCaptureMembers::InvProj);

@@ -1,0 +1,76 @@
+From d032d85c81a75dd18ba0dd3aca2436d7f9676432 Mon Sep 17 00:00:00 2001
+From: CoreyKatzburg <64795827+CoreyKatzburg@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 00:21:53 -0500
+Subject: [PATCH 02/17] Telemetry: add vramFreeMB (device-local budget minus
+ usage)
+
+The gate ran slower at spots where textureBudgetMB was low, which suggests video-memory pressure, but that is
+unproven: textureBudgetMB is a derived budget, not a measurement of free memory, and the one same-view pair is
+confounded by warm-up. vramFreeMB records the headroom directly so the settings sweep can prove or disprove it.
+It sums VK_EXT_memory_budget heapBudget - heapUsage over device-local heaps, floored at 0.
+
+Amp-Thread-ID: https://ampcode.com/threads/T-01a1e070-32c4-730c-bdfc-76d09e1f79eb
+Co-authored-by: Amp <amp@ampcode.com>
+---
+ src/dxvk/rtx_render/rtx_scene_manager.cpp | 6 +++++-
+ src/dxvk/rtx_render/rtx_telemetry.h       | 7 +++++--
+ 2 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/src/dxvk/rtx_render/rtx_scene_manager.cpp b/src/dxvk/rtx_render/rtx_scene_manager.cpp
+index 761f422..da4b8ba 100644
+--- a/src/dxvk/rtx_render/rtx_scene_manager.cpp
++++ b/src/dxvk/rtx_render/rtx_scene_manager.cpp
+@@ -588,15 +588,19 @@ namespace dxvk {
+     m_telemetry.cameraCut = m_cameraManager.isCameraCutThisFrame();
+ 
+     const DxvkAdapterMemoryInfo heaps = m_device->adapter()->getMemoryHeapInfo();
+-    VkDeviceSize vramUsed = 0, textureMemory = 0;
++    VkDeviceSize vramUsed = 0, vramFree = 0, textureMemory = 0;
+     for (uint32_t heap = 0; heap < heaps.heapCount; heap++) {
+       if (heaps.heaps[heap].heapFlags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+         vramUsed += heaps.heaps[heap].memoryAllocated;
++        if (heaps.heaps[heap].memoryBudget > heaps.heaps[heap].memoryAllocated) {
++          vramFree += heaps.heaps[heap].memoryBudget - heaps.heaps[heap].memoryAllocated;
++        }
+         const DxvkMemoryStats stats = m_device->getMemoryStats(heap);
+         textureMemory += stats.usedByCategory(DxvkMemoryStats::AppTexture) + stats.usedByCategory(DxvkMemoryStats::RTXMaterialTexture);
+       }
+     }
+     m_telemetry.vramUsedMB = double(vramUsed) / (1024.0 * 1024.0);
++    m_telemetry.vramFreeMB = double(vramFree) / (1024.0 * 1024.0);
+     m_telemetry.textureMemoryMB = double(textureMemory) / (1024.0 * 1024.0);
+     m_telemetry.textureBudgetMB = double(g_streamedTextures_budgetBytes) / (1024.0 * 1024.0);
+     m_telemetry.texturesDemoted = std::exchange(g_streamedTextures_demotedCount, 0u);
+diff --git a/src/dxvk/rtx_render/rtx_telemetry.h b/src/dxvk/rtx_render/rtx_telemetry.h
+index ca70bef..e6c807d 100644
+--- a/src/dxvk/rtx_render/rtx_telemetry.h
++++ b/src/dxvk/rtx_render/rtx_telemetry.h
+@@ -45,6 +45,8 @@
+ //   newLegacyMaterials      hex texture hashes first seen falling back this frame (at most 64 per frame)
+ //   texturesDemoted         replacement textures forced to their smallest size by the VRAM budget
+ //   textureBudgetMB         VRAM budget for replacement textures (0 until Remix first computes it)
++//   vramFreeMB              device-local memory budget minus usage, summed over device-local heaps, floored at 0
++//                           (VK_EXT_memory_budget: what the OS still lets this process use before paging)
+ //   thumbNonFinite          thumbnail pixels holding NaN or infinity before clamping
+ //   thumbClipped            thumbnail pixels at or above full white in all three channels
+ //   rgbThumb                optional base64 of 64x36 8-bit RGB from the same image as lumaThumb
+@@ -100,6 +102,7 @@ namespace dxvk {
+     uint32_t legacyMaterialDraws = 0;
+     uint32_t texturesDemoted = 0;
+     double textureBudgetMB = 0.0;
++    double vramFreeMB = 0.0;
+     uint32_t thumbNonFinite = 0;
+     uint32_t thumbClipped = 0;
+     uint32_t skips[size_t(RtxSkip::Count)] = {};
+@@ -129,9 +132,9 @@ namespace dxvk {
+       t.staticBlasBuilds, t.skinnedBlasUpdates, t.unorderedInstances,
+       t.skinnedTriangles, t.inwardSkinnedTriangles);
+     add(",\"rayTraced\":%s,\"telemetryCpuMs\":%.3f,\"replacedMaterialDraws\":%u,\"legacyMaterialDraws\":%u,"
+-      "\"texturesDemoted\":%u,\"textureBudgetMB\":%.1f,\"thumbNonFinite\":%u,\"thumbClipped\":%u,\"skips\":{",
++      "\"texturesDemoted\":%u,\"textureBudgetMB\":%.1f,\"vramFreeMB\":%.1f,\"thumbNonFinite\":%u,\"thumbClipped\":%u,\"skips\":{",
+       t.rayTraced ? "true" : "false", t.telemetryCpuMs, t.replacedMaterialDraws, t.legacyMaterialDraws,
+-      t.texturesDemoted, t.textureBudgetMB, t.thumbNonFinite, t.thumbClipped);
++      t.texturesDemoted, t.textureBudgetMB, t.vramFreeMB, t.thumbNonFinite, t.thumbClipped);
+     const char* comma = "";
+     for (size_t i = 0; i < size_t(RtxSkip::Count); i++) {
+       if (t.skips[i] != 0) {

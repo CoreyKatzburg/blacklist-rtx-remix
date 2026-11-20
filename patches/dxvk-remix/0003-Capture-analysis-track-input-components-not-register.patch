@@ -1,0 +1,88 @@
+From 7d39dc3abea198f2af80d70d3a8aebaa00c9d857 Mon Sep 17 00:00:00 2001
+From: CoreyKatzburg <64795827+CoreyKatzburg@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 00:31:25 -0500
+Subject: [PATCH 03/17] Capture analysis: track input components, not
+ registers, when finding the normal output
+
+Six game vertex shaders write 'mul o5, cN.<zero xyz>, v3.w' to TEXCOORD4: the xyz is
+always (0,0,0) and reads only NORMAL0.w. findNormalOutput tracked dependencies per input
+register, so it took TEXCOORD4 as the normal output and Remix captured zero normals.
+Skinned: 78BCCBDD (0x6ec90), 514A5FAA (0x7106c). World: 6E196E77 (0x6e840),
+F6CAEE4E (0x6f3a0), 5EA537BA (0x70c0c), 0335612F (0x71780).
+
+Inputs are now tracked per component and a normal output must read NORMAL0.xyz. The six
+shaders move to the synthesized-normal path; no other shader changes classification
+(old/new dump diff over all 263 shaders).
+
+Amp-Thread-ID: https://ampcode.com/threads/T-01a1e1fe-618a-70d3-af1b-fbcbdff96aa4
+Co-authored-by: Amp <amp@ampcode.com>
+---
+ src/dxso/dxso_capture_analysis.cpp | 30 ++++++++++++++++++++----------
+ 1 file changed, 20 insertions(+), 10 deletions(-)
+
+diff --git a/src/dxso/dxso_capture_analysis.cpp b/src/dxso/dxso_capture_analysis.cpp
+index bd72253..8242179 100644
+--- a/src/dxso/dxso_capture_analysis.cpp
++++ b/src/dxso/dxso_capture_analysis.cpp
+@@ -37,10 +37,11 @@ namespace dxvk {
+     constexpr uint32_t kMaxTemps = 32;
+     constexpr uint32_t kMaxOutputs = 16;
+ 
+-    // A "source" is an input register or a float constant register a value can come from.
+-    using Sources = std::bitset<kMaxInputs + kMaxFloatConsts>;
+-    inline size_t inputBit(uint32_t v) { return v; }
+-    inline size_t constBit(uint32_t c) { return kMaxInputs + c; }
++    // A "source" is an input register component or a float constant register a value can come from.
++    // Inputs are tracked per component so that, e.g., NORMAL0.w alone does not count as the normal.
++    using Sources = std::bitset<kMaxInputs * 4 + kMaxFloatConsts>;
++    inline size_t inputBit(uint32_t v, uint32_t comp) { return v * 4 + comp; }
++    inline size_t constBit(uint32_t c) { return kMaxInputs * 4 + c; }
+ 
+     // Splinter Cell Blacklist names for constants that only map world space to the screen
+     // (camera and viewport). Captured positions are converted back to world space with the
+@@ -332,7 +333,7 @@ namespace dxvk {
+           if (p.num < kMaxTemps) t = s.temps[p.num * 4 + c]; else m_ok = false;
+           break;
+         case reg::Input:
+-          if (p.num < kMaxInputs) t.set(inputBit(p.num)); else m_ok = false;
++          if (p.num < kMaxInputs) t.set(inputBit(p.num, c)); else m_ok = false;
+           break;
+         case reg::Const:
+           if (p.relative) {
+@@ -518,22 +519,31 @@ namespace dxvk {
+           if (usage == kUsageBlendIndices && index == 0) blendIndicesInput = int(v);
+           if (usage == kUsageBlendWeight && index == 0) blendWeightInput = int(v);
+           if ((usage == kUsageNormal && index == 0) || usage == kUsageBlendIndices || usage == kUsageBlendWeight) {
+-            allowed.set(inputBit(v));
++            for (uint32_t c = 0; c < 4; c++) {
++              allowed.set(inputBit(v, c));
++            }
+           }
+         }
+         if (normalInput < 0) return;
+ 
+-        // The output whose xyz is built only from the input normal (plus skinning
++        // The output whose xyz is built from the input normal's xyz (plus skinning
+         // weights/indices and constants) is the transformed normal.
+-        Sources inputMask;
+-        for (uint32_t v = 0; v < kMaxInputs; v++) inputMask.set(inputBit(v));
++        Sources inputMask, normalXyz;
++        for (uint32_t v = 0; v < kMaxInputs; v++) {
++          for (uint32_t c = 0; c < 4; c++) {
++            inputMask.set(inputBit(v, c));
++          }
++        }
++        for (uint32_t c = 0; c < 3; c++) {
++          normalXyz.set(inputBit(uint32_t(normalInput), c));
++        }
+         for (uint32_t o = 0; o < kMaxOutputs; o++) {
+           const int u = m_outputUsage[o];
+           if (u < 0 || (u & 0xFF) == kUsagePosition || (m_outputMask[o] & 0x7) != 0x7) continue;
+           bool isNormal = true;
+           for (uint32_t c = 0; c < 3 && isNormal; c++) {
+             const Sources inputs = s.outputs[o * 4 + c] & inputMask;
+-            isNormal = inputs.test(inputBit(normalInput)) && (inputs & ~allowed).none();
++            isNormal = (inputs & normalXyz).any() && (inputs & ~allowed).none();
+           }
+           if (isNormal) {
+             result.hasNormalOutput = true;

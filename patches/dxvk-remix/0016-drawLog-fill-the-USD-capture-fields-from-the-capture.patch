@@ -1,0 +1,202 @@
+From b2c355f5109239306a56227374f9f42ce61bf82f Mon Sep 17 00:00:00 2001
+From: CoreyKatzburg <64795827+CoreyKatzburg@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 22:46:29 -0500
+Subject: [PATCH 16/17] drawLog: fill the USD capture fields from the capture
+ itself
+
+A one-frame USD capture opens and closes inside one end-of-frame step
+(GameCapturer::step from prepareSceneData), after every draw of the frame, so the
+per-draw query never saw State::Capturing and cap read 0 on every row (live run
+20261116-215353, all four tags). The capturer now calls
+SceneManager::fillDrawLogCapture right after captureFrame, and the header line
+gains capture=1 when the rows were filled from a capture.
+
+New rtx.drawLog.waitForCapture (default off): when set as the tag changes, the
+log keeps recording and writes only the frame a capture captures. Off by
+default; with it off the log behaves as before apart from the header field.
+
+Amp-Thread-ID: https://ampcode.com/threads/T-01a1e070-32c4-730c-bdfc-76d09e1f79eb
+Co-authored-by: Amp <amp@ampcode.com>
+---
+ src/dxvk/rtx_render/rtx_draw_log.h        | 38 ++++++++++++++++++++---
+ src/dxvk/rtx_render/rtx_game_capturer.cpp |  1 +
+ src/dxvk/rtx_render/rtx_scene_manager.cpp | 18 ++++++-----
+ src/dxvk/rtx_render/rtx_scene_manager.h   |  7 +++++
+ 4 files changed, 53 insertions(+), 11 deletions(-)
+
+diff --git a/src/dxvk/rtx_render/rtx_draw_log.h b/src/dxvk/rtx_render/rtx_draw_log.h
+index 32dcb0a..42f7691 100644
+--- a/src/dxvk/rtx_render/rtx_draw_log.h
++++ b/src/dxvk/rtx_render/rtx_draw_log.h
+@@ -13,9 +13,13 @@
+ // cost is one bool test per draw. When the tag changes to a non-empty value, the next frame's draws are
+ // recorded as they reach SceneManager::processDrawCallState, and at that frame's end one file is written:
+ // gate\<tag>_remix_draws.tsv next to the game exe (the folder rtx.gateDumpTag writes to).
++// With rtx.drawLog.waitForCapture set when the tag changes, the log instead records every frame and writes only the
++// first frame a USD capture captures, with the cap fields filled from that capture (the only way to get them: a
++// one-frame capture opens and closes inside one end-of-frame step, after every draw of the frame).
+ //
+ // Line format (tab separated key=value, so new keys can be appended without breaking readers):
+ //   remixframe  frame=<Remix frame id, as telemetry "frame">  qpcMs=<telemetry qpcMs>  tag=<tag>  draws=<rows>
++//               capture=<1 when the rows were filled from a USD capture of this frame, else 0>
+ //   remixdraw   one per draw, keys in this order:
+ //     order      position among the draws that reached the scene this frame (0-based)
+ //     dcid       D3D9 draw index this frame (DrawCallState::drawCallID; counts every draw Remix considered)
+@@ -39,7 +43,7 @@
+ //     instalbedo 1 when the instance's bound surface material has an albedo texture index, 0 if not, -1 not opaque
+ //     blasmat    legacy material hash in the BLAS entry's input (what a USD capture keys the mesh with)
+ //     capmesh    the USD capture's mesh hash for this draw (BLAS input hash under the asset rule)
+-//     cap        1 while a USD capture is running, 0 otherwise
++//     cap        1 when the row was filled from a USD capture of this frame (header capture=1), 0 otherwise
+ //     capmat     1/0 whether mat is in the capture's materials, -1 when no capture
+ //     capmeshmat 1/0 whether the capture's mesh entry for capmesh has its matHash in materials,
+ //                -1 when no capture or the mesh is not captured yet
+@@ -133,7 +137,9 @@ namespace dxvk {
+ 
+     // Called once per frame end, after write(). Arms the next frame when tag is non-empty and differs from the last
+     // armed tag; an empty tag disarms and forgets the last tag, so the same tag can be asked for again later.
+-    void armIfNewTag(const std::string& tag) {
++    // With waitForCapture the log stays armed and records frame after frame until a USD capture captures one; only
++    // that frame is written (see ready() and skipFrame()).
++    void armIfNewTag(const std::string& tag, bool waitForCapture = false) {
+       if (tag.empty()) {
+         m_lastTag.clear();
+         return;
+@@ -145,6 +151,8 @@ namespace dxvk {
+       m_tag = tag;
+       m_rows.clear();
+       m_active = true;
++      m_waitForCapture = waitForCapture;
++      m_captured = false;
+     }
+ 
+     void add(DrawLogRow row) {
+@@ -152,6 +160,26 @@ namespace dxvk {
+       m_rows.push_back(row);
+     }
+ 
++    // Called by the capturer once it has captured this frame's instances, while its capture is still open: fn fills
++    // the cap fields of each row. A one-frame capture opens and closes inside a single end-of-frame step, so a draw
++    // can never see it running; the rows have to be filled here.
++    template<typename F>
++    void fillCapture(F&& fn) {
++      if (!m_active) {
++        return;
++      }
++      for (DrawLogRow& r : m_rows) {
++        fn(r);
++      }
++      m_captured = true;
++    }
++
++    // At frame end: true when the recorded frame should be written now.
++    bool ready() const { return m_active && (!m_waitForCapture || m_captured); }
++
++    // At frame end when armed but not ready: drop this frame's rows and keep waiting for the captured frame.
++    void skipFrame() { m_rows.clear(); }
++
+     // Writes the armed frame to <dir>\<tag>_remix_draws.tsv and disarms. Returns the path written, or "" when not
+     // armed or the write failed (the log is a measurement; a failed write changes nothing else).
+     std::string write(const std::filesystem::path& dir, uint64_t frameId, double qpcMs) {
+@@ -161,8 +189,8 @@ namespace dxvk {
+       m_active = false;
+       std::string text;
+       char head[512];
+-      std::snprintf(head, sizeof(head), "remixframe\tframe=%llu\tqpcMs=%.3f\ttag=%s\tdraws=%zu\n",
+-                    (unsigned long long) frameId, qpcMs, m_tag.c_str(), m_rows.size());
++      std::snprintf(head, sizeof(head), "remixframe\tframe=%llu\tqpcMs=%.3f\ttag=%s\tdraws=%zu\tcapture=%d\n",
++                    (unsigned long long) frameId, qpcMs, m_tag.c_str(), m_rows.size(), m_captured ? 1 : 0);
+       text += head;
+       for (const DrawLogRow& r : m_rows) {
+         text += formatDrawLogRow(r);
+@@ -189,6 +217,8 @@ namespace dxvk {
+ 
+   private:
+     bool m_active = false;
++    bool m_waitForCapture = false;
++    bool m_captured = false;
+     std::string m_tag;
+     std::string m_lastTag;
+     std::vector<DrawLogRow> m_rows;
+diff --git a/src/dxvk/rtx_render/rtx_game_capturer.cpp b/src/dxvk/rtx_render/rtx_game_capturer.cpp
+index 4f838b6..3a60a71 100644
+--- a/src/dxvk/rtx_render/rtx_game_capturer.cpp
++++ b/src/dxvk/rtx_render/rtx_game_capturer.cpp
+@@ -214,6 +214,7 @@ namespace dxvk {
+ 
+     m_pCap->currentFrameNum += (frameTimeMilliseconds * 0.001f) * static_cast<float>(m_options.fps);
+     captureFrame(ctx);
++    m_sceneManager.fillDrawLogCapture(*this);
+ 
+     if (m_pCap->numFramesCaptured >= m_options.numFrames) {
+       m_state.set<State::BeginExport, true>();
+diff --git a/src/dxvk/rtx_render/rtx_scene_manager.cpp b/src/dxvk/rtx_render/rtx_scene_manager.cpp
+index b9d439c..cdcdf06 100644
+--- a/src/dxvk/rtx_render/rtx_scene_manager.cpp
++++ b/src/dxvk/rtx_render/rtx_scene_manager.cpp
+@@ -657,13 +657,15 @@ namespace dxvk {
+     ScopedCpuProfileZone();
+ 
+     m_device->getCommon()->getTextureManager().retireDestroyedGameTextures();
+-    if (m_drawLog.active()) {
++    if (m_drawLog.ready()) {
+       const std::filesystem::path gateDir = std::filesystem::path(env::getExePath()).parent_path() / "gate";
+       const std::string written = m_drawLog.write(gateDir, m_device->getCurrentFrameId(), m_telemetry.qpcMs);
+       Logger::info(str::format("[DrawLog] frame ", m_device->getCurrentFrameId(), ": ",
+                                written.empty() ? std::string("write failed") : written));
++    } else if (m_drawLog.active()) {
++      m_drawLog.skipFrame();
+     }
+-    m_drawLog.armIfNewTag(tag());
++    m_drawLog.armIfNewTag(tag(), waitForCapture());
+     writeFrameTelemetry(ctx, raytracedThisFrame);
+ 
+     manageTextureVram();
+@@ -1434,15 +1436,17 @@ namespace dxvk {
+       }
+     }
+ 
+-    if (auto capturer = m_device->getCommon()->capturer(); capturer != nullptr) {
+-      const GameCapturer::DrawLogCaptureInfo info = capturer->drawLogCaptureInfo(r.capmesh, r.mat);
++    m_drawLog.add(r);
++  }
++
++  void SceneManager::fillDrawLogCapture(GameCapturer& capturer) {
++    m_drawLog.fillCapture([&capturer](DrawLogRow& r) {
++      const GameCapturer::DrawLogCaptureInfo info = capturer.drawLogCaptureInfo(r.capmesh, r.mat);
+       r.cap = info.capturing;
+       r.capmat = info.matCaptured;
+       r.capmeshmat = info.meshMatCaptured;
+       r.capmeshmathash = info.meshMatHash;
+-    }
+-
+-    m_drawLog.add(r);
++    });
+   }
+ 
+   const RtSurfaceMaterial& SceneManager::createSurfaceMaterial(const MaterialData& renderMaterialData,
+diff --git a/src/dxvk/rtx_render/rtx_scene_manager.h b/src/dxvk/rtx_render/rtx_scene_manager.h
+index 1655cbe..934cd71 100644
+--- a/src/dxvk/rtx_render/rtx_scene_manager.h
++++ b/src/dxvk/rtx_render/rtx_scene_manager.h
+@@ -64,6 +64,7 @@ struct AssetReplacement;
+ struct AssetReplacer;
+ class OpacityMicromapManager;
+ class TerrainBaker;
++class GameCapturer;
+ 
+ // The resource cache can be *searched* by other users
+ class ResourceCache {
+@@ -267,6 +268,12 @@ public:
+              "Measurement only, off when empty. When changed to a non-empty tag, the next frame's draws that reach the "
+              "scene are written one line each to gate/<tag>_remix_draws.tsv next to the game exe (hashes, texcoord "
+              "source, whether an albedo texture was tracked, USD capture binding). See rtx_draw_log.h.");
++  RTX_OPTION("rtx.drawLog", bool, waitForCapture, false,
++             "Measurement only. When set as rtx.drawLog.tag changes, the log waits for the next USD capture and writes "
++             "the captured frame, with its capture binding fields filled from that capture.");
++
++  // Called by GameCapturer after it captured this frame's instances, while the capture is open.
++  void fillDrawLogCapture(GameCapturer& capturer);
+ 
+ private:
+   // Per-draw scene log (rtx.drawLog.tag); records nothing unless armed.

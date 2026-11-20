@@ -1,0 +1,237 @@
+From b622286149fdf9e5bf2466fc3b14076fe4786142 Mon Sep 17 00:00:00 2001
+From: CoreyKatzburg <64795827+CoreyKatzburg@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 09:11:56 -0500
+Subject: [PATCH 08/17] Wait for GPU idle before recreating the swap chain;
+ record exposure in telemetry
+
+RecreateSwapChain only waited for submission before the presenter destroyed the
+old swap chain and its semaphores. With ray tracing on, a minimize (menu quit,
+alt-tab) then hit VK_ERROR_DEVICE_LOST 2.5 to 4.9 s later and the game crashed
+(run 082350 quit_menu; Corey's sessions 143424, 153109, 135449). Upstream DXVK
+waits for idle here. New option rtx.swapchainRecreateWaitIdle (default True)
+calls waitForIdle after the DLFG presenter sync; False restores the old path
+for fail-before runs. Each new extent logs '[RTX Swapchain] recreate' with
+pending submissions and the wait in ms, and a wait over 2 s logs a warning.
+
+Telemetry gains autoExposure and effectiveExposure on ray-traced frames, null
+otherwise. The 1x1 exposure texel is copied into the existing gate readback
+slot and read on the writer thread after the fence, so the render thread never
+waits; the value is from the line's own frame. The auto exposure image gets
+TRANSFER_SRC usage for the copy.
+
+Amp-Thread-ID: https://ampcode.com/threads/T-01a1e070-32c4-730c-bdfc-76d09e1f79eb
+Co-authored-by: Amp <amp@ampcode.com>
+---
+ src/d3d9/d3d9_swapchain.cpp               | 49 +++++++++++++++++++++++
+ src/dxvk/rtx_render/rtx_auto_exposure.cpp |  4 +-
+ src/dxvk/rtx_render/rtx_context.cpp       | 33 ++++++++++++++-
+ src/dxvk/rtx_render/rtx_telemetry.h       | 20 ++++++++-
+ 4 files changed, 102 insertions(+), 4 deletions(-)
+
+diff --git a/src/d3d9/d3d9_swapchain.cpp b/src/d3d9/d3d9_swapchain.cpp
+index f9f4e7b..e5b9d47 100644
+--- a/src/d3d9/d3d9_swapchain.cpp
++++ b/src/d3d9/d3d9_swapchain.cpp
+@@ -36,7 +36,17 @@
+ #include "../dxvk/rtx_render/rtx_dlfg.h"
+ // NV-DXVK end
+ 
++// NV-DXVK start: wait for the GPU before the presenter destroys the old swap chain
++#include "../dxvk/rtx_render/rtx_option.h"
++// NV-DXVK end
++
+ namespace dxvk {
++  // NV-DXVK start: wait for the GPU before the presenter destroys the old swap chain
++  struct SwapchainRecreateSettings {
++    RTX_OPTION("rtx", bool, swapchainRecreateWaitIdle, true, "When enabled, recreating the swap chain (for example on minimize or restore) waits for the GPU to finish all queued work before the old swap chain and its semaphores are destroyed. Disabling it restores the old behavior, which waited only for submission.");
++  };
++  // NV-DXVK end
++
+   // NV-DXVK start: App Controlled FSE
+   enum FSEState {
+     Acquire = 0,
+@@ -1313,6 +1323,45 @@ namespace dxvk {
+     }
+     // NV-DXVK end
+ 
++    // NV-DXVK start: wait for the GPU before the presenter destroys the old swap chain
++    // recreateSwapChain() destroys the swap chain and its acquire and present semaphores. Frames still queued on the
++    // GPU wait on or signal those semaphores, so destroying them early can hang the GPU until Windows resets it
++    // (VK_ERROR_DEVICE_LOST after a minimize with ray tracing on). Upstream DXVK waits for idle here too. The DLFG
++    // presenter was synchronized above, which waitForIdle() requires. rtx.swapchainRecreateWaitIdle = False skips the wait.
++    const bool waitIdleOnRecreate = SwapchainRecreateSettings::swapchainRecreateWaitIdle();
++    const uint32_t pendingBefore = m_device->pendingSubmissions();
++    const auto waitStart = std::chrono::steady_clock::now();
++    if (waitIdleOnRecreate) {
++      m_device->waitForIdle();
++    }
++    const double waitMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
++    const VkExtent2D newExtent = GetPresentExtent();
++
++    // While minimized, Present recreates every frame; log each new extent once, then a summary of the repeats.
++    static VkExtent2D s_lastExtent = { ~0u, ~0u };
++    static uint32_t s_repeats = 0;
++    static double s_repeatMaxWaitMs = 0.0;
++    const bool sameExtent = newExtent.width == s_lastExtent.width && newExtent.height == s_lastExtent.height;
++    if (!sameExtent) {
++      if (s_repeats > 0) {
++        Logger::info(str::format("[RTX Swapchain] recreate: ", s_repeats, " more at ", s_lastExtent.width, "x", s_lastExtent.height,
++                                 ", max wait ", s_repeatMaxWaitMs, " ms"));
++      }
++      Logger::info(str::format("[RTX Swapchain] recreate: extent ", newExtent.width, "x", newExtent.height,
++                               ", pendingSubmissions ", pendingBefore, ", waitIdle ", waitIdleOnRecreate ? "on" : "off",
++                               ", waited ", waitMs, " ms"));
++      s_lastExtent = newExtent;
++      s_repeats = 0;
++      s_repeatMaxWaitMs = 0.0;
++    } else {
++      s_repeats++;
++      s_repeatMaxWaitMs = std::max(s_repeatMaxWaitMs, waitMs);
++    }
++    if (waitMs > 2000.0) {
++      Logger::warn(str::format("[RTX Swapchain] recreate: waitForIdle took ", waitMs, " ms (over 2 s), pendingSubmissions ", pendingBefore));
++    }
++    // NV-DXVK end
++
+     m_presentStatus.result = VK_SUCCESS;
+ 
+     vk::PresenterDesc presenterDesc;
+diff --git a/src/dxvk/rtx_render/rtx_auto_exposure.cpp b/src/dxvk/rtx_render/rtx_auto_exposure.cpp
+index 0126a62..6c85fe2 100644
+--- a/src/dxvk/rtx_render/rtx_auto_exposure.cpp
++++ b/src/dxvk/rtx_render/rtx_auto_exposure.cpp
+@@ -197,7 +197,9 @@ namespace dxvk {
+     desc.extent = VkExtent3D{ 1, 1, 1 };
+ 
+     viewInfo.format = desc.format = VK_FORMAT_R32_SFLOAT;
+-    viewInfo.usage = desc.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++    // Transfer source so the frame recorder can copy the exposure texel out (captureGateTelemetry).
++    desc.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    viewInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+     m_exposure.image = device()->createImage(desc, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXRenderTarget, "autoexposure");
+     m_exposure.view = device()->createImageView(m_exposure.image, viewInfo);
+     ctx->changeImageLayout(m_exposure.image, VK_IMAGE_LAYOUT_GENERAL);
+diff --git a/src/dxvk/rtx_render/rtx_context.cpp b/src/dxvk/rtx_render/rtx_context.cpp
+index a563e7c..d069514 100644
+--- a/src/dxvk/rtx_render/rtx_context.cpp
++++ b/src/dxvk/rtx_render/rtx_context.cpp
+@@ -3002,6 +3002,9 @@ namespace dxvk {
+     constexpr VkDeviceSize kGateSlotCounterBytes = VkDeviceSize(GATE_SKINNED_SLOT_UINTS) * sizeof(uint32_t);
+     constexpr VkDeviceSize kGateCounterHeaderBytes = (kGateSlotCounterBytes + 15) & ~VkDeviceSize(15);
+     constexpr VkDeviceSize kGateThumbBytes = VkDeviceSize(kGateThumbW) * kGateThumbH * 8;
++    // The auto exposure texel (one R32_SFLOAT) follows the thumbnail, padded to 16 bytes.
++    constexpr VkDeviceSize kGateExposureOffset = kGateCounterHeaderBytes + kGateThumbBytes;
++    constexpr VkDeviceSize kGateSlotBytes = kGateExposureOffset + 16;
+ 
+     inline float halfToFloat32(uint16_t h) {
+       const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+@@ -3259,7 +3262,7 @@ namespace dxvk {
+       m_gateTelemetry.gpuCounters = m_device->createBuffer(cInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "Gate Skinned Counters");
+ 
+       for (uint32_t s = 0; s < kGateTelemetrySlots; ++s) {
+-        m_gateTelemetry.readbackSlots[s] = allocHostReadbackBuffer(m_device, kGateCounterHeaderBytes + kGateThumbBytes, "Gate Telemetry Slot");
++        m_gateTelemetry.readbackSlots[s] = allocHostReadbackBuffer(m_device, kGateSlotBytes, "Gate Telemetry Slot");
+       }
+     }
+ 
+@@ -3378,6 +3381,24 @@ namespace dxvk {
+     copyImageToBuffer(dstSlot, kGateCounterHeaderBytes, 8, 8, m_gateTelemetry.thumbSmall, subres,
+       VkOffset3D { 0, 0, 0 }, VkExtent3D { kGateThumbW, kGateThumbH, 1 });
+ 
++    // Auto exposure: the texel the tone mapper multiplied this frame's color by. Copied here, after tone mapping,
++    // and read on the telemetry writer thread once this frame's fence signals, so the render thread never waits.
++    DxvkAutoExposure& autoExposure = m_common->metaAutoExposure();
++    const Rc<DxvkImage>& exposureImg = autoExposure.getExposureTexture().image;
++    const bool readExposure = rayTraced && exposureImg != nullptr;
++    if (readExposure) {
++      copyImageToBuffer(dstSlot, kGateExposureOffset, 4, 4, exposureImg, subres,
++        VkOffset3D { 0, 0, 0 }, VkExtent3D { 1, 1, 1 });
++    }
++    // The factor the tone mapper multiplies the auto exposure by (rtx_tone_mapping.cpp and rtx_local_tone_mapping.cpp).
++    const bool autoExposureOn = autoExposure.enabled();
++    float exposureFactor = 0.0f;
++    if (m_common->metaLocalToneMapping().isActive()) {
++      exposureFactor = exp2f(log2f(std::max(1e-10f, DxvkLocalToneMapping::exposure())) + RtxOptions::calcUserEVBias());
++    } else {
++      exposureFactor = exp2f(m_common->metaToneMapping().exposureBias() + RtxOptions::calcUserEVBias());
++    }
++
+     emitMemoryBarrier(0,
+       VK_PIPELINE_STAGE_TRANSFER_BIT,
+       VK_ACCESS_TRANSFER_WRITE_BIT,
+@@ -3401,12 +3422,20 @@ namespace dxvk {
+     }
+ 
+     Rc<sync::Fence> fence = m_gateTelemetry.fence;
+-    getSceneManager().setTelemetryResolve([fence, syncVal, dstSlot, lumaScale, gated = std::move(gated)](RtxFrameTelemetry& out) mutable {
++    getSceneManager().setTelemetryResolve([fence, syncVal, dstSlot, lumaScale, readExposure, autoExposureOn, exposureFactor,
++                                           gated = std::move(gated)](RtxFrameTelemetry& out) mutable {
+       fence->wait(syncVal);
+       const uint8_t* raw = reinterpret_cast<const uint8_t*>(dstSlot->mapPtr(0));
+       if (raw == nullptr) {
+         return;
+       }
++      if (readExposure) {
++        float texel = 0.0f;
++        std::memcpy(&texel, raw + kGateExposureOffset, sizeof(texel));
++        out.hasExposure = true;
++        out.autoExposure = texel;
++        out.effectiveExposure = exposureFactor * (autoExposureOn ? texel : 1.0f);
++      }
+       uint32_t counters[GATE_SKINNED_TOTALS + 2 * GATE_SKINNED_MAX_INSTANCES];
+       std::memcpy(counters, raw, sizeof(counters));
+       out.inwardSkinnedTriangles = counters[0];
+diff --git a/src/dxvk/rtx_render/rtx_telemetry.h b/src/dxvk/rtx_render/rtx_telemetry.h
+index b984a40..8205a5d 100644
+--- a/src/dxvk/rtx_render/rtx_telemetry.h
++++ b/src/dxvk/rtx_render/rtx_telemetry.h
+@@ -3,6 +3,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <cmath>
+ #include <condition_variable>
+ #include <cstdint>
+ #include <cstdio>
+@@ -67,6 +68,14 @@
+ //   remixShaderCompiles     Remix shader pipelines queued or compiling at the end of this frame. While above 0 with
+ //                           ray tracing enabled, Remix does not ray trace and waits
+ //                           rtx.shader.asyncCompilationThrottleMilliseconds per frame
++//   autoExposure            the auto exposure multiplier (DxvkAutoExposure::m_exposure) this frame's ray-traced
++//                           picture was tone mapped with; 1 when rtx.autoExposure.enabled is off. The value is this
++//                           line's own frame (0 frames old): it is copied after tone mapping and read on the
++//                           telemetry writer thread after the frame's fence, so the render thread never waits.
++//                           null on frames with rayTraced false.
++//   effectiveExposure       the full multiplier on color before the tone curve: autoExposure (when enabled) times
++//                           2^(rtx.tonemap.exposureBias + user EV bias) in global mode, or times
++//                           2^(log2(rtx.localtonemap.exposure) + user EV bias) in local mode. Same frame, same null rule.
+ //   rgbThumb                optional base64 of 64x36 8-bit RGB from the same image as lumaThumb
+ //   lumaThumb               optional base64 of 128x72 8-bit Rec.709 luma. Remix's final image on ray-traced
+ //                           frames, the game's own picture on frames with rayTraced false.
+@@ -147,6 +156,9 @@ namespace dxvk {
+     uint32_t thumbNonFinite = 0;
+     uint32_t thumbClipped = 0;
+     uint32_t remixShaderCompiles = 0;
++    bool hasExposure = false;
++    float autoExposure = 0.0f;
++    float effectiveExposure = 0.0f;
+     uint32_t skips[size_t(RtxSkip::Count)] = {};
+     std::vector<RtxPassTime> passes;
+     std::vector<uint64_t> newLegacyMaterials;
+@@ -205,9 +217,15 @@ namespace dxvk {
+     }
+     add("]");
+     add(",\"rayTraced\":%s,\"telemetryCpuMs\":%.3f,\"replacedMaterialDraws\":%u,\"legacyMaterialDraws\":%u,"
+-      "\"texturesDemoted\":%u,\"textureBudgetMB\":%.1f,\"vramFreeMB\":%.1f,\"thumbNonFinite\":%u,\"thumbClipped\":%u,\"remixShaderCompiles\":%u,\"skips\":{",
++      "\"texturesDemoted\":%u,\"textureBudgetMB\":%.1f,\"vramFreeMB\":%.1f,\"thumbNonFinite\":%u,\"thumbClipped\":%u,\"remixShaderCompiles\":%u",
+       t.rayTraced ? "true" : "false", t.telemetryCpuMs, t.replacedMaterialDraws, t.legacyMaterialDraws,
+       t.texturesDemoted, t.textureBudgetMB, t.vramFreeMB, t.thumbNonFinite, t.thumbClipped, t.remixShaderCompiles);
++    if (t.hasExposure && std::isfinite(t.autoExposure) && std::isfinite(t.effectiveExposure)) {
++      add(",\"autoExposure\":%.6g,\"effectiveExposure\":%.6g", double(t.autoExposure), double(t.effectiveExposure));
++    } else {
++      add(",\"autoExposure\":null,\"effectiveExposure\":null");
++    }
++    add(",\"skips\":{");
+     const char* comma = "";
+     for (size_t i = 0; i < size_t(RtxSkip::Count); i++) {
+       if (t.skips[i] != 0) {

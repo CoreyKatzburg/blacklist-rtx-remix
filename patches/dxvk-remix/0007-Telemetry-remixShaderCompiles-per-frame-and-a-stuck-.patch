@@ -1,0 +1,323 @@
+From 06cc22523227651229a2bee370ade31c9e5172e6 Mon Sep 17 00:00:00 2001
+From: CoreyKatzburg <64795827+CoreyKatzburg@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 07:47:47 -0500
+Subject: [PATCH 07/17] Telemetry: remixShaderCompiles per frame and a
+ stuck-compile log line
+
+con_bright_hall (run 20261116-063147) never ray traced: Remix holds ray tracing back
+while any Remix pipeline is queued or compiling, and nothing recorded that count.
+
+- rtx_telemetry.jsonl gets remixShaderCompiles (pipelines queued or compiling at frame
+  end) from the first frame of the launch, so the loading-screen wait can be told apart
+  from a loading screen paced near 30 FPS.
+- After 30 s of waiting with ray tracing on, one warning names the oldest compiling
+  pipeline and its age with in-flight, compiling, queued and completed counts (one
+  compile that never returns vs compiles that keep arriving). Waits of 1 s or more log
+  their length when they end.
+- dxvk_state_cache/dxvk_pipemanager (NV-DXVK blocks): read-only status of in-flight Remix
+  compiles and a completed count. Nothing changes how or when anything compiles.
+
+Amp-Thread-ID: https://ampcode.com/threads/T-01a1e070-32c4-730c-bdfc-76d09e1f79eb
+Co-authored-by: Amp <amp@ampcode.com>
+---
+ src/dxvk/dxvk_pipemanager.cpp             |  4 ++
+ src/dxvk/dxvk_pipemanager.h               | 14 +++++++
+ src/dxvk/dxvk_state_cache.cpp             | 46 +++++++++++++++++++++++
+ src/dxvk/dxvk_state_cache.h               | 16 ++++++++
+ src/dxvk/rtx_render/rtx_context.cpp       | 37 ++++++++++++++++++
+ src/dxvk/rtx_render/rtx_context.h         |  6 +++
+ src/dxvk/rtx_render/rtx_scene_manager.cpp |  1 +
+ src/dxvk/rtx_render/rtx_telemetry.h       |  8 +++-
+ 8 files changed, 130 insertions(+), 2 deletions(-)
+
+diff --git a/src/dxvk/dxvk_pipemanager.cpp b/src/dxvk/dxvk_pipemanager.cpp
+index 8ffce82..8ca8ebe 100644
+--- a/src/dxvk/dxvk_pipemanager.cpp
++++ b/src/dxvk/dxvk_pipemanager.cpp
+@@ -146,6 +146,10 @@ namespace dxvk {
+   uint32_t DxvkPipelineManager::remixShaderCompilationCount() const {
+     return m_stateCache != nullptr ? m_stateCache->remixShaderCompilationCount() : 0;
+   }
++
++  DxvkRemixCompileStatus DxvkPipelineManager::remixCompileStatus() const {
++    return m_stateCache != nullptr ? m_stateCache->remixCompileStatus() : DxvkRemixCompileStatus{};
++  }
+ // NV-DXVK end
+ 
+ 
+diff --git a/src/dxvk/dxvk_pipemanager.h b/src/dxvk/dxvk_pipemanager.h
+index d072b11..f3b1cb2 100644
+--- a/src/dxvk/dxvk_pipemanager.h
++++ b/src/dxvk/dxvk_pipemanager.h
+@@ -22,6 +22,9 @@
+ #pragma once
+ 
+ #include <mutex>
++// NV-DXVK start: Remix compile status
++#include <string>
++// NV-DXVK end
+ #include <unordered_map>
+ 
+ #include "dxvk_compute.h"
+@@ -31,6 +34,16 @@ namespace dxvk {
+ 
+   class DxvkStateCache;
+ 
++  // NV-DXVK start: Remix compile status, read-only, for the stuck-compile log line
++  struct DxvkRemixCompileStatus {
++    uint32_t inFlight = 0;      // queued or compiling, as remixShaderCompilationCount()
++    uint32_t compiling = 0;     // taken by a compiler thread and not finished
++    uint64_t completed = 0;     // finished since launch
++    std::string oldestName;     // longest-running compile; empty when none is compiling
++    double oldestAgeMs = 0.0;
++  };
++  // NV-DXVK end
++
+   /**
+    * \brief Pipeline count
+    * 
+@@ -141,6 +154,7 @@ namespace dxvk {
+ 
+ // NV-DXVK start
+     uint32_t remixShaderCompilationCount() const;
++    DxvkRemixCompileStatus remixCompileStatus() const;
+ // NV-DXVK end
+ 
+     /**
+diff --git a/src/dxvk/dxvk_state_cache.cpp b/src/dxvk/dxvk_state_cache.cpp
+index 6b19874..abe2ddc 100644
+--- a/src/dxvk/dxvk_state_cache.cpp
++++ b/src/dxvk/dxvk_state_cache.cpp
+@@ -1040,6 +1040,43 @@ namespace dxvk {
+   }
+ 
+ 
++  // NV-DXVK start: Remix compile status
++  std::string DxvkStateCache::workerItemName(const WorkerItem& item) {
++    if (!item.rt.groups.empty()) {
++      return item.rt.debugName != nullptr ? std::string(item.rt.debugName) : std::string("raytracing pipeline");
++    }
++    if (item.cp.cs != nullptr) {
++      return item.cp.cs->debugName();
++    }
++    if (item.gp.fs != nullptr) {
++      return item.gp.fs->debugName();
++    }
++    if (item.gp.vs != nullptr) {
++      return item.gp.vs->debugName();
++    }
++    return "unknown";
++  }
++
++
++  DxvkRemixCompileStatus DxvkStateCache::remixCompileStatus() {
++    DxvkRemixCompileStatus status;
++    const auto now = std::chrono::steady_clock::now();
++    std::unique_lock<dxvk::mutex> lock(m_workerLock);
++    status.inFlight = m_workerCompilingRemixShaders.load();
++    status.compiling = uint32_t(m_remixCompiling.size());
++    status.completed = m_remixShadersCompiled.load();
++    for (const auto& entry : m_remixCompiling) {
++      const double ageMs = std::chrono::duration<double, std::milli>(now - entry.second.start).count();
++      if (ageMs >= status.oldestAgeMs) {
++        status.oldestAgeMs = ageMs;
++        status.oldestName = entry.second.name;
++      }
++    }
++    return status;
++  }
++  // NV-DXVK end
++
++
+   void DxvkStateCache::workerFunc() {
+     env::setThreadName("dxvk-shader");
+ 
+@@ -1064,6 +1101,11 @@ namespace dxvk {
+         
+         item = m_workerQueue.front();
+         m_workerQueue.pop();
++        // NV-DXVK start: Remix compile status
++        if (item.isRemixShader) {
++          m_remixCompiling[item.hash()] = { workerItemName(item), std::chrono::steady_clock::now() };
++        }
++        // NV-DXVK end
+       }
+ 
+       compilePipelines(item);
+@@ -1071,6 +1113,8 @@ namespace dxvk {
+ // NV-DXVK start
+       if (item.isRemixShader) {
+         --m_workerCompilingRemixShaders;
++        // Remix compile status
++        ++m_remixShadersCompiled;
+       }
+ // NV-DXVK end
+ 
+@@ -1078,6 +1122,8 @@ namespace dxvk {
+       { std::unique_lock<dxvk::mutex> lock(m_workerLock);
+         assert(m_workerItemsInFlight.count(item.hash()) == 1);
+         m_workerItemsInFlight.erase(item.hash());
++        // Remix compile status
++        m_remixCompiling.erase(item.hash());
+       }
+       // NV-DXVK end
+     }
+diff --git a/src/dxvk/dxvk_state_cache.h b/src/dxvk/dxvk_state_cache.h
+index 73c0751..d57ae5b 100644
+--- a/src/dxvk/dxvk_state_cache.h
++++ b/src/dxvk/dxvk_state_cache.h
+@@ -22,6 +22,10 @@
+ #pragma once
+ 
+ #include <atomic>
++// NV-DXVK start: Remix compile status
++#include <chrono>
++#include <string>
++// NV-DXVK end
+ #include <condition_variable>
+ #include <fstream>
+ #include <mutex>
+@@ -128,6 +132,8 @@ namespace dxvk {
+     uint32_t remixShaderCompilationCount() const {
+       return m_workerCompilingRemixShaders.load();
+     }
++
++    DxvkRemixCompileStatus remixCompileStatus();
+ // NV-DXVK end
+ 
+   private:
+@@ -187,6 +193,16 @@ namespace dxvk {
+     // NV-DXVK start
+     std::atomic<uint32_t>             m_workerCompilingRemixShaders;
+     // NV-DXVK end
++    // NV-DXVK start: Remix compile status
++    struct RemixCompile {
++      std::string name;
++      std::chrono::steady_clock::time_point start;
++    };
++    std::unordered_map<size_t, RemixCompile> m_remixCompiling;  // by WorkerItem::hash(), guarded by m_workerLock
++    std::atomic<uint64_t>             m_remixShadersCompiled = { 0 };
++
++    static std::string workerItemName(const WorkerItem& item);
++    // NV-DXVK end
+     std::vector<dxvk::thread>         m_workerThreads;
+ 
+     dxvk::mutex                       m_writerLock;
+diff --git a/src/dxvk/rtx_render/rtx_context.cpp b/src/dxvk/rtx_render/rtx_context.cpp
+index b656f8c..a563e7c 100644
+--- a/src/dxvk/rtx_render/rtx_context.cpp
++++ b/src/dxvk/rtx_render/rtx_context.cpp
+@@ -453,6 +453,42 @@ namespace dxvk {
+     getSceneManager().onFrameEnd(this, rayTracedThisFrame);
+   }
+ 
++  // While ray tracing is enabled and Remix shaders are queued or compiling, Remix does not ray trace and throttles every
++  // frame. Name the oldest compile once when that wait passes kStuckCompileWaitMs, so a launch that never ray traces says
++  // whether one compile never returned (oldest age close to the wait) or compiles keep arriving (completed keeps rising).
++  // Log every wait of a second or more when it ends.
++  void RtxContext::logRemixCompileWait(bool waiting) {
++    constexpr double kStuckCompileWaitMs = 30000.0;
++    const auto now = std::chrono::steady_clock::now();
++    if (waiting && !m_compileWaitActive) {
++      m_compileWaitActive = true;
++      m_compileWaitLogged = false;
++      m_compileWaitStart = now;
++    }
++    if (!m_compileWaitActive) {
++      return;
++    }
++    const double waitMs = std::chrono::duration<double, std::milli>(now - m_compileWaitStart).count();
++    if (waiting && !m_compileWaitLogged && waitMs >= kStuckCompileWaitMs) {
++      const DxvkRemixCompileStatus s = getCommonObjects()->pipelineManager().remixCompileStatus();
++      const uint32_t queued = s.inFlight > s.compiling ? s.inFlight - s.compiling : 0u;
++      Logger::warn(str::format("[RTX Shader Compile] ray tracing has waited ", uint32_t(waitMs / 1000.0),
++                               " s for Remix shaders: ", s.inFlight, " in flight (", s.compiling, " compiling, ", queued,
++                               " queued), ", s.completed, " completed since launch, oldest compiling: ",
++                               s.oldestName.empty() ? std::string("none") : s.oldestName, " for ",
++                               uint32_t(s.oldestAgeMs / 1000.0), " s"));
++      m_compileWaitLogged = true;
++    }
++    if (!waiting) {
++      if (waitMs >= 1000.0) {
++        const DxvkRemixCompileStatus s = getCommonObjects()->pipelineManager().remixCompileStatus();
++        Logger::info(str::format("[RTX Shader Compile] wait ended after ", uint32_t(waitMs), " ms, ", s.completed,
++                                 " completed since launch"));
++      }
++      m_compileWaitActive = false;
++    }
++  }
++
+   // Hooked into D3D9 presentImage (same place HUD rendering is)
+   void RtxContext::injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage) {
+     ScopedCpuProfileZone();
+@@ -516,6 +552,7 @@ namespace dxvk {
+     const auto computedPresentThrottleDelay = std::max(requestedPresentThrottleDelay, requestedAsyncShaderCompilationDelay);
+ 
+     m_device->setPresentThrottleDelay(computedPresentThrottleDelay);
++    logRemixCompileWait(m_rayTracingSupported && isRaytracingEnabled && asyncShaderCompilationActive);
+ 
+     // Early out if ray tracing is not supported or if Remix has already been injected
+ 
+diff --git a/src/dxvk/rtx_render/rtx_context.h b/src/dxvk/rtx_render/rtx_context.h
+index 14bd167..afc9422 100644
+--- a/src/dxvk/rtx_render/rtx_context.h
++++ b/src/dxvk/rtx_render/rtx_context.h
+@@ -226,6 +226,12 @@ namespace dxvk {
+     uint32_t m_frameLastInjected = kInvalidFrameIndex;
+     bool m_captureStateForRTX = true;
+ 
++    // Ray tracing held back by Remix shader compiles (see logRemixCompileWait)
++    bool m_compileWaitActive = false;
++    bool m_compileWaitLogged = false;
++    std::chrono::steady_clock::time_point m_compileWaitStart;
++    void logRemixCompileWait(bool waiting);
++
+     Rc<DxvkImage> m_skyProbeImage;
+     Rc<DxvkImageView> m_skyProbeCubePlanes[6];
+     VkFormat m_skyColorFormat = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+diff --git a/src/dxvk/rtx_render/rtx_scene_manager.cpp b/src/dxvk/rtx_render/rtx_scene_manager.cpp
+index da4b8ba..3feddba 100644
+--- a/src/dxvk/rtx_render/rtx_scene_manager.cpp
++++ b/src/dxvk/rtx_render/rtx_scene_manager.cpp
+@@ -605,6 +605,7 @@ namespace dxvk {
+     m_telemetry.textureBudgetMB = double(g_streamedTextures_budgetBytes) / (1024.0 * 1024.0);
+     m_telemetry.texturesDemoted = std::exchange(g_streamedTextures_demotedCount, 0u);
+     m_telemetry.rayTraced = raytracedThisFrame;
++    m_telemetry.remixShaderCompiles = m_device->getCommon()->pipelineManager().remixShaderCompilationCount();
+     for (size_t i = 0; i < size_t(RtxSkip::Count); i++) {
+       m_telemetry.skips[i] = g_rtxSkips[i].exchange(0, std::memory_order_relaxed);
+     }
+diff --git a/src/dxvk/rtx_render/rtx_telemetry.h b/src/dxvk/rtx_render/rtx_telemetry.h
+index 250f610..b984a40 100644
+--- a/src/dxvk/rtx_render/rtx_telemetry.h
++++ b/src/dxvk/rtx_render/rtx_telemetry.h
+@@ -64,6 +64,9 @@
+ //                           (VK_EXT_memory_budget: what the OS still lets this process use before paging)
+ //   thumbNonFinite          thumbnail pixels holding NaN or infinity before clamping
+ //   thumbClipped            thumbnail pixels at or above full white in all three channels
++//   remixShaderCompiles     Remix shader pipelines queued or compiling at the end of this frame. While above 0 with
++//                           ray tracing enabled, Remix does not ray trace and waits
++//                           rtx.shader.asyncCompilationThrottleMilliseconds per frame
+ //   rgbThumb                optional base64 of 64x36 8-bit RGB from the same image as lumaThumb
+ //   lumaThumb               optional base64 of 128x72 8-bit Rec.709 luma. Remix's final image on ray-traced
+ //                           frames, the game's own picture on frames with rayTraced false.
+@@ -143,6 +146,7 @@ namespace dxvk {
+     double vramFreeMB = 0.0;
+     uint32_t thumbNonFinite = 0;
+     uint32_t thumbClipped = 0;
++    uint32_t remixShaderCompiles = 0;
+     uint32_t skips[size_t(RtxSkip::Count)] = {};
+     std::vector<RtxPassTime> passes;
+     std::vector<uint64_t> newLegacyMaterials;
+@@ -201,9 +205,9 @@ namespace dxvk {
+     }
+     add("]");
+     add(",\"rayTraced\":%s,\"telemetryCpuMs\":%.3f,\"replacedMaterialDraws\":%u,\"legacyMaterialDraws\":%u,"
+-      "\"texturesDemoted\":%u,\"textureBudgetMB\":%.1f,\"vramFreeMB\":%.1f,\"thumbNonFinite\":%u,\"thumbClipped\":%u,\"skips\":{",
++      "\"texturesDemoted\":%u,\"textureBudgetMB\":%.1f,\"vramFreeMB\":%.1f,\"thumbNonFinite\":%u,\"thumbClipped\":%u,\"remixShaderCompiles\":%u,\"skips\":{",
+       t.rayTraced ? "true" : "false", t.telemetryCpuMs, t.replacedMaterialDraws, t.legacyMaterialDraws,
+-      t.texturesDemoted, t.textureBudgetMB, t.vramFreeMB, t.thumbNonFinite, t.thumbClipped);
++      t.texturesDemoted, t.textureBudgetMB, t.vramFreeMB, t.thumbNonFinite, t.thumbClipped, t.remixShaderCompiles);
+     const char* comma = "";
+     for (size_t i = 0; i < size_t(RtxSkip::Count); i++) {
+       if (t.skips[i] != 0) {

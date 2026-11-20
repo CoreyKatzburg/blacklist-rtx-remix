@@ -1,0 +1,57 @@
+From 2edde4e24dd11aeb971ea90956a629ab9d087faf Mon Sep 17 00:00:00 2001
+From: CoreyKatzburg <64795827+CoreyKatzburg@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 13:15:33 -0500
+Subject: [PATCH 13/17] Revert "captureAllInstances: take the instance count
+ from game-thread state"
+
+This reverts commit 2b5dbb6. The game has no hardware-instanced draws: vs 7D4CE01C takes its transform from the per-draw constant gLocalToWorld (c5-c7) and its stream 1 is three D3DCOLOR per-vertex values, not instance matrices. Run 20261116-130630-settings on 2b5dbb6: instancedSharedSlotDraws and instancedCapturedDraws 0 on all 3,114 frames of 01_off (option False) and on all 6,227 frames of 02_on (option True, read at remix-dxvk.log line 47).
+---
+ src/d3d9/d3d9_rtx.cpp                 | 12 +++---------
+ src/d3d9/d3d9_rtx_instanced_capture.h | 11 -----------
+ 2 files changed, 3 insertions(+), 20 deletions(-)
+
+diff --git a/src/d3d9/d3d9_rtx.cpp b/src/d3d9/d3d9_rtx.cpp
+index 17bdb39..bd38811 100644
+--- a/src/d3d9/d3d9_rtx.cpp
++++ b/src/d3d9/d3d9_rtx.cpp
+@@ -763,15 +763,9 @@ namespace dxvk {
+     const bool needVertexCapture = m_parent->UseProgrammableVS() && useVertexCapture();
+     InstancedCaptureLayout instancedLayout;
+     if (needVertexCapture) {
+-      // Game-thread state only: GenerateDrawInfo reads m_iaState, which the CS thread writes.
+-      uint32_t declStreams = 0;
+-      for (const auto& element : d3d9State().vertexDecl->GetElements()) {
+-        if (element.Stream < caps::MaxStreams) {
+-          declStreams |= 1u << element.Stream;
+-        }
+-      }
+-      const uint32_t instanceCount = drawInstanceCount(d3d9State().streamFreq[0], m_parent->m_instancedData, declStreams);
+-      instancedLayout = planInstancedCapture(geoData.vertexCount, geoData.indexCount, instanceCount,
++      const uint32_t drawInstanceCount =
++        m_parent->GenerateDrawInfo(drawContext.PrimitiveType, drawContext.PrimitiveCount, m_parent->GetInstanceCount()).instanceCount;
++      instancedLayout = planInstancedCapture(geoData.vertexCount, geoData.indexCount, drawInstanceCount,
+                                              geoData.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, captureAllInstances());
+     }
+     geoData.futureGeometryHashes = computeHash(geoData, maxOffsetedIndex, instancedLayout.copies);
+diff --git a/src/d3d9/d3d9_rtx_instanced_capture.h b/src/d3d9/d3d9_rtx_instanced_capture.h
+index b02f20b..2433ce6 100644
+--- a/src/d3d9/d3d9_rtx_instanced_capture.h
++++ b/src/d3d9/d3d9_rtx_instanced_capture.h
+@@ -25,17 +25,6 @@ namespace dxvk {
+     bool sharedSlots = false;
+   };
+ 
+-  // Instances the GPU runs for a draw, from game-thread state (D3D9DeviceEx::m_state.streamFreq[0],
+-  // m_instancedData and the vertex declaration's streams). The device's m_iaState holds the same answer
+-  // but is written on the CS thread, so the RTX draw path cannot read it.
+-  inline uint32_t drawInstanceCount(uint32_t streamFreq0, uint32_t instancedStreams, uint32_t declStreams) {
+-    if ((instancedStreams & declStreams) == 0) {
+-      return 1;
+-    }
+-    const uint32_t count = streamFreq0 & 0x7FFFFFu;
+-    return count > 1 ? count : 1;
+-  }
+-
+   // vertexCount: vertices one instance spans (max index - min index + 1, or the non-indexed count).
+   // indexCount: 0 for non-indexed draws. isTriangleList: strips and fans cannot be repeated by
+   // appending indices without joining the copies, so they keep one copy.

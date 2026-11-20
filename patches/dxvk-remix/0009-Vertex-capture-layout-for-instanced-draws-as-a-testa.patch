@@ -1,0 +1,77 @@
+From c46a50f1f42f982222308181f89202d14e64743a Mon Sep 17 00:00:00 2001
+From: CoreyKatzburg <64795827+CoreyKatzburg@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 09:35:51 -0500
+Subject: [PATCH 09/17] Vertex capture layout for instanced draws as a testable
+ header (today's layout: instances share slots)
+
+Amp-Thread-ID: https://ampcode.com/threads/T-01a1e1fe-618a-70d3-af1b-fbcbdff96aa4
+Co-authored-by: Amp <amp@ampcode.com>
+---
+ src/d3d9/d3d9_rtx_instanced_capture.h | 58 +++++++++++++++++++++++++++
+ 1 file changed, 58 insertions(+)
+ create mode 100644 src/d3d9/d3d9_rtx_instanced_capture.h
+
+diff --git a/src/d3d9/d3d9_rtx_instanced_capture.h b/src/d3d9/d3d9_rtx_instanced_capture.h
+new file mode 100644
+index 0000000..947495f
+--- /dev/null
++++ b/src/d3d9/d3d9_rtx_instanced_capture.h
+@@ -0,0 +1,58 @@
++#pragma once
++
++// NV-DXVK start: vertex capture layout for hardware-instanced draws
++// Vertex capture writes each shaded vertex of a draw to a slot of the capture buffer, and the
++// ray-traced geometry is built from that buffer and the draw's index buffer. This header holds the
++// layout both sides must agree on (dxso_compiler.cpp emitVertexCaptureOp writes the slots,
++// d3d9_rtx.cpp sizes the buffer and builds the indices), so it can be tested without a GPU.
++
++#include <cstdint>
++
++namespace dxvk {
++
++  struct InstancedCaptureLayout {
++    // Copies of the mesh written to the capture buffer.
++    uint32_t copies = 1;
++    // Slot distance between copies; 0 means every instance writes the same slots.
++    uint32_t instanceVertexStride = 0;
++    uint32_t capturedVertexCount = 0;
++    uint32_t indexCount = 0;
++    bool needs32BitIndices = false;
++    // The draw has more than one instance, but its instances share slots (only one copy survives).
++    bool sharedSlots = false;
++  };
++
++  // vertexCount: vertices one instance spans (max index - min index + 1, or the non-indexed count).
++  // indexCount: 0 for non-indexed draws. isTriangleList: strips and fans cannot be repeated by
++  // appending indices without joining the copies, so they keep one copy.
++  inline InstancedCaptureLayout planInstancedCapture(uint32_t vertexCount, uint32_t indexCount,
++                                                     uint32_t drawInstanceCount, bool isTriangleList,
++                                                     bool captureAllInstances) {
++    (void) isTriangleList;
++    (void) captureAllInstances;
++    InstancedCaptureLayout layout;
++    layout.capturedVertexCount = vertexCount;
++    layout.indexCount = indexCount;
++    layout.sharedSlots = drawInstanceCount > 1;
++    return layout;
++  }
++
++  // Slot written by the capture shader for one vertex of one instance (gl_VertexIndex, gl_InstanceIndex).
++  inline uint32_t vertexCaptureSlot(uint32_t vertexId, uint32_t baseVertex, uint32_t instanceId,
++                                    uint32_t instanceVertexStride) {
++    (void) instanceId;
++    (void) instanceVertexStride;
++    return vertexId - baseVertex;
++  }
++
++  // Writes layout.indexCount indices: the draw's indices once per copy, offset by the copy's slots.
++  template<typename In, typename Out>
++  void expandInstancedIndices(const In* src, uint32_t drawIndexCount, const InstancedCaptureLayout& layout, Out* dst) {
++    (void) layout;
++    for (uint32_t i = 0; i < drawIndexCount; i++) {
++      dst[i] = Out(src[i]);
++    }
++  }
++
++}
++// NV-DXVK end

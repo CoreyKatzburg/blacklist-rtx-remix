@@ -1,0 +1,84 @@
+From cb7d3b6466835197e5b8ba96942371c91e8c6279 Mon Sep 17 00:00:00 2001
+From: CoreyKatzburg <64795827+CoreyKatzburg@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 09:39:32 -0500
+Subject: [PATCH 10/17] Telemetry: instancedSharedSlotDraws and
+ instancedCapturedDraws per frame
+
+Hardware-instanced draws (D3D9 stream frequency) go through vertex capture
+with every instance written to the same slots, so only one copy reaches ray
+tracing (worker E's con_boiler tank). countInstancedCapture(sharedSlots),
+called once per instanced captured draw from the D3D9 layer like
+countRtxSkip, feeds two per-frame counts: draws whose copies shared slots and
+draws captured with every copy. Both 0 means no instanced draws, so the
+scorecard can tell the fix being off from a scene with none. Not yet called;
+worker E wires it in d3d9_rtx.cpp.
+
+Amp-Thread-ID: https://ampcode.com/threads/T-01a1e070-32c4-730c-bdfc-76d09e1f79eb
+Co-authored-by: Amp <amp@ampcode.com>
+---
+ src/dxvk/rtx_render/rtx_scene_manager.cpp |  2 ++
+ src/dxvk/rtx_render/rtx_telemetry.h       | 17 ++++++++++++++++-
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/src/dxvk/rtx_render/rtx_scene_manager.cpp b/src/dxvk/rtx_render/rtx_scene_manager.cpp
+index 3feddba..4d8d52d 100644
+--- a/src/dxvk/rtx_render/rtx_scene_manager.cpp
++++ b/src/dxvk/rtx_render/rtx_scene_manager.cpp
+@@ -609,6 +609,8 @@ namespace dxvk {
+     for (size_t i = 0; i < size_t(RtxSkip::Count); i++) {
+       m_telemetry.skips[i] = g_rtxSkips[i].exchange(0, std::memory_order_relaxed);
+     }
++    m_telemetry.instancedCapturedDraws = g_instancedCaptures[0].exchange(0, std::memory_order_relaxed);
++    m_telemetry.instancedSharedSlotDraws = g_instancedCaptures[1].exchange(0, std::memory_order_relaxed);
+ 
+     m_telemetry.telemetryCpuMs += std::exchange(m_telemetryZoneCpuMs, 0.0);
+     if (!m_telemetryZones.empty()) {
+diff --git a/src/dxvk/rtx_render/rtx_telemetry.h b/src/dxvk/rtx_render/rtx_telemetry.h
+index 8205a5d..2c2ef80 100644
+--- a/src/dxvk/rtx_render/rtx_telemetry.h
++++ b/src/dxvk/rtx_render/rtx_telemetry.h
+@@ -56,6 +56,11 @@
+ //   telemetryCpuMs          render-thread CPU time this recorder itself used this frame
+ //   skips                   {"reason":count} draws the D3D9 layer kept out of ray tracing (see RtxSkip).
+ //                           Counted on the game's draw thread, so a count can land one frame late.
++//   instancedSharedSlotDraws  draws captured by vertex capture with more than one instance (D3D9 stream frequency)
++//                           whose instances were written to the same capture slots, so only one copy reaches ray
++//                           tracing (countInstancedCapture(true)). Same thread and lag as skips.
++//   instancedCapturedDraws  instanced draws captured with every copy in its own slots (countInstancedCapture(false)).
++//                           Both 0 means the frame had no instanced captured draws.
+ //   replacedMaterialDraws   draws whose texture has a replacement material in the mod
+ //   legacyMaterialDraws     draws that fell back to the game's plain texture
+ //   newLegacyMaterials      hex texture hashes first seen falling back this frame (at most 64 per frame)
+@@ -101,6 +106,13 @@ namespace dxvk {
+     g_rtxSkips[size_t(reason)].fetch_add(1, std::memory_order_relaxed);
+   }
+ 
++  // Instanced draws (more than one instance) that went through vertex capture since the last frame record:
++  // [0] every copy captured, [1] copies written to shared slots so one survives. Call once per such draw.
++  inline std::atomic<uint32_t> g_instancedCaptures[2];
++  inline void countInstancedCapture(bool sharedSlots) {
++    g_instancedCaptures[sharedSlots ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
++  }
++
+   struct RtxPassTime {
+     std::string path;
+     double gpuMs = 0.0;
+@@ -160,6 +172,8 @@ namespace dxvk {
+     float autoExposure = 0.0f;
+     float effectiveExposure = 0.0f;
+     uint32_t skips[size_t(RtxSkip::Count)] = {};
++    uint32_t instancedSharedSlotDraws = 0;
++    uint32_t instancedCapturedDraws = 0;
+     std::vector<RtxPassTime> passes;
+     std::vector<uint64_t> newLegacyMaterials;
+     std::string rgbThumb;
+@@ -233,7 +247,8 @@ namespace dxvk {
+         comma = ",";
+       }
+     }
+-    add("},\"passMs\":{");
++    add("},\"instancedSharedSlotDraws\":%u,\"instancedCapturedDraws\":%u", t.instancedSharedSlotDraws, t.instancedCapturedDraws);
++    add(",\"passMs\":{");
+     comma = "";
+     for (const RtxPassTime& pass : t.passes) {
+       add("%s\"%s\":[%.3f,%.3f,%u]", comma, pass.path.c_str(), pass.gpuMs, pass.cpuMs, pass.count);

@@ -1,0 +1,71 @@
+From f39d62ab9b98d2c3b8454445fb980cd9c9f3f20f Mon Sep 17 00:00:00 2001
+From: CoreyKatzburg <64795827+CoreyKatzburg@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 00:36:46 -0500
+Subject: [PATCH 04/17] Add rtx.useSynthesizedCaptureNormals (default off) to
+ use synthesized capture normals
+
+Vertex capture synthesizes a smooth normal from NORMAL0 for 74 world shaders that have
+no normal output (21 skinned, 48 world, 5 object), but d3d9_rtx.cpp bound the captured
+normal buffer only for a detected normal output, so those normals were discarded and the
+draws fell back to geometric triangle normals. It is unknown whether that was deliberate,
+so the new rule hasNormalOutput || (option && hasSynthesizedNormal) sits behind an
+option that is off by default, for an off/on comparison in one build. The rule lives in
+usesCapturedNormal() in dxso_capture_analysis.h so the offline tests can check it.
+
+Amp-Thread-ID: https://ampcode.com/threads/T-01a1e1fe-618a-70d3-af1b-fbcbdff96aa4
+Co-authored-by: Amp <amp@ampcode.com>
+---
+ src/d3d9/d3d9_rtx.cpp            | 8 ++++++--
+ src/d3d9/d3d9_rtx.h              | 3 +++
+ src/dxso/dxso_capture_analysis.h | 6 ++++++
+ 3 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/src/d3d9/d3d9_rtx.cpp b/src/d3d9/d3d9_rtx.cpp
+index 2266257..ea45627 100644
+--- a/src/d3d9/d3d9_rtx.cpp
++++ b/src/d3d9/d3d9_rtx.cpp
+@@ -205,8 +205,12 @@ namespace dxvk {
+     // Capture normals only from the shader output that holds the transformed (skinned, world-space)
+     // normal, found by analysing the shader bytecode. The raw input normal is not usable: games pack
+     // and decode it in shader-specific ways, and skinned meshes need the skinned normal. Without such an
+-    // output, Remix falls back to geometric triangle normals.
+-    const bool hasCapturedNormal = vertexShader != nullptr && vertexShader->GetCaptureAnalysis().hasNormalOutput;
++    // output, Remix falls back to geometric triangle normals unless rtx.useSynthesizedCaptureNormals
++    // opts in to the normal the capture shader synthesized from NORMAL0.
++    // NV-DXVK start: synthesized capture normals behind rtx.useSynthesizedCaptureNormals
++    const bool hasCapturedNormal = vertexShader != nullptr &&
++                                   usesCapturedNormal(vertexShader->GetCaptureAnalysis(), useSynthesizedCaptureNormals());
++    // NV-DXVK end
+     if (hasCapturedNormal && useVertexCapturedNormals()) {
+       const uint32_t normalOffset = offsetof(CapturedVertex, normal0);
+       geoData.normalBuffer = RasterBuffer(slice, normalOffset, stride, VK_FORMAT_R32G32B32_SFLOAT);
+diff --git a/src/d3d9/d3d9_rtx.h b/src/d3d9/d3d9_rtx.h
+index 1ebafb3..61f25c9 100644
+--- a/src/d3d9/d3d9_rtx.h
++++ b/src/d3d9/d3d9_rtx.h
+@@ -41,6 +41,9 @@ namespace dxvk {
+     RTX_OPTION("rtx", bool, allowCubemaps, false, "When enabled, cubemaps from the game are processed through Remix, but they may not render correctly.");
+     RTX_OPTION("rtx", bool, useVertexCapture, true, "When enabled, injects code into the original vertex shader to capture final shaded vertex positions.  Is useful for games using simple vertex shaders, that still also set the fixed function transform matrices.");
+     RTX_OPTION("rtx", bool, useVertexCapturedNormals, true, "When enabled, vertex normals are read from the input assembler and used in raytracing.  This doesn't always work as normals can be in any coordinate space, but can help sometimes.");
++    // NV-DXVK start: opt-in use of synthesized vertex capture normals
++    RTX_OPTION("rtx", bool, useSynthesizedCaptureNormals, false, "When enabled, vertex shaders that consume NORMAL0 without writing a normal output use the smooth normal synthesized during vertex capture (skinned, world or object space) instead of geometric triangle normals. Off keeps the stock rule: only a detected normal output is used.");
++    // NV-DXVK end
+     RTX_OPTION("rtx", bool, useWorldMatricesForShaders, true, "When enabled, Remix will utilize the world matrices being passed from the game via D3D9 fixed function API, even when running with shaders.  Sometimes games pass these matrices and they are useful, however for some games they are very unreliable, and should be filtered out.  If you're seeing precision related issues with shader vertex capture, try disabling this setting.");
+     RTX_OPTION("rtx", bool, enableIndexBufferMemoization, true, "CPU performance optimization, should generally be enabled.  Will reduce main thread time by caching processIndexBuffer operations and reusing when possible, this will come at the expense of some CPU RAM.");
+     RTX_OPTION("rtx", uint32_t, numGeometryProcessingThreads, 2, "The desired number of CPU threads to dedicate to geometry processing  Will be limited by the number of CPU cores.  There may be some advantage to lowering this number in games which are fairly simple and use a low number of draw calls per frame.  The default was determined by looking at a game with around 2000 draw calls per frame, and with a reasonably high average triangle count per draw.");
+diff --git a/src/dxso/dxso_capture_analysis.h b/src/dxso/dxso_capture_analysis.h
+index ad76833..2e454ad 100644
+--- a/src/dxso/dxso_capture_analysis.h
++++ b/src/dxso/dxso_capture_analysis.h
+@@ -60,5 +60,11 @@ namespace dxvk {
+ 
+   DxsoCaptureAnalysis analyzeVertexShaderForCapture(const uint32_t* tokens, size_t tokenCount);
+ 
++  // True when the vertex capture buffer holds a normal Remix should use for this shader.
++  // Synthesized normals are used only when the caller opts in (rtx.useSynthesizedCaptureNormals).
++  inline bool usesCapturedNormal(const DxsoCaptureAnalysis& analysis, bool useSynthesized) {
++    return analysis.hasNormalOutput || (useSynthesized && analysis.hasSynthesizedNormal);
++  }
++
+ }
+ // NV-DXVK end

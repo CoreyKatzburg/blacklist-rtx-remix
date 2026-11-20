@@ -1,0 +1,454 @@
+From 7f8c727a2f0cdd95f6e7b80c2c2a8ea5709ea46b Mon Sep 17 00:00:00 2001
+From: CoreyKatzburg <64795827+CoreyKatzburg@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 04:48:14 -0500
+Subject: [PATCH 06/17] Telemetry: zero-normal counts, top inward instances,
+ and qpcMs join key
+
+Worker E (problem 5, black and inside-out surfaces) needs to know which meshes have zero or invalid
+normals and which instances face inward. The gate pass now also runs on static instances and counts
+triangles with a zero or non-finite decoded normal (zeroNormalSkinnedTriangles/Instances,
+zeroNormalStaticTriangles/Instances), and keeps a per-instance inward count so the recorder can list
+the 8 most inward skinned instances (topInwardInstances: inward, tris, geomHash by the asset hash
+rule so it matches USD capture mesh names, albedoHash, cull, flip, blend, enc).
+
+qpcMs is QueryPerformanceCounter in ms, read on the D3D9 thread when a frame goes to ray tracing,
+the same clock as d3d9_proxy_frames.csv column 2, so the two files can be cross-checked frame by
+frame. Inherited inward/skinned fields are unchanged. Verified offline only: build and remix source
+tests pass; the shader classification has not run live yet.
+---
+ src/d3d9/d3d9_rtx.cpp                         | 20 ++++-
+ src/dxvk/rtx_render/rtx_context.cpp           | 58 +++++++++++----
+ src/dxvk/rtx_render/rtx_scene_manager.h       |  1 +
+ src/dxvk/rtx_render/rtx_telemetry.h           | 73 ++++++++++++++++++-
+ .../pass/gate_skinned_triangles.comp.slang    | 42 +++++++++--
+ .../gate_skinned_triangles_binding_indices.h  | 12 +++
+ 6 files changed, 181 insertions(+), 25 deletions(-)
+
+diff --git a/src/d3d9/d3d9_rtx.cpp b/src/d3d9/d3d9_rtx.cpp
+index ea45627..6d7c5ce 100644
+--- a/src/d3d9/d3d9_rtx.cpp
++++ b/src/d3d9/d3d9_rtx.cpp
+@@ -792,14 +792,25 @@ namespace dxvk {
+       (preserveOriginalDraw ? PrepareDrawFlag::PreserveDrawCallAndItsState : 0);
+   }
+ 
++  // NV-DXVK start: telemetry qpcMs
++  // QueryPerformanceCounter in ms, the same clock and formula as d3d9_proxy_frames.csv column 2, so the
++  // telemetry and proxy files can be joined frame by frame.
++  static double telemetryQpcMs() {
++    return double(high_resolution_clock::getCounter()) * 1000.0 / double(high_resolution_clock::getFrequency());
++  }
++  // NV-DXVK end
++
+   void D3D9Rtx::triggerInjectRTX() {
+     // Flush any pending game and RTX work
+     m_parent->Flush();
+ 
+     // Send command to inject RTX
+-    m_parent->EmitCs([cReflexFrameId = GetReflexFrameId()](DxvkContext* ctx) {
++    // NV-DXVK start: stamp the frame record with the proxy's clock (telemetry qpcMs)
++    m_parent->EmitCs([cReflexFrameId = GetReflexFrameId(), cQpcMs = telemetryQpcMs()](DxvkContext* ctx) {
++      static_cast<RtxContext*>(ctx)->getSceneManager().setTelemetryQpcMs(cQpcMs);
+       static_cast<RtxContext*>(ctx)->injectRTX(cReflexFrameId);
+     });
++    // NV-DXVK end
+   }
+ 
+   void D3D9Rtx::CommitGeometryToRT(const DrawContext& drawContext) {
+@@ -1307,9 +1318,12 @@ namespace dxvk {
+     m_parent->Flush();
+ 
+     // Inform backend of end-frame
+-    m_parent->EmitCs([currentReflexFrameId, targetImage, callInjectRtx](DxvkContext* ctx) { 
+-      static_cast<RtxContext*>(ctx)->endFrame(currentReflexFrameId, targetImage, callInjectRtx); 
++    // NV-DXVK start: stamp the frame record with the proxy's clock (telemetry qpcMs)
++    m_parent->EmitCs([currentReflexFrameId, targetImage, callInjectRtx, cQpcMs = telemetryQpcMs()](DxvkContext* ctx) {
++      static_cast<RtxContext*>(ctx)->getSceneManager().setTelemetryQpcMs(cQpcMs);
++      static_cast<RtxContext*>(ctx)->endFrame(currentReflexFrameId, targetImage, callInjectRtx);
+     });
++    // NV-DXVK end
+ 
+     // Reset for the next frame
+     m_rtxInjectTriggered = false;
+diff --git a/src/dxvk/rtx_render/rtx_context.cpp b/src/dxvk/rtx_render/rtx_context.cpp
+index 6d3ba8e..b656f8c 100644
+--- a/src/dxvk/rtx_render/rtx_context.cpp
++++ b/src/dxvk/rtx_render/rtx_context.cpp
+@@ -2961,7 +2961,9 @@ namespace dxvk {
+     constexpr uint32_t kGateThumbH = 72;
+     constexpr uint32_t kGateMidW = 512;
+     constexpr uint32_t kGateMidH = 288;
+-    constexpr VkDeviceSize kGateCounterHeaderBytes = 16;
++    // One slot's counters (see gate_skinned_triangles_binding_indices.h), rounded up to 16 bytes; the thumbnail follows.
++    constexpr VkDeviceSize kGateSlotCounterBytes = VkDeviceSize(GATE_SKINNED_SLOT_UINTS) * sizeof(uint32_t);
++    constexpr VkDeviceSize kGateCounterHeaderBytes = (kGateSlotCounterBytes + 15) & ~VkDeviceSize(15);
+     constexpr VkDeviceSize kGateThumbBytes = VkDeviceSize(kGateThumbW) * kGateThumbH * 8;
+ 
+     inline float halfToFloat32(uint16_t h) {
+@@ -3213,7 +3215,7 @@ namespace dxvk {
+       m_gateTelemetry.thumbSmall = makeThumbImage(kGateThumbW, kGateThumbH, "Gate Thumb 128x72");
+ 
+       DxvkBufferCreateInfo cInfo = {};
+-      cInfo.size = kGateTelemetrySlots * sizeof(uint32_t);
++      cInfo.size = kGateTelemetrySlots * kGateSlotCounterBytes;
+       cInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+       cInfo.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+       cInfo.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+@@ -3229,7 +3231,8 @@ namespace dxvk {
+       m_gateTelemetry.fence->wait(m_gateTelemetry.slotSync[slot]);
+     }
+ 
+-    clearBuffer(m_gateTelemetry.gpuCounters, VkDeviceSize(slot) * sizeof(uint32_t), sizeof(uint32_t), 0u);
++    const uint32_t slotBase = slot * GATE_SKINNED_SLOT_UINTS;
++    clearBuffer(m_gateTelemetry.gpuCounters, VkDeviceSize(slot) * kGateSlotCounterBytes, kGateSlotCounterBytes, 0u);
+     emitMemoryBarrier(0,
+       VK_PIPELINE_STAGE_TRANSFER_BIT,
+       VK_ACCESS_TRANSFER_WRITE_BIT,
+@@ -3238,15 +3241,18 @@ namespace dxvk {
+ 
+     const uint32_t frameId = m_device->getCurrentFrameId();
+     bool dispatchedAny = false;
++    std::vector<RtxGateInstance> gated;
+     for (const RtInstance* instance : getSceneManager().getInstanceManager().getInstanceTable()) {
+       if (instance == nullptr || instance->isMarkedForGC() || instance->getFrameLastUpdated() != frameId || instance->isHidden()) {
+         continue;
+       }
+       const BlasEntry* blas = instance->getBlas();
+-      if (blas == nullptr || !(blas->input.usesVertexShaderSkinning || blas->input.getSkinningState().numBones > 0)) {
++      if (blas == nullptr) {
+         continue;
+       }
+-      if (blas->input.getGeometryData().cullMode == VK_CULL_MODE_NONE) {
++      // Skinned instances get the inward test (only when culled, as before); static ones only the normal count.
++      const bool skinned = blas->input.usesVertexShaderSkinning || blas->input.getSkinningState().numBones > 0;
++      if (skinned && blas->input.getGeometryData().cullMode == VK_CULL_MODE_NONE) {
+         continue;
+       }
+       const RaytraceGeometry& geo = blas->modifiedGeometryData;
+@@ -3268,6 +3274,24 @@ namespace dxvk {
+                                   : static_cast<const DxvkBufferSlice&>(geo.positionBuffer));
+ 
+       const bool flipWinding = (instance->getVkInstance().flags & VK_GEOMETRY_INSTANCE_TRIANGLE_FLIP_FACING_BIT_KHR) != 0;
++      const bool encoded = geo.normalBuffer.vertexFormat() == VK_FORMAT_R32_UINT;
++      uint32_t counterSlot = slotBase;   // totals only, once every pair is taken
++      if (gated.size() < GATE_SKINNED_MAX_INSTANCES) {
++        counterSlot = slotBase + GATE_SKINNED_TOTALS + 2u * uint32_t(gated.size());
++        RtxGateInstance info;
++        info.skinned = skinned;
++        info.tris = numTris;
++        if (skinned) {
++          const LegacyMaterialData& material = blas->input.getMaterialData();
++          info.geomHash = blas->input.getHash(RtxOptions::geometryAssetHashRule());
++          info.albedoHash = material.getColorTexture().getImageHash();
++          info.cull = uint32_t(blas->input.getGeometryData().cullMode);
++          info.flip = flipWinding;
++          info.blend = material.blendMode.enableBlending;
++          info.enc = encoded;
++        }
++        gated.push_back(info);
++      }
+       GateSkinnedTrianglesArgs args = {};
+       args.positionOffset = uint32_t(geo.positionBuffer.offsetFromSlice());
+       args.positionStride = uint32_t(geo.positionBuffer.stride());
+@@ -3278,9 +3302,10 @@ namespace dxvk {
+       args.flags =
+         (geo.indexBuffer.defined() ? GATE_SKINNED_FLAG_INDEXED : 0u) |
+         ((geo.indexBuffer.defined() && geo.indexBuffer.indexType() == VK_INDEX_TYPE_UINT16) ? GATE_SKINNED_FLAG_SHORT_INDICES : 0u) |
+-        ((geo.normalBuffer.vertexFormat() == VK_FORMAT_R32_UINT) ? GATE_SKINNED_FLAG_NORMALS_ENCODED : 0u) |
+-        (flipWinding ? GATE_SKINNED_FLAG_FLIP_WINDING : 0u);
+-      args.counterSlot = slot;
++        (encoded ? GATE_SKINNED_FLAG_NORMALS_ENCODED : 0u) |
++        (flipWinding ? GATE_SKINNED_FLAG_FLIP_WINDING : 0u) |
++        (skinned ? 0u : GATE_SKINNED_FLAG_STATIC);
++      args.counterSlot = counterSlot;
+       args.objToWorld0 = instance->surface.objectToWorld.data[0];
+       args.objToWorld1 = instance->surface.objectToWorld.data[1];
+       args.objToWorld2 = instance->surface.objectToWorld.data[2];
+@@ -3303,7 +3328,7 @@ namespace dxvk {
+     }
+ 
+     Rc<DxvkBuffer> dstSlot = m_gateTelemetry.readbackSlots[slot];
+-    copyBuffer(dstSlot, 0, m_gateTelemetry.gpuCounters, VkDeviceSize(slot) * sizeof(uint32_t), sizeof(uint32_t));
++    copyBuffer(dstSlot, 0, m_gateTelemetry.gpuCounters, VkDeviceSize(slot) * kGateSlotCounterBytes, kGateSlotCounterBytes);
+ 
+     changeImageLayout(m_gateTelemetry.thumbMid, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+     blitImageHelper(this, finalImg, m_gateTelemetry.thumbMid, VK_FILTER_LINEAR);
+@@ -3339,15 +3364,22 @@ namespace dxvk {
+     }
+ 
+     Rc<sync::Fence> fence = m_gateTelemetry.fence;
+-    getSceneManager().setTelemetryResolve([fence, syncVal, dstSlot, lumaScale](RtxFrameTelemetry& out) {
++    getSceneManager().setTelemetryResolve([fence, syncVal, dstSlot, lumaScale, gated = std::move(gated)](RtxFrameTelemetry& out) mutable {
+       fence->wait(syncVal);
+       const uint8_t* raw = reinterpret_cast<const uint8_t*>(dstSlot->mapPtr(0));
+       if (raw == nullptr) {
+         return;
+       }
+-      uint32_t inward = 0;
+-      std::memcpy(&inward, raw, sizeof(uint32_t));
+-      out.inwardSkinnedTriangles = inward;
++      uint32_t counters[GATE_SKINNED_TOTALS + 2 * GATE_SKINNED_MAX_INSTANCES];
++      std::memcpy(counters, raw, sizeof(counters));
++      out.inwardSkinnedTriangles = counters[0];
++      out.zeroNormalSkinnedTriangles = counters[1];
++      out.zeroNormalStaticTriangles = counters[2];
++      for (size_t k = 0; k < gated.size(); ++k) {
++        gated[k].inward = counters[GATE_SKINNED_TOTALS + 2 * k];
++        gated[k].zeroNormal = counters[GATE_SKINNED_TOTALS + 2 * k + 1];
++      }
++      summarizeGateInstances(gated, out);
+ 
+       const uint16_t* px = reinterpret_cast<const uint16_t*>(raw + kGateCounterHeaderBytes);
+       uint8_t luma[kGateThumbW * kGateThumbH];
+diff --git a/src/dxvk/rtx_render/rtx_scene_manager.h b/src/dxvk/rtx_render/rtx_scene_manager.h
+index a1210c9..8d35ce3 100644
+--- a/src/dxvk/rtx_render/rtx_scene_manager.h
++++ b/src/dxvk/rtx_render/rtx_scene_manager.h
+@@ -260,6 +260,7 @@ public:
+   void beginTelemetryZone(DxvkContext& ctx, const char* name);
+   void endTelemetryZone(DxvkContext& ctx);
+   void addTelemetryCpuMs(double ms) { m_telemetry.telemetryCpuMs += ms; }
++  void setTelemetryQpcMs(double ms) { m_telemetry.qpcMs = ms; }
+ 
+ private:
+   enum class ObjectCacheState
+diff --git a/src/dxvk/rtx_render/rtx_telemetry.h b/src/dxvk/rtx_render/rtx_telemetry.h
+index e6c807d..250f610 100644
+--- a/src/dxvk/rtx_render/rtx_telemetry.h
++++ b/src/dxvk/rtx_render/rtx_telemetry.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <condition_variable>
+@@ -23,6 +24,10 @@
+ //
+ // Field contract (do not rename; new fields may be added):
+ //   frame                   frame index (uint)
++//   qpcMs                   QueryPerformanceCounter in ms (the clock in d3d9_proxy_frames.csv column 2), read on the
++//                           D3D9 thread when this frame's ray tracing was started; 0 when not stamped. The bridge
++//                           client returns from Present only after the server's Present, so proxy row k owns the
++//                           stamps in (entry+presentMs of row k-1, entry+presentMs of row k]
+ //   frameTimeMs             CPU time between this frame's end and the previous one
+ //   gpuTimeMs               GPU busy time in the same interval (interval minus measured GPU idle time)
+ //   instances               active ray-traced instances
+@@ -33,6 +38,16 @@
+ //   vramUsedMB              device-local memory used by this process (VK_EXT_memory_budget)
+ //   skinnedTriangles        triangles of skinned instances drawn this frame
+ //   inwardSkinnedTriangles  skinned triangles whose winding face normal opposes their vertex normals
++//   zeroNormalSkinnedTriangles  skinned triangles (same filters) with a decoded vertex normal of length^2 <= 1e-12,
++//                           NaN or infinity; the inward test cannot judge these
++//   zeroNormalInstances     skinned instances with zeroNormalSkinnedTriangles > 0
++//   zeroNormalStaticTriangles  the same count over non-skinned instances drawn this frame (no cull-mode filter)
++//   zeroNormalStaticInstances  non-skinned instances with at least one such triangle
++//   topInwardInstances      up to 8 skinned instances with inward > 0, most inward first:
++//                           {"inward","tris","geomHash" (asset hash rule, as USD capture mesh_<hash>),
++//                            "albedoHash" (colour texture 0 image hash),"cull","flip","blend","enc"}.
++//                           Only the first 1024 gated instances of a frame (skinned and static) get their own
++//                           counters; later ones still count in the totals.
+ //   rayTraced               true when Remix ray traced this frame, false on goggle and menu frames
+ //   passMs                  {"Parent/Step":[gpuMs, cpuMs, count]} for every labelled render step
+ //                           (ScopedGpuProfileZone) that closed this frame. gpuMs is -1 when the GPU result
+@@ -81,8 +96,26 @@ namespace dxvk {
+     uint32_t count = 0;
+   };
+ 
++  // One instance in the normal gate pass (skinned: inward and zero-normal counts; static: zero-normal only).
++  // The counts come back from the GPU; the rest is recorded on the CPU when the instance is dispatched.
++  struct RtxGateInstance {
++    bool skinned = true;
++    uint32_t inward = 0;
++    uint32_t zeroNormal = 0;
++    uint32_t tris = 0;
++    uint64_t geomHash = 0;
++    uint64_t albedoHash = 0;
++    uint32_t cull = 0;
++    bool flip = false;
++    bool blend = false;
++    bool enc = false;
++  };
++
++  inline constexpr size_t kTopInwardInstances = 8;
++
+   struct RtxFrameTelemetry {
+     uint64_t frame = 0;
++    double qpcMs = 0.0;
+     double frameTimeMs = 0.0;
+     double gpuTimeMs = 0.0;
+     uint32_t instances = 0;
+@@ -96,6 +129,11 @@ namespace dxvk {
+     uint32_t unorderedInstances = 0;
+     uint32_t skinnedTriangles = 0;
+     uint32_t inwardSkinnedTriangles = 0;
++    uint32_t zeroNormalSkinnedTriangles = 0;
++    uint32_t zeroNormalInstances = 0;
++    uint32_t zeroNormalStaticTriangles = 0;
++    uint32_t zeroNormalStaticInstances = 0;
++    std::vector<RtxGateInstance> topInwardInstances;
+     bool rayTraced = false;
+     double telemetryCpuMs = 0.0;
+     uint32_t replacedMaterialDraws = 0;
+@@ -114,6 +152,27 @@ namespace dxvk {
+ 
+   using RtxTelemetryResolver = std::function<void(RtxFrameTelemetry&)>;
+ 
++  // Fills zeroNormalInstances, zeroNormalStaticInstances and topInwardInstances (skinned only) from the gated
++  // instances, whose counts were already read back. Ties keep dispatch order.
++  inline void summarizeGateInstances(const std::vector<RtxGateInstance>& instances, RtxFrameTelemetry& out) {
++    out.zeroNormalInstances = 0;
++    out.zeroNormalStaticInstances = 0;
++    out.topInwardInstances.clear();
++    for (const RtxGateInstance& inst : instances) {
++      if (inst.zeroNormal > 0) {
++        ++(inst.skinned ? out.zeroNormalInstances : out.zeroNormalStaticInstances);
++      }
++      if (inst.skinned && inst.inward > 0) {
++        out.topInwardInstances.push_back(inst);
++      }
++    }
++    std::stable_sort(out.topInwardInstances.begin(), out.topInwardInstances.end(),
++      [](const RtxGateInstance& a, const RtxGateInstance& b) { return a.inward > b.inward; });
++    if (out.topInwardInstances.size() > kTopInwardInstances) {
++      out.topInwardInstances.resize(kTopInwardInstances);
++    }
++  }
++
+   // Formats one JSON line (with trailing '\n'). Returns the length, or 0 if it did not fit.
+   inline size_t formatTelemetryLine(char* buffer, size_t size, const RtxFrameTelemetry& t) {
+     size_t used = 0;
+@@ -123,14 +182,24 @@ namespace dxvk {
+       fits = n >= 0 && used + size_t(n) < size;
+       used += fits ? size_t(n) : 0;
+     };
+-    add("{\"frame\":%llu,\"frameTimeMs\":%.3f,\"gpuTimeMs\":%.3f,\"instances\":%u,\"skinnedInstances\":%u,"
++    add("{\"frame\":%llu,\"qpcMs\":%.3f,\"frameTimeMs\":%.3f,\"gpuTimeMs\":%.3f,\"instances\":%u,\"skinnedInstances\":%u,"
+       "\"staticBlasRebuilds\":%u,\"cameraCut\":%s,\"textureMemoryMB\":%.1f,\"vramUsedMB\":%.1f,"
+       "\"staticBlasBuilds\":%u,\"skinnedBlasUpdates\":%u,\"unorderedInstances\":%u,"
+       "\"skinnedTriangles\":%u,\"inwardSkinnedTriangles\":%u",
+-      static_cast<unsigned long long>(t.frame), t.frameTimeMs, t.gpuTimeMs, t.instances, t.skinnedInstances,
++      static_cast<unsigned long long>(t.frame), t.qpcMs, t.frameTimeMs, t.gpuTimeMs, t.instances, t.skinnedInstances,
+       t.staticBlasRebuilds, t.cameraCut ? "true" : "false", t.textureMemoryMB, t.vramUsedMB,
+       t.staticBlasBuilds, t.skinnedBlasUpdates, t.unorderedInstances,
+       t.skinnedTriangles, t.inwardSkinnedTriangles);
++    add(",\"zeroNormalSkinnedTriangles\":%u,\"zeroNormalInstances\":%u,\"zeroNormalStaticTriangles\":%u,"
++      "\"zeroNormalStaticInstances\":%u,\"topInwardInstances\":[",
++      t.zeroNormalSkinnedTriangles, t.zeroNormalInstances, t.zeroNormalStaticTriangles, t.zeroNormalStaticInstances);
++    for (size_t i = 0; i < t.topInwardInstances.size(); i++) {
++      const RtxGateInstance& g = t.topInwardInstances[i];
++      add("%s{\"inward\":%u,\"tris\":%u,\"geomHash\":\"%016llX\",\"albedoHash\":\"%016llX\",\"cull\":%u,\"flip\":%u,"
++        "\"blend\":%u,\"enc\":%u}", i ? "," : "", g.inward, g.tris, static_cast<unsigned long long>(g.geomHash),
++        static_cast<unsigned long long>(g.albedoHash), g.cull, g.flip ? 1u : 0u, g.blend ? 1u : 0u, g.enc ? 1u : 0u);
++    }
++    add("]");
+     add(",\"rayTraced\":%s,\"telemetryCpuMs\":%.3f,\"replacedMaterialDraws\":%u,\"legacyMaterialDraws\":%u,"
+       "\"texturesDemoted\":%u,\"textureBudgetMB\":%.1f,\"vramFreeMB\":%.1f,\"thumbNonFinite\":%u,\"thumbClipped\":%u,\"skips\":{",
+       t.rayTraced ? "true" : "false", t.telemetryCpuMs, t.replacedMaterialDraws, t.legacyMaterialDraws,
+diff --git a/src/dxvk/shaders/rtx/pass/gate_skinned_triangles.comp.slang b/src/dxvk/shaders/rtx/pass/gate_skinned_triangles.comp.slang
+index aaba874..caa31bd 100644
+--- a/src/dxvk/shaders/rtx/pass/gate_skinned_triangles.comp.slang
++++ b/src/dxvk/shaders/rtx/pass/gate_skinned_triangles.comp.slang
+@@ -38,17 +38,24 @@ float3 loadWorldPosition(uint v) {
+   return cb.objToWorld0.xyz * p.x + cb.objToWorld1.xyz * p.y + cb.objToWorld2.xyz * p.z;
+ }
+ 
+-float3 loadWorldNormal(uint v) {
++float3 loadObjectNormal(uint v) {
+   const uint base = (cb.normalOffset >> 2) + v * (cb.normalStride >> 2);
+-  float3 n;
+   if ((cb.flags & GATE_SKINNED_FLAG_NORMALS_ENCODED) != 0u) {
+     const uint enc = asuint(normalData[base]);
+-    n = unsignedOctahedralToSphereDirection(vec2(
++    return unsignedOctahedralToSphereDirection(vec2(
+       unorm16ToF32(uint16_t(enc & 0xFFFFu)),
+       unorm16ToF32(uint16_t(enc >> 16))));
+-  } else {
+-    n = float3(normalData[base + 0u], normalData[base + 1u], normalData[base + 2u]);
+   }
++  return float3(normalData[base + 0u], normalData[base + 1u], normalData[base + 2u]);
++}
++
++// A decoded normal the inward test cannot judge: (near) zero length, NaN or infinity.
++bool isUnusableNormal(float3 n) {
++  const float lenSq = dot(n, n);
++  return !(lenSq > 1e-12f) || isinf(lenSq);
++}
++
++float3 toWorldNormal(float3 n) {
+   const float3 wn = cb.normToWorld0.xyz * n.x + cb.normToWorld1.xyz * n.y + cb.normToWorld2.xyz * n.z;
+   const float lenSq = dot(wn, wn);
+   return lenSq > 1e-24f ? (wn * rsqrt(lenSq)) : float3(0.0f, 0.0f, 0.0f);
+@@ -65,6 +72,24 @@ void main(uint triIdx : SV_DispatchThreadID) {
+   const uint i1 = loadVertexIndex(triIdx * 3u + 1u);
+   const uint i2 = loadVertexIndex(triIdx * 3u + 2u);
+ 
++  const float3 n0 = loadObjectNormal(i0);
++  const float3 n1 = loadObjectNormal(i1);
++  const float3 n2 = loadObjectNormal(i2);
++
++  const uint totals = cb.counterSlot - (cb.counterSlot % GATE_SKINNED_SLOT_UINTS);
++  const bool hasPair = cb.counterSlot != totals;
++  const bool isStatic = (cb.flags & GATE_SKINNED_FLAG_STATIC) != 0u;
++
++  if (isUnusableNormal(n0) || isUnusableNormal(n1) || isUnusableNormal(n2)) {
++    InterlockedAdd(outCounters[totals + (isStatic ? 2u : 1u)], 1u);
++    if (hasPair) {
++      InterlockedAdd(outCounters[cb.counterSlot + 1u], 1u);
++    }
++  }
++  if (isStatic) {
++    return;
++  }
++
+   const float3 w0 = loadWorldPosition(i0);
+   const float3 w1 = loadWorldPosition(i1);
+   const float3 w2 = loadWorldPosition(i2);
+@@ -75,12 +100,15 @@ void main(uint triIdx : SV_DispatchThreadID) {
+     return;
+   }
+ 
+-  const float3 meanN = loadWorldNormal(i0) + loadWorldNormal(i1) + loadWorldNormal(i2);
++  const float3 meanN = toWorldNormal(n0) + toWorldNormal(n1) + toWorldNormal(n2);
+   if (dot(meanN, meanN) <= 1e-24f) {
+     return;
+   }
+ 
+   if (dot(face, meanN) < 0.0f) {
+-    InterlockedAdd(outCounters[cb.counterSlot], 1u);
++    InterlockedAdd(outCounters[totals], 1u);
++    if (hasPair) {
++      InterlockedAdd(outCounters[cb.counterSlot], 1u);
++    }
+   }
+ }
+diff --git a/src/dxvk/shaders/rtx/pass/gate_skinned_triangles_binding_indices.h b/src/dxvk/shaders/rtx/pass/gate_skinned_triangles_binding_indices.h
+index f2cd6e1..fabee7b 100644
+--- a/src/dxvk/shaders/rtx/pass/gate_skinned_triangles_binding_indices.h
++++ b/src/dxvk/shaders/rtx/pass/gate_skinned_triangles_binding_indices.h
+@@ -14,6 +14,15 @@
+ #define GATE_SKINNED_FLAG_SHORT_INDICES   (1u << 1)
+ #define GATE_SKINNED_FLAG_NORMALS_ENCODED (1u << 2)
+ #define GATE_SKINNED_FLAG_FLIP_WINDING    (1u << 3)
++// Static (non-skinned) instance: only count unusable normals, skip the inward test.
++#define GATE_SKINNED_FLAG_STATIC          (1u << 4)
++
++// Counters per telemetry slot: [0] inward skinned total, [1] zero-normal skinned total, [2] zero-normal static
++// total, [3] unused, then an (inward, zero-normal) pair per gated instance for the first
++// GATE_SKINNED_MAX_INSTANCES instances.
++#define GATE_SKINNED_TOTALS 4
++#define GATE_SKINNED_MAX_INSTANCES 1024
++#define GATE_SKINNED_SLOT_UINTS (GATE_SKINNED_TOTALS + 2 * GATE_SKINNED_MAX_INSTANCES)
+ 
+ struct GateSkinnedTrianglesArgs {
+   uint positionOffset;
+@@ -23,6 +32,9 @@ struct GateSkinnedTrianglesArgs {
+   uint indexOffset;
+   uint numTriangles;
+   uint flags;
++  // Index into the counter buffer of this instance's (inward, zero-normal) pair. When it is the slot's first
++  // index (counterSlot % GATE_SKINNED_SLOT_UINTS == 0) the instance has no pair and only the totals count.
++  // Pairs start at GATE_SKINNED_TOTALS, so a pair index never equals the slot's first index.
+   uint counterSlot;
+   vec4 objToWorld0;
+   vec4 objToWorld1;
