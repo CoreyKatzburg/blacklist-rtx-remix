@@ -65,6 +65,10 @@ This repo's history is a filtered copy of our private working repo: same commits
 
 ## License
 
-License: to be set by the owner. Until then, no license is granted for the code in this repo. The files in `patches/dxvk-remix/` change NVIDIA's MIT-licensed dxvk-remix and keep its notice there. `play-setup/unified-build/ref/remix_c.h` is NVIDIA's MIT-licensed Remix API header, and `play-setup/unified-build/third_party/xxhash-0.8.2/` is xxHash under its own BSD license.
+Our code is under the MIT license: see [LICENSE](LICENSE). That covers everything in this repo except the parts below.
+
+- `patches/dxvk-remix/` holds patches to NVIDIA's dxvk-remix, not standalone code of ours. dxvk-remix is NVIDIA's code under the MIT license, built on DXVK under the zlib/libpng license; both notices are kept beside the patches (`LICENSE-MIT.dxvk-remix`, `LICENSE-zlib.dxvk`), and the patches are offered under the same terms as the files they change.
+- `play-setup/unified-build/ref/remix_c.h` is NVIDIA's Remix API header, under NVIDIA's MIT notice inside the file.
+- `play-setup/unified-build/third_party/xxhash-0.8.2/` is xxHash, under its own BSD license in that folder.
 
 Splinter Cell and Blacklist are trademarks of Ubisoft. RTX Remix is NVIDIA's. This project is not affiliated with either.

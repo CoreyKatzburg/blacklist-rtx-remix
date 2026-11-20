@@ -4,7 +4,7 @@ These 17 patch files are every change we made to NVIDIA's RTX Remix runtime, mad
 
 - Upstream: https://github.com/NVIDIAGameWorks/dxvk-remix
 - Base: tag `remix-1.5.2` (commit `b81a7b566b1eeb9edb4dc2b3c9d3972e0f253ad4`)
-- License: dxvk-remix is NVIDIA's code under the MIT license (`LICENSE-MIT.dxvk-remix`, copied unchanged from the upstream tree). It builds on DXVK, which is under the zlib/libpng license (`LICENSE-zlib.dxvk`, also copied unchanged). Our patches are offered under the same terms as the files they change.
+- License: dxvk-remix is NVIDIA's code under the MIT license (`LICENSE-MIT.dxvk-remix`, copied unchanged from the upstream tree). It builds on DXVK, which is under the zlib/libpng license (`LICENSE-zlib.dxvk`, also copied unchanged). Our patches are offered under the same terms as the files they change. The MIT license in this repo's top-level LICENSE covers our own code, not these patches.
 
 ## Apply
 
